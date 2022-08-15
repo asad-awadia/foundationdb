@@ -32,6 +32,7 @@
 #include "flow/ActorCollection.h"
 #include "fdbclient/ClusterConnectionMemoryRecord.h"
 #include "fdbclient/NativeAPI.actor.h"
+#include "fdbclient/TenantManagement.actor.h"
 #include "fdbserver/ApplyMetadataMutation.h"
 #include "fdbserver/BackupInterface.h"
 #include "fdbserver/BackupProgress.actor.h"
@@ -248,8 +249,11 @@ ACTOR Future<Void> clusterWatchDatabase(ClusterControllerData* cluster,
 			dbInfo.latencyBandConfig = db->serverInfo->get().latencyBandConfig;
 			dbInfo.myLocality = db->serverInfo->get().myLocality;
 			dbInfo.client = ClientDBInfo();
-			dbInfo.client.tenantMode = db->config.tenantMode;
+			dbInfo.client.isEncryptionEnabled = SERVER_KNOBS->ENABLE_ENCRYPTION;
+			dbInfo.client.tenantMode = TenantAPI::tenantModeForClusterType(db->clusterType, db->config.tenantMode);
 			dbInfo.client.clusterId = db->serverInfo->get().client.clusterId;
+			dbInfo.client.clusterType = db->clusterType;
+			dbInfo.client.metaclusterName = db->metaclusterName;
 
 			TraceEvent("CCWDB", cluster->id)
 			    .detail("NewMaster", dbInfo.master.id().toString())
@@ -316,7 +320,7 @@ ACTOR Future<Void> clusterWatchDatabase(ClusterControllerData* cluster,
 
 			wait(spinDelay);
 
-			TEST(true); // clusterWatchDatabase() master failed
+			CODE_PROBE(true, "clusterWatchDatabase() master failed");
 			TraceEvent(SevWarn, "DetectedFailedRecovery", cluster->id).detail("OldMaster", iMaster.id());
 		} catch (Error& e) {
 			state Error err = e;
@@ -328,13 +332,14 @@ ACTOR Future<Void> clusterWatchDatabase(ClusterControllerData* cluster,
 			wait(cleanupRecoveryActorCollection(recoveryData, true /* exThrown */));
 			ASSERT(addActor.isEmpty());
 
-			TEST(err.code() == error_code_tlog_failed); // Terminated due to tLog failure
-			TEST(err.code() == error_code_commit_proxy_failed); // Terminated due to commit proxy failure
-			TEST(err.code() == error_code_grv_proxy_failed); // Terminated due to GRV proxy failure
-			TEST(err.code() == error_code_resolver_failed); // Terminated due to resolver failure
-			TEST(err.code() == error_code_backup_worker_failed); // Terminated due to backup worker failure
-			TEST(err.code() == error_code_operation_failed); // Terminated due to failed operation
-			TEST(err.code() == error_code_restart_cluster_controller); // Terminated due to cluster-controller restart.
+			CODE_PROBE(err.code() == error_code_tlog_failed, "Terminated due to tLog failure");
+			CODE_PROBE(err.code() == error_code_commit_proxy_failed, "Terminated due to commit proxy failure");
+			CODE_PROBE(err.code() == error_code_grv_proxy_failed, "Terminated due to GRV proxy failure");
+			CODE_PROBE(err.code() == error_code_resolver_failed, "Terminated due to resolver failure");
+			CODE_PROBE(err.code() == error_code_backup_worker_failed, "Terminated due to backup worker failure");
+			CODE_PROBE(err.code() == error_code_operation_failed, "Terminated due to failed operation");
+			CODE_PROBE(err.code() == error_code_restart_cluster_controller,
+			           "Terminated due to cluster-controller restart.");
 
 			if (cluster->shouldCommitSuicide || err.code() == error_code_coordinators_changed) {
 				TraceEvent("ClusterControllerTerminate", cluster->id).errorUnsuppressed(err);
@@ -1010,7 +1015,10 @@ void clusterRegisterMaster(ClusterControllerData* self, RegisterMasterRequest co
 	// Construct the client information
 	if (db->clientInfo->get().commitProxies != req.commitProxies ||
 	    db->clientInfo->get().grvProxies != req.grvProxies ||
-	    db->clientInfo->get().tenantMode != db->config.tenantMode || db->clientInfo->get().clusterId != req.clusterId) {
+	    db->clientInfo->get().tenantMode != db->config.tenantMode || db->clientInfo->get().clusterId != req.clusterId ||
+	    db->clientInfo->get().isEncryptionEnabled != SERVER_KNOBS->ENABLE_ENCRYPTION ||
+	    db->clientInfo->get().clusterType != db->clusterType ||
+	    db->clientInfo->get().metaclusterName != db->metaclusterName) {
 		TraceEvent("PublishNewClientInfo", self->id)
 		    .detail("Master", dbInfo.master.id())
 		    .detail("GrvProxies", db->clientInfo->get().grvProxies)
@@ -1020,15 +1028,23 @@ void clusterRegisterMaster(ClusterControllerData* self, RegisterMasterRequest co
 		    .detail("TenantMode", db->clientInfo->get().tenantMode.toString())
 		    .detail("ReqTenantMode", db->config.tenantMode.toString())
 		    .detail("ClusterId", db->clientInfo->get().clusterId)
-		    .detail("ReqClusterId", req.clusterId);
+		    .detail("ReqClusterId", req.clusterId)
+		    .detail("EncryptionEnabled", SERVER_KNOBS->ENABLE_ENCRYPTION)
+		    .detail("ClusterType", db->clientInfo->get().clusterType)
+		    .detail("ReqClusterType", db->clusterType)
+		    .detail("MetaclusterName", db->clientInfo->get().metaclusterName)
+		    .detail("ReqMetaclusterName", db->metaclusterName);
 		isChanged = true;
 		// TODO why construct a new one and not just copy the old one and change proxies + id?
 		ClientDBInfo clientInfo;
 		clientInfo.id = deterministicRandom()->randomUniqueID();
+		clientInfo.isEncryptionEnabled = SERVER_KNOBS->ENABLE_ENCRYPTION;
 		clientInfo.commitProxies = req.commitProxies;
 		clientInfo.grvProxies = req.grvProxies;
-		clientInfo.tenantMode = db->config.tenantMode;
+		clientInfo.tenantMode = TenantAPI::tenantModeForClusterType(db->clusterType, db->config.tenantMode);
 		clientInfo.clusterId = req.clusterId;
+		clientInfo.clusterType = db->clusterType;
+		clientInfo.metaclusterName = db->metaclusterName;
 		db->clientInfo->set(clientInfo);
 		dbInfo.client = db->clientInfo->get();
 	}
@@ -1244,7 +1260,7 @@ ACTOR Future<Void> registerWorker(RegisterWorkerRequest req,
 		}
 		checkOutstandingRequests(self);
 	} else {
-		TEST(true); // Received an old worker registration request.
+		CODE_PROBE(true, "Received an old worker registration request.");
 	}
 
 	// For each singleton
@@ -2293,7 +2309,8 @@ ACTOR Future<Void> startBlobManager(ClusterControllerData* self, double waitTime
 			self->recruitingBlobManagerID = req.reqId;
 			TraceEvent("CCRecruitBlobManager", self->id)
 			    .detail("Addr", worker.interf.address())
-			    .detail("BMID", req.reqId);
+			    .detail("BMID", req.reqId)
+			    .detail("Epoch", nextEpoch);
 
 			ErrorOr<BlobManagerInterface> interf = wait(worker.interf.blobManager.getReplyUnlessFailedFor(
 			    req, SERVER_KNOBS->WAIT_FOR_BLOB_MANAGER_JOIN_DELAY, 0));

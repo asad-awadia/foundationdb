@@ -193,7 +193,7 @@ Error checkIOTimeout(Error const& e) {
 		timeoutOccurred = g_pSimulator->getCurrentProcess()->machine->machineProcess->global(INetwork::enASIOTimedOut);
 
 	if (timeoutOccurred) {
-		TEST(true); // Timeout occurred
+		CODE_PROBE(true, "Timeout occurred");
 		Error timeout = io_timeout();
 		// Preserve injectedness of error
 		if (e.isInjectedFault())
@@ -244,7 +244,7 @@ ACTOR Future<Void> handleIOErrors(Future<Void> actor, IClosable* store, UID id, 
 			// file_not_found can occur due to attempting to open a partially deleted DiskQueue, which should not be
 			// reported SevError.
 			if (e.isError() && e.getError().code() == error_code_file_not_found) {
-				TEST(true); // Worker terminated with file_not_found error
+				CODE_PROBE(true, "Worker terminated with file_not_found error");
 				return Void();
 			}
 			throw e.isError() ? e.getError() : actor_cancelled();
@@ -1236,13 +1236,9 @@ struct TrackRunningStorage {
 	                    KeyValueStoreType storeType,
 	                    std::set<std::pair<UID, KeyValueStoreType>>* runningStorages)
 	  : self(self), storeType(storeType), runningStorages(runningStorages) {
-		TraceEvent(SevDebug, "TrackingRunningStorageConstruction").detail("StorageID", self);
 		runningStorages->emplace(self, storeType);
 	}
-	~TrackRunningStorage() {
-		runningStorages->erase(std::make_pair(self, storeType));
-		TraceEvent(SevDebug, "TrackingRunningStorageDesctruction").detail("StorageID", self);
-	};
+	~TrackRunningStorage() { runningStorages->erase(std::make_pair(self, storeType)); };
 };
 
 ACTOR Future<Void> storageServerRollbackRebooter(std::set<std::pair<UID, KeyValueStoreType>>* runningStorages,
@@ -2044,7 +2040,7 @@ ACTOR Future<Void> workerServer(Reference<IClusterConnectionRecord> connRecord,
 
 				if (ddInterf->get().present()) {
 					recruited = ddInterf->get().get();
-					TEST(true); // Recruited while already a data distributor.
+					CODE_PROBE(true, "Recruited while already a data distributor.");
 				} else {
 					startRole(Role::DATA_DISTRIBUTOR, recruited.id(), interf.id());
 					DUMPTOKEN(recruited.waitFailure);
@@ -2068,7 +2064,7 @@ ACTOR Future<Void> workerServer(Reference<IClusterConnectionRecord> connRecord,
 
 				if (rkInterf->get().present()) {
 					recruited = rkInterf->get().get();
-					TEST(true); // Recruited while already a ratekeeper.
+					CODE_PROBE(true, "Recruited while already a ratekeeper.");
 				} else {
 					startRole(Role::RATEKEEPER, recruited.id(), interf.id());
 					DUMPTOKEN(recruited.waitFailure);
@@ -2096,7 +2092,7 @@ ACTOR Future<Void> workerServer(Reference<IClusterConnectionRecord> connRecord,
 				if (bmEpochAndInterf->get().present() && bmEpochAndInterf->get().get().first == req.epoch) {
 					recruited = bmEpochAndInterf->get().get().second;
 
-					TEST(true); // Recruited while already a blob manager.
+					CODE_PROBE(true, "Recruited while already a blob manager.");
 				} else {
 					// TODO: it'd be more optimal to halt the last manager if present here, but it will figure it out
 					// via the epoch check
@@ -2151,7 +2147,7 @@ ACTOR Future<Void> workerServer(Reference<IClusterConnectionRecord> connRecord,
 
 				if (ekpInterf->get().present()) {
 					recruited = ekpInterf->get().get();
-					TEST(true); // Recruited while already a encryptKeyProxy server.
+					CODE_PROBE(true, "Recruited while already a encryptKeyProxy server.");
 				} else {
 					startRole(Role::ENCRYPT_KEY_PROXY, recruited.id(), interf.id());
 					DUMPTOKEN(recruited.waitFailure);
@@ -2354,6 +2350,7 @@ ACTOR Future<Void> workerServer(Reference<IClusterConnectionRecord> connRecord,
 					DUMPTOKEN(recruited.granuleAssignmentsRequest);
 					DUMPTOKEN(recruited.granuleStatusStreamRequest);
 					DUMPTOKEN(recruited.haltBlobWorker);
+					DUMPTOKEN(recruited.minBlobVersionRequest);
 
 					ReplyPromise<InitializeBlobWorkerReply> blobWorkerReady = req.reply;
 					Future<Void> bw = blobWorker(recruited, blobWorkerReady, dbInfo);
@@ -2543,28 +2540,30 @@ ACTOR Future<Void> workerServer(Reference<IClusterConnectionRecord> connRecord,
 				loggingTrigger = delay(loggingDelay, TaskPriority::FlushTrace);
 			}
 			when(state WorkerSnapRequest snapReq = waitNext(interf.workerSnapReq.getFuture())) {
-				std::string snapUID = snapReq.snapUID.toString() + snapReq.role.toString();
-				if (snapReqResultMap.count(snapUID)) {
-					TEST(true); // Worker received a duplicate finished snap request
-					auto result = snapReqResultMap[snapUID];
+				std::string snapReqKey = snapReq.snapUID.toString() + snapReq.role.toString();
+				if (snapReqResultMap.count(snapReqKey)) {
+					CODE_PROBE(true, "Worker received a duplicate finished snapshot request");
+					auto result = snapReqResultMap[snapReqKey];
 					result.isError() ? snapReq.reply.sendError(result.getError()) : snapReq.reply.send(result.get());
 					TraceEvent("RetryFinishedWorkerSnapRequest")
-					    .detail("SnapUID", snapUID)
+					    .detail("SnapUID", snapReq.snapUID.toString())
 					    .detail("Role", snapReq.role)
-					    .detail("Result", result.isError() ? result.getError().code() : 0);
-				} else if (snapReqMap.count(snapUID)) {
-					TEST(true); // Worker received a duplicate ongoing snap request
-					TraceEvent("RetryOngoingWorkerSnapRequest").detail("SnapUID", snapUID).detail("Role", snapReq.role);
-					ASSERT(snapReq.role == snapReqMap[snapUID].role);
-					ASSERT(snapReq.snapPayload == snapReqMap[snapUID].snapPayload);
-					snapReqMap[snapUID] = snapReq;
+					    .detail("Result", result.isError() ? result.getError().code() : success().code());
+				} else if (snapReqMap.count(snapReqKey)) {
+					CODE_PROBE(true, "Worker received a duplicate ongoing snapshot request");
+					TraceEvent("RetryOngoingWorkerSnapRequest")
+					    .detail("SnapUID", snapReq.snapUID.toString())
+					    .detail("Role", snapReq.role);
+					ASSERT(snapReq.role == snapReqMap[snapReqKey].role);
+					ASSERT(snapReq.snapPayload == snapReqMap[snapReqKey].snapPayload);
+					snapReqMap[snapReqKey] = snapReq;
 				} else {
-					snapReqMap[snapUID] = snapReq; // set map point to the request
+					snapReqMap[snapReqKey] = snapReq; // set map point to the request
 					if (g_network->isSimulated() && (now() - lastSnapTime) < SERVER_KNOBS->SNAP_MINIMUM_TIME_GAP) {
 						// only allow duplicate snapshots on same process in a short time for different roles
 						auto okay = (lastSnapReq.snapUID == snapReq.snapUID) && lastSnapReq.role != snapReq.role;
 						TraceEvent(okay ? SevInfo : SevError, "RapidSnapRequestsOnSameProcess")
-						    .detail("CurrSnapUID", snapUID)
+						    .detail("CurrSnapUID", snapReqKey)
 						    .detail("PrevSnapUID", lastSnapReq.snapUID)
 						    .detail("CurrRole", snapReq.role)
 						    .detail("PrevRole", lastSnapReq.role)
@@ -2576,8 +2575,8 @@ ACTOR Future<Void> workerServer(Reference<IClusterConnectionRecord> connRecord,
 					                                     &snapReqResultMap));
 					auto* snapReqResultMapPtr = &snapReqResultMap;
 					errorForwarders.add(fmap(
-					    [snapReqResultMapPtr, snapUID](Void _) {
-						    snapReqResultMapPtr->erase(snapUID);
+					    [snapReqResultMapPtr, snapReqKey](Void _) {
+						    snapReqResultMapPtr->erase(snapReqKey);
 						    return Void();
 					    },
 					    delay(SERVER_KNOBS->SNAP_MINIMUM_TIME_GAP)));
@@ -2808,7 +2807,8 @@ ACTOR Future<Void> updateNewestSoftwareVersion(std::string folder,
 }
 
 ACTOR Future<Void> testAndUpdateSoftwareVersionCompatibility(std::string dataFolder, UID processIDUid) {
-	ErrorOr<SWVersion> swVersion = wait(errorOr(testSoftwareVersionCompatibility(dataFolder, currentProtocolVersion)));
+	ErrorOr<SWVersion> swVersion =
+	    wait(errorOr(testSoftwareVersionCompatibility(dataFolder, currentProtocolVersion())));
 	if (swVersion.isError()) {
 		TraceEvent(SevWarnAlways, "SWVersionCompatibilityCheckError", processIDUid).error(swVersion.getError());
 		throw swVersion.getError();
@@ -2817,16 +2817,16 @@ ACTOR Future<Void> testAndUpdateSoftwareVersionCompatibility(std::string dataFol
 	TraceEvent(SevInfo, "SWVersionCompatible", processIDUid).detail("SWVersion", swVersion.get());
 
 	if (!swVersion.get().isValid() ||
-	    currentProtocolVersion > ProtocolVersion(swVersion.get().newestProtocolVersion())) {
+	    currentProtocolVersion() > ProtocolVersion(swVersion.get().newestProtocolVersion())) {
 		ErrorOr<Void> updatedSWVersion = wait(errorOr(updateNewestSoftwareVersion(
-		    dataFolder, currentProtocolVersion, currentProtocolVersion, minCompatibleProtocolVersion)));
+		    dataFolder, currentProtocolVersion(), currentProtocolVersion(), minCompatibleProtocolVersion)));
 		if (updatedSWVersion.isError()) {
 			throw updatedSWVersion.getError();
 		}
-	} else if (currentProtocolVersion < ProtocolVersion(swVersion.get().newestProtocolVersion())) {
+	} else if (currentProtocolVersion() < ProtocolVersion(swVersion.get().newestProtocolVersion())) {
 		ErrorOr<Void> updatedSWVersion = wait(
 		    errorOr(updateNewestSoftwareVersion(dataFolder,
-		                                        currentProtocolVersion,
+		                                        currentProtocolVersion(),
 		                                        ProtocolVersion(swVersion.get().newestProtocolVersion()),
 		                                        ProtocolVersion(swVersion.get().lowestCompatibleProtocolVersion()))));
 		if (updatedSWVersion.isError()) {
@@ -2835,7 +2835,7 @@ ACTOR Future<Void> testAndUpdateSoftwareVersionCompatibility(std::string dataFol
 	}
 
 	ErrorOr<SWVersion> newSWVersion =
-	    wait(errorOr(testSoftwareVersionCompatibility(dataFolder, currentProtocolVersion)));
+	    wait(errorOr(testSoftwareVersionCompatibility(dataFolder, currentProtocolVersion())));
 	if (newSWVersion.isError()) {
 		TraceEvent(SevWarnAlways, "SWVersionCompatibilityCheckError", processIDUid).error(newSWVersion.getError());
 		throw newSWVersion.getError();
@@ -3311,7 +3311,9 @@ ACTOR Future<Void> fdbd(Reference<IClusterConnectionRecord> connRecord,
 		auto ci = makeReference<AsyncVar<Optional<ClusterInterface>>>();
 		auto asyncPriorityInfo =
 		    makeReference<AsyncVar<ClusterControllerPriorityInfo>>(getCCPriorityInfo(fitnessFilePath, processClass));
-		auto dbInfo = makeReference<AsyncVar<ServerDBInfo>>();
+		auto serverDBInfo = ServerDBInfo();
+		serverDBInfo.client.isEncryptionEnabled = SERVER_KNOBS->ENABLE_ENCRYPTION;
+		auto dbInfo = makeReference<AsyncVar<ServerDBInfo>>(serverDBInfo);
 
 		actors.push_back(reportErrors(monitorAndWriteCCPriorityInfo(fitnessFilePath, asyncPriorityInfo),
 		                              "MonitorAndWriteCCPriorityInfo"));
