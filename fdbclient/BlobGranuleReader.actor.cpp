@@ -105,7 +105,9 @@ ACTOR Future<RangeResult> readBlobGranule(BlobGranuleChunkRef chunk,
 			arena.dependsOn(data.arena());
 		}
 
-		return materializeBlobGranule(chunk, keyRange, beginVersion, readVersion, snapshotData, deltaData);
+		// TODO do something useful with stats?
+		GranuleMaterializeStats stats;
+		return materializeBlobGranule(chunk, keyRange, beginVersion, readVersion, snapshotData, deltaData, stats);
 
 	} catch (Error& e) {
 		throw e;
@@ -167,7 +169,7 @@ TEST_CASE("/fdbserver/blobgranule/isRangeCoveredByBlob") {
 	}
 
 	// check '' to \xff
-	{ ASSERT(isRangeFullyCovered(KeyRangeRef(LiteralStringRef(""), LiteralStringRef("\xff")), chunks) == false); }
+	{ ASSERT(isRangeFullyCovered(KeyRangeRef(""_sr, "\xff"_sr), chunks) == false); }
 
 	// check {key_a1, key_a9}
 	{ ASSERT(isRangeFullyCovered(KeyRangeRef("key_a1"_sr, "key_a9"_sr), chunks)); }

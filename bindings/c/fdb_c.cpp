@@ -548,10 +548,14 @@ extern "C" DLLEXPORT WARN_UNUSED_RESULT FDBFuture* fdb_database_verify_blob_rang
                                                                                   uint8_t const* end_key_name,
                                                                                   int end_key_name_length,
                                                                                   int64_t version) {
+	Optional<Version> rv;
+	if (version != latestVersion) {
+		rv = version;
+	}
 	return (FDBFuture*)(DB(db)
 	                        ->verifyBlobRange(KeyRangeRef(StringRef(begin_key_name, begin_key_name_length),
 	                                                      StringRef(end_key_name, end_key_name_length)),
-	                                          version)
+	                                          rv)
 	                        .extractPtr());
 }
 
@@ -578,6 +582,58 @@ extern "C" DLLEXPORT FDBFuture* fdb_tenant_wait_purge_granules_complete(FDBTenan
                                                                         int purge_key_name_length) {
 	return (FDBFuture*)(TENANT(tenant)
 	                        ->waitPurgeGranulesComplete(StringRef(purge_key_name, purge_key_name_length))
+	                        .extractPtr());
+}
+
+extern "C" DLLEXPORT FDBFuture* fdb_tenant_blobbify_range(FDBTenant* tenant,
+                                                          uint8_t const* begin_key_name,
+                                                          int begin_key_name_length,
+                                                          uint8_t const* end_key_name,
+                                                          int end_key_name_length) {
+	return (FDBFuture*)(TENANT(tenant)
+	                        ->blobbifyRange(KeyRangeRef(StringRef(begin_key_name, begin_key_name_length),
+	                                                    StringRef(end_key_name, end_key_name_length)))
+	                        .extractPtr());
+}
+
+extern "C" DLLEXPORT FDBFuture* fdb_tenant_unblobbify_range(FDBTenant* tenant,
+                                                            uint8_t const* begin_key_name,
+                                                            int begin_key_name_length,
+                                                            uint8_t const* end_key_name,
+                                                            int end_key_name_length) {
+	return (FDBFuture*)(TENANT(tenant)
+	                        ->unblobbifyRange(KeyRangeRef(StringRef(begin_key_name, begin_key_name_length),
+	                                                      StringRef(end_key_name, end_key_name_length)))
+	                        .extractPtr());
+}
+
+extern "C" DLLEXPORT FDBFuture* fdb_tenant_list_blobbified_ranges(FDBTenant* tenant,
+                                                                  uint8_t const* begin_key_name,
+                                                                  int begin_key_name_length,
+                                                                  uint8_t const* end_key_name,
+                                                                  int end_key_name_length,
+                                                                  int rangeLimit) {
+	return (FDBFuture*)(TENANT(tenant)
+	                        ->listBlobbifiedRanges(KeyRangeRef(StringRef(begin_key_name, begin_key_name_length),
+	                                                           StringRef(end_key_name, end_key_name_length)),
+	                                               rangeLimit)
+	                        .extractPtr());
+}
+
+extern "C" DLLEXPORT WARN_UNUSED_RESULT FDBFuture* fdb_tenant_verify_blob_range(FDBTenant* tenant,
+                                                                                uint8_t const* begin_key_name,
+                                                                                int begin_key_name_length,
+                                                                                uint8_t const* end_key_name,
+                                                                                int end_key_name_length,
+                                                                                int64_t version) {
+	Optional<Version> rv;
+	if (version != latestVersion) {
+		rv = version;
+	}
+	return (FDBFuture*)(TENANT(tenant)
+	                        ->verifyBlobRange(KeyRangeRef(StringRef(begin_key_name, begin_key_name_length),
+	                                                      StringRef(end_key_name, end_key_name_length)),
+	                                          rv)
 	                        .extractPtr());
 }
 

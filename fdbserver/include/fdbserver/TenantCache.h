@@ -18,16 +18,25 @@
  * limitations under the License.
  */
 
+#pragma once
+
 #include "fdbclient/FDBTypes.h"
+#include "fdbclient/NativeAPI.actor.h"
 #include "fdbclient/Tenant.h"
-#include "fdbserver/DDTeamCollection.h"
 #include "fdbserver/TCInfo.h"
 #include "flow/IRandom.h"
 #include "flow/IndexedSet.h"
+#include "flow/flow.h"
 #include <limits>
 #include <string>
 
 typedef Map<KeyRef, Reference<TCTenantInfo>> TenantMapByPrefix;
+
+struct TenantCacheTenantCreated {
+	KeyRange keys;
+	Promise<bool> reply;
+	TenantCacheTenantCreated(Key prefix) { keys = prefixRange(prefix); }
+};
 
 class TenantCache : public ReferenceCounted<TenantCache> {
 	friend class TenantCacheImpl;
@@ -53,6 +62,12 @@ private:
 	// return count of tenants that were found to be stale and removed from the cache
 	int cleanup();
 
+	// return the mapping from prefix -> tenant name for all tenants stored in the cache
+	std::vector<std::pair<KeyRef, TenantName>> getTenantList() const;
+
+	// update the size for a tenant; do nothing if the tenant doesn't exist in the map
+	void updateStorageUsage(KeyRef prefix, int64_t size);
+
 	UID id() const { return distributorID; }
 
 	Database dbcx() const { return cx; }
@@ -62,11 +77,17 @@ public:
 		generation = deterministicRandom()->randomUInt32();
 	}
 
-	Future<Void> build(Database cx);
+	PromiseStream<TenantCacheTenantCreated> tenantCreationSignal;
+
+	Future<Void> build();
 
 	Future<Void> monitorTenantMap();
+
+	Future<Void> monitorStorageUsage();
 
 	std::string desc() const;
 
 	bool isTenantKey(KeyRef key) const;
+
+	Optional<Reference<TCTenantInfo>> tenantOwning(KeyRef key) const;
 };

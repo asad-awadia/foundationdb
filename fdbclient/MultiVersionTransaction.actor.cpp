@@ -490,6 +490,73 @@ ThreadFuture<Void> DLTenant::waitPurgeGranulesComplete(const KeyRef& purgeKey) {
 	return toThreadFuture<Void>(api, f, [](FdbCApi::FDBFuture* f, FdbCApi* api) { return Void(); });
 }
 
+ThreadFuture<bool> DLTenant::blobbifyRange(const KeyRangeRef& keyRange) {
+	if (!api->tenantBlobbifyRange) {
+		return unsupported_operation();
+	}
+
+	FdbCApi::FDBFuture* f = api->tenantBlobbifyRange(
+	    tenant, keyRange.begin.begin(), keyRange.begin.size(), keyRange.end.begin(), keyRange.end.size());
+
+	return toThreadFuture<bool>(api, f, [](FdbCApi::FDBFuture* f, FdbCApi* api) {
+		FdbCApi::fdb_bool_t ret = false;
+		ASSERT(!api->futureGetBool(f, &ret));
+		return ret;
+	});
+}
+
+ThreadFuture<bool> DLTenant::unblobbifyRange(const KeyRangeRef& keyRange) {
+	if (!api->tenantUnblobbifyRange) {
+		return unsupported_operation();
+	}
+
+	FdbCApi::FDBFuture* f = api->tenantUnblobbifyRange(
+	    tenant, keyRange.begin.begin(), keyRange.begin.size(), keyRange.end.begin(), keyRange.end.size());
+
+	return toThreadFuture<bool>(api, f, [](FdbCApi::FDBFuture* f, FdbCApi* api) {
+		FdbCApi::fdb_bool_t ret = false;
+		ASSERT(!api->futureGetBool(f, &ret));
+		return ret;
+	});
+}
+
+ThreadFuture<Standalone<VectorRef<KeyRangeRef>>> DLTenant::listBlobbifiedRanges(const KeyRangeRef& keyRange,
+                                                                                int rangeLimit) {
+	if (!api->tenantListBlobbifiedRanges) {
+		return unsupported_operation();
+	}
+
+	FdbCApi::FDBFuture* f = api->tenantListBlobbifiedRanges(
+	    tenant, keyRange.begin.begin(), keyRange.begin.size(), keyRange.end.begin(), keyRange.end.size(), rangeLimit);
+
+	return toThreadFuture<Standalone<VectorRef<KeyRangeRef>>>(api, f, [](FdbCApi::FDBFuture* f, FdbCApi* api) {
+		const FdbCApi::FDBKeyRange* keyRanges;
+		int keyRangesLength;
+		FdbCApi::fdb_error_t error = api->futureGetKeyRangeArray(f, &keyRanges, &keyRangesLength);
+		ASSERT(!error);
+		// The memory for this is stored in the FDBFuture and is released when the future gets destroyed.
+		return Standalone<VectorRef<KeyRangeRef>>(VectorRef<KeyRangeRef>((KeyRangeRef*)keyRanges, keyRangesLength),
+		                                          Arena());
+	});
+}
+
+ThreadFuture<Version> DLTenant::verifyBlobRange(const KeyRangeRef& keyRange, Optional<Version> version) {
+	if (!api->tenantVerifyBlobRange) {
+		return unsupported_operation();
+	}
+
+	Version readVersion = version.present() ? version.get() : latestVersion;
+
+	FdbCApi::FDBFuture* f = api->tenantVerifyBlobRange(
+	    tenant, keyRange.begin.begin(), keyRange.begin.size(), keyRange.end.begin(), keyRange.end.size(), readVersion);
+
+	return toThreadFuture<Version>(api, f, [](FdbCApi::FDBFuture* f, FdbCApi* api) {
+		Version version = invalidVersion;
+		ASSERT(!api->futureGetInt64(f, &version));
+		return version;
+	});
+}
+
 // DLDatabase
 DLDatabase::DLDatabase(Reference<FdbCApi> api, ThreadFuture<FdbCApi::FDBDatabase*> dbFuture) : api(api), db(nullptr) {
 	addref();
@@ -652,7 +719,7 @@ ThreadFuture<bool> DLDatabase::blobbifyRange(const KeyRangeRef& keyRange) {
 	    db, keyRange.begin.begin(), keyRange.begin.size(), keyRange.end.begin(), keyRange.end.size());
 
 	return toThreadFuture<bool>(api, f, [](FdbCApi::FDBFuture* f, FdbCApi* api) {
-		bool ret = false;
+		FdbCApi::fdb_bool_t ret = false;
 		ASSERT(!api->futureGetBool(f, &ret));
 		return ret;
 	});
@@ -667,7 +734,7 @@ ThreadFuture<bool> DLDatabase::unblobbifyRange(const KeyRangeRef& keyRange) {
 	    db, keyRange.begin.begin(), keyRange.begin.size(), keyRange.end.begin(), keyRange.end.size());
 
 	return toThreadFuture<bool>(api, f, [](FdbCApi::FDBFuture* f, FdbCApi* api) {
-		bool ret = false;
+		FdbCApi::fdb_bool_t ret = false;
 		ASSERT(!api->futureGetBool(f, &ret));
 		return ret;
 	});
@@ -698,8 +765,10 @@ ThreadFuture<Version> DLDatabase::verifyBlobRange(const KeyRangeRef& keyRange, O
 		return unsupported_operation();
 	}
 
+	Version readVersion = version.present() ? version.get() : latestVersion;
+
 	FdbCApi::FDBFuture* f = api->databaseVerifyBlobRange(
-	    db, keyRange.begin.begin(), keyRange.begin.size(), keyRange.end.begin(), keyRange.end.size(), version);
+	    db, keyRange.begin.begin(), keyRange.begin.size(), keyRange.end.begin(), keyRange.end.size(), readVersion);
 
 	return toThreadFuture<Version>(api, f, [](FdbCApi::FDBFuture* f, FdbCApi* api) {
 		Version version = invalidVersion;
@@ -825,12 +894,32 @@ void DLApi::init() {
 	                   lib,
 	                   fdbCPath,
 	                   "fdb_tenant_purge_blob_granules",
-	                   headerVersion >= ApiVersion::withBlobRangeApi().version());
+	                   headerVersion >= ApiVersion::withTenantBlobRangeApi().version());
 	loadClientFunction(&api->tenantWaitPurgeGranulesComplete,
 	                   lib,
 	                   fdbCPath,
 	                   "fdb_tenant_wait_purge_granules_complete",
-	                   headerVersion >= ApiVersion::withBlobRangeApi().version());
+	                   headerVersion >= ApiVersion::withTenantBlobRangeApi().version());
+	loadClientFunction(&api->tenantBlobbifyRange,
+	                   lib,
+	                   fdbCPath,
+	                   "fdb_tenant_blobbify_range",
+	                   headerVersion >= ApiVersion::withTenantBlobRangeApi().version());
+	loadClientFunction(&api->tenantUnblobbifyRange,
+	                   lib,
+	                   fdbCPath,
+	                   "fdb_tenant_unblobbify_range",
+	                   headerVersion >= ApiVersion::withTenantBlobRangeApi().version());
+	loadClientFunction(&api->tenantListBlobbifiedRanges,
+	                   lib,
+	                   fdbCPath,
+	                   "fdb_tenant_list_blobbified_ranges",
+	                   headerVersion >= ApiVersion::withTenantBlobRangeApi().version());
+	loadClientFunction(&api->tenantVerifyBlobRange,
+	                   lib,
+	                   fdbCPath,
+	                   "fdb_tenant_verify_blob_range",
+	                   headerVersion >= ApiVersion::withTenantBlobRangeApi().version());
 	loadClientFunction(&api->tenantDestroy, lib, fdbCPath, "fdb_tenant_destroy", headerVersion >= 710);
 
 	loadClientFunction(&api->transactionSetOption, lib, fdbCPath, "fdb_transaction_set_option", headerVersion >= 0);
@@ -1459,7 +1548,10 @@ Optional<TenantName> MultiVersionTransaction::getTenant() {
 // Waits for the specified duration and signals the assignment variable with a timed out error
 // This will be canceled if a new timeout is set, in which case the tsav will not be signaled.
 ACTOR Future<Void> timeoutImpl(Reference<ThreadSingleAssignmentVar<Void>> tsav, double duration) {
-	wait(delay(duration));
+	state double endTime = now() + duration;
+	while (now() < endTime) {
+		wait(delayUntil(std::min(endTime + 0.0001, now() + CLIENT_KNOBS->TRANSACTION_TIMEOUT_DELAY_INTERVAL)));
+	}
 
 	tsav->trySendError(transaction_timed_out());
 	return Void();
@@ -1499,14 +1591,17 @@ void MultiVersionTransaction::setTimeout(Optional<StringRef> value) {
 
 	{ // lock scope
 		ThreadSpinLockHolder holder(timeoutLock);
-
-		Reference<ThreadSingleAssignmentVar<Void>> tsav = timeoutTsav;
-		ThreadFuture<Void> newTimeout = onMainThread([transactionStartTime, tsav, timeoutDuration]() {
-			return timeoutImpl(tsav, timeoutDuration - std::max(0.0, now() - transactionStartTime));
-		});
-
 		prevTimeout = currentTimeout;
-		currentTimeout = newTimeout;
+
+		if (timeoutDuration > 0) {
+			Reference<ThreadSingleAssignmentVar<Void>> tsav = timeoutTsav;
+			ThreadFuture<Void> newTimeout = onMainThread([transactionStartTime, tsav, timeoutDuration]() {
+				return timeoutImpl(tsav, timeoutDuration - std::max(0.0, now() - transactionStartTime));
+			});
+			currentTimeout = newTimeout;
+		} else {
+			currentTimeout = ThreadFuture<Void>();
+		}
 	}
 
 	// Cancel the previous timeout now that we have a new one. This means that changing the timeout
@@ -1575,6 +1670,9 @@ void MultiVersionTransaction::reset() {
 
 MultiVersionTransaction::~MultiVersionTransaction() {
 	timeoutTsav->trySendError(transaction_cancelled());
+	if (currentTimeout.isValid()) {
+		currentTimeout.cancel();
+	}
 }
 
 bool MultiVersionTransaction::isValid() {
@@ -1597,13 +1695,41 @@ Reference<ITransaction> MultiVersionTenant::createTransaction() {
 }
 
 ThreadFuture<Key> MultiVersionTenant::purgeBlobGranules(const KeyRangeRef& keyRange, Version purgeVersion, bool force) {
-	auto f = tenantState->db ? tenantState->db->purgeBlobGranules(keyRange, purgeVersion, force)
-	                         : ThreadFuture<Key>(Never());
-	return abortableFuture(f, tenantState->db->dbState->dbVar->get().onChange);
+	auto tenantDb = tenantState->tenantVar->get();
+	auto f =
+	    tenantDb.value ? tenantDb.value->purgeBlobGranules(keyRange, purgeVersion, force) : ThreadFuture<Key>(Never());
+	return abortableFuture(f, tenantDb.onChange);
 }
 ThreadFuture<Void> MultiVersionTenant::waitPurgeGranulesComplete(const KeyRef& purgeKey) {
-	auto f = tenantState->db ? tenantState->db->waitPurgeGranulesComplete(purgeKey) : ThreadFuture<Void>(Never());
-	return abortableFuture(f, tenantState->db->dbState->dbVar->get().onChange);
+	auto tenantDb = tenantState->tenantVar->get();
+	auto f = tenantDb.value ? tenantDb.value->waitPurgeGranulesComplete(purgeKey) : ThreadFuture<Void>(Never());
+	return abortableFuture(f, tenantDb.onChange);
+}
+
+ThreadFuture<bool> MultiVersionTenant::blobbifyRange(const KeyRangeRef& keyRange) {
+	auto tenantDb = tenantState->tenantVar->get();
+	auto f = tenantDb.value ? tenantDb.value->blobbifyRange(keyRange) : ThreadFuture<bool>(Never());
+	return abortableFuture(f, tenantDb.onChange);
+}
+
+ThreadFuture<bool> MultiVersionTenant::unblobbifyRange(const KeyRangeRef& keyRange) {
+	auto tenantDb = tenantState->tenantVar->get();
+	auto f = tenantDb.value ? tenantDb.value->unblobbifyRange(keyRange) : ThreadFuture<bool>(Never());
+	return abortableFuture(f, tenantDb.onChange);
+}
+
+ThreadFuture<Standalone<VectorRef<KeyRangeRef>>> MultiVersionTenant::listBlobbifiedRanges(const KeyRangeRef& keyRange,
+                                                                                          int rangeLimit) {
+	auto tenantDb = tenantState->tenantVar->get();
+	auto f = tenantDb.value ? tenantDb.value->listBlobbifiedRanges(keyRange, rangeLimit)
+	                        : ThreadFuture<Standalone<VectorRef<KeyRangeRef>>>(Never());
+	return abortableFuture(f, tenantDb.onChange);
+}
+
+ThreadFuture<Version> MultiVersionTenant::verifyBlobRange(const KeyRangeRef& keyRange, Optional<Version> version) {
+	auto tenantDb = tenantState->tenantVar->get();
+	auto f = tenantDb.value ? tenantDb.value->verifyBlobRange(keyRange, version) : ThreadFuture<Version>(Never());
+	return abortableFuture(f, tenantDb.onChange);
 }
 
 MultiVersionTenant::TenantState::TenantState(Reference<MultiVersionDatabase> db, TenantNameRef tenantName)
@@ -2246,7 +2372,7 @@ void validateOption(Optional<StringRef> value, bool canBePresent, bool canBeAbse
 
 void MultiVersionApi::disableMultiVersionClientApi() {
 	MutexHolder holder(lock);
-	if (networkStartSetup || localClientDisabled) {
+	if (networkStartSetup || localClientDisabled || disableBypass) {
 		throw invalid_option();
 	}
 
@@ -2453,6 +2579,13 @@ void MultiVersionApi::setNetworkOptionInternal(FDBNetworkOptions::Option option,
 		externalClient = true;
 		bypassMultiClientApi = true;
 		forwardOption = true;
+	} else if (option == FDBNetworkOptions::DISABLE_CLIENT_BYPASS) {
+		MutexHolder holder(lock);
+		ASSERT(!networkStartSetup);
+		if (bypassMultiClientApi) {
+			throw invalid_option();
+		}
+		disableBypass = true;
 	} else if (option == FDBNetworkOptions::CLIENT_THREADS_PER_VERSION) {
 		MutexHolder holder(lock);
 		validateOption(value, true, false, false);
@@ -2471,6 +2604,18 @@ void MultiVersionApi::setNetworkOptionInternal(FDBNetworkOptions::Option option,
 	} else if (option == FDBNetworkOptions::FUTURE_VERSION_CLIENT_LIBRARY) {
 		validateOption(value, true, false, false);
 		addExternalLibrary(abspath(value.get().toString()), true);
+	} else if (option == FDBNetworkOptions::TRACE_FILE_IDENTIFIER) {
+		validateOption(value, true, false, true);
+		traceFileIdentifier = value.get().toString();
+		{
+			MutexHolder holder(lock);
+			// Forward the option unmodified only to the the local client and let it validate it.
+			// While for external clients the trace file identifiers are determined in setupNetwork
+			localClient->api->setNetworkOption(option, value);
+		}
+	} else if (option == FDBNetworkOptions::TRACE_SHARE_AMONG_CLIENT_THREADS) {
+		validateOption(value, false, true);
+		traceShareBaseNameAmongThreads = true;
 	} else {
 		forwardOption = true;
 	}
@@ -2514,9 +2659,14 @@ void MultiVersionApi::setupNetwork() {
 			// Copy external lib for each thread
 			if (externalClients.count(filename) == 0) {
 				externalClients[filename] = {};
-				for (const auto& tmp : copyExternalLibraryPerThread(path)) {
+				auto libCopies = copyExternalLibraryPerThread(path);
+				for (int idx = 0; idx < libCopies.size(); ++idx) {
+					bool unlinkOnLoad = libCopies[idx].second && CLIENT_KNOBS->DELETE_NATIVE_LIB_AFTER_LOADING;
 					externalClients[filename].push_back(Reference<ClientInfo>(
-					    new ClientInfo(new DLApi(tmp.first, tmp.second /*unlink on load*/), path, useFutureVersion)));
+					    new ClientInfo(new DLApi(libCopies[idx].first, unlinkOnLoad /*unlink on load*/),
+					                   path,
+					                   useFutureVersion,
+					                   idx)));
 				}
 			}
 		}
@@ -2535,7 +2685,7 @@ void MultiVersionApi::setupNetwork() {
 
 		networkStartSetup = true;
 
-		if (externalClients.empty()) {
+		if (externalClients.empty() && !disableBypass) {
 			bypassMultiClientApi = true; // SOMEDAY: we won't be able to set this option once it becomes possible to add
 			                             // clients after setupNetwork is called
 		}
@@ -2562,13 +2712,23 @@ void MultiVersionApi::setupNetwork() {
 			client->loadVersion();
 		});
 
+		std::string baseTraceFileId;
+		if (apiVersion.hasTraceFileIdentifier()) {
+			// TRACE_FILE_IDENTIFIER option is supported since 6.3
+			baseTraceFileId = traceFileIdentifier.empty() ? format("%d", getpid()) : traceFileIdentifier;
+		}
+
 		MutexHolder holder(lock);
-		runOnExternalClientsAllThreads([this, transportId](Reference<ClientInfo> client) {
+		runOnExternalClientsAllThreads([this, transportId, baseTraceFileId](Reference<ClientInfo> client) {
 			for (auto option : options) {
 				client->api->setNetworkOption(option.first, option.second.castTo<StringRef>());
 			}
 			client->api->setNetworkOption(FDBNetworkOptions::EXTERNAL_CLIENT_TRANSPORT_ID, std::to_string(transportId));
-
+			if (!baseTraceFileId.empty()) {
+				client->api->setNetworkOption(
+				    FDBNetworkOptions::TRACE_FILE_IDENTIFIER,
+				    traceShareBaseNameAmongThreads ? baseTraceFileId : client->getTraceFileIdentifier(baseTraceFileId));
+			}
 			client->api->setupNetwork();
 		});
 
@@ -2607,21 +2767,17 @@ void MultiVersionApi::runNetwork() {
 
 	std::vector<THREAD_HANDLE> handles;
 	if (!bypassMultiClientApi) {
-		for (int threadNum = 0; threadNum < threadCount; threadNum++) {
-			runOnExternalClients(threadNum, [&handles, threadNum](Reference<ClientInfo> client) {
-				if (client->external) {
-					std::string threadName = format("fdb-%s-%d", client->releaseVersion.c_str(), threadNum);
-					if (threadName.size() > 15) {
-						threadName = format("fdb-%s", client->releaseVersion.c_str());
-						if (threadName.size() > 15) {
-							threadName = "fdb-external";
-						}
-					}
-					handles.push_back(
-					    g_network->startThread(&runNetworkThread, client.getPtr(), 0, threadName.c_str()));
+		runOnExternalClientsAllThreads([&handles](Reference<ClientInfo> client) {
+			ASSERT(client->external);
+			std::string threadName = format("fdb-%s-%d", client->releaseVersion.c_str(), client->threadIndex);
+			if (threadName.size() > 15) {
+				threadName = format("fdb-%s", client->releaseVersion.c_str());
+				if (threadName.size() > 15) {
+					threadName = "fdb-external";
 				}
-			});
-		}
+			}
+			handles.push_back(g_network->startThread(&runNetworkThread, client.getPtr(), 0, threadName.c_str()));
+		});
 	}
 
 	localClient->api->runNetwork();
@@ -2734,9 +2890,9 @@ ACTOR Future<std::string> updateClusterSharedStateMapImpl(MultiVersionApi* self,
                                                           ProtocolVersion dbProtocolVersion,
                                                           Reference<IDatabase> db) {
 	// The cluster ID will be the connection record string (either a filename or the connection string itself)
-	// in API versions before we could read the cluster ID.
+	// in versions before we could read the cluster ID.
 	state std::string clusterId = connectionRecord.toString();
-	if (MultiVersionApi::api->getApiVersion().hasCreateDBFromConnString()) {
+	if (dbProtocolVersion.hasClusterIdSpecialKey()) {
 		state Reference<ITransaction> tr = db->createTransaction();
 		loop {
 			try {
@@ -2910,8 +3066,8 @@ void MultiVersionApi::loadEnvironmentVariableNetworkOptions() {
 
 MultiVersionApi::MultiVersionApi()
   : callbackOnMainThread(true), localClientDisabled(false), networkStartSetup(false), networkSetup(false),
-    bypassMultiClientApi(false), externalClient(false), apiVersion(0), threadCount(0), tmpDir("/tmp"),
-    envOptionsLoaded(false) {}
+    disableBypass(false), bypassMultiClientApi(false), externalClient(false), apiVersion(0), threadCount(0),
+    tmpDir("/tmp"), traceShareBaseNameAmongThreads(false), envOptionsLoaded(false) {}
 
 MultiVersionApi* MultiVersionApi::api = new MultiVersionApi();
 
@@ -2946,6 +3102,12 @@ bool ClientInfo::canReplace(Reference<ClientInfo> other) const {
 	}
 
 	return !protocolVersion.isCompatible(other->protocolVersion);
+}
+
+std::string ClientInfo::getTraceFileIdentifier(const std::string& baseIdentifier) {
+	std::string versionStr = releaseVersion;
+	std::replace(versionStr.begin(), versionStr.end(), '.', '_');
+	return format("%s_v%st%d", baseIdentifier.c_str(), versionStr.c_str(), threadIndex);
 }
 
 // UNIT TESTS
@@ -3233,7 +3395,7 @@ struct AbortableTest {
 	}
 };
 
-TEST_CASE("/fdbclient/multiversionclient/AbortableSingleAssignmentVar") {
+TEST_CASE("fdbclient/multiversionclient/AbortableSingleAssignmentVar") {
 	state volatile bool done = false;
 	state THREAD_HANDLE thread = g_network->startThread(runSingleAssignmentVarTest<AbortableTest>, (void*)&done);
 
@@ -3310,7 +3472,7 @@ struct DLTest {
 	}
 };
 
-TEST_CASE("/fdbclient/multiversionclient/DLSingleAssignmentVar") {
+TEST_CASE("fdbclient/multiversionclient/DLSingleAssignmentVar") {
 	state volatile bool done = false;
 
 	MultiVersionApi::api->callbackOnMainThread = true;
@@ -3354,7 +3516,7 @@ struct MapTest {
 	}
 };
 
-TEST_CASE("/fdbclient/multiversionclient/MapSingleAssignmentVar") {
+TEST_CASE("fdbclient/multiversionclient/MapSingleAssignmentVar") {
 	state volatile bool done = false;
 	state THREAD_HANDLE thread = g_network->startThread(runSingleAssignmentVarTest<MapTest>, (void*)&done);
 
@@ -3393,7 +3555,7 @@ struct FlatMapTest {
 	}
 };
 
-TEST_CASE("/fdbclient/multiversionclient/FlatMapSingleAssignmentVar") {
+TEST_CASE("fdbclient/multiversionclient/FlatMapSingleAssignmentVar") {
 	state volatile bool done = false;
 	state THREAD_HANDLE thread = g_network->startThread(runSingleAssignmentVarTest<FlatMapTest>, (void*)&done);
 

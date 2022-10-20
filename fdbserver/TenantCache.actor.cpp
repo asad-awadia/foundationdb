@@ -18,11 +18,16 @@
  * limitations under the License.
  */
 
-#include "fdbserver/DDTeamCollection.h"
-#include "fdbserver/TenantCache.h"
 #include <limits>
 #include <string>
-#include "flow/actorcompiler.h"
+
+#include "fdbclient/SystemData.h"
+#include "fdbclient/FDBTypes.h"
+#include "fdbserver/DDTeamCollection.h"
+#include "fdbserver/TenantCache.h"
+#include "flow/flow.h"
+#include "flow/Trace.h"
+#include "flow/actorcompiler.h" // This must be the last #include.
 
 class TenantCacheImpl {
 
@@ -87,6 +92,8 @@ public:
 				for (int i = 0; i < tenantList.size(); i++) {
 					if (tenantCache->update(tenantList[i].first, tenantList[i].second)) {
 						tenantListUpdated = true;
+						TenantCacheTenantCreated req(tenantList[i].second.prefix);
+						tenantCache->tenantCreationSignal.send(req);
 					}
 				}
 
@@ -109,6 +116,37 @@ public:
 				}
 				wait(tr.onError(e));
 			}
+		}
+	}
+
+	ACTOR static Future<Void> monitorStorageUsage(TenantCache* tenantCache) {
+		TraceEvent(SevInfo, "StartingTenantCacheStorageUsageMonitor", tenantCache->id()).log();
+
+		state int refreshInterval = SERVER_KNOBS->TENANT_CACHE_STORAGE_REFRESH_INTERVAL;
+		state double lastTenantListFetchTime = now();
+
+		loop {
+			state double fetchStartTime = now();
+			state std::vector<std::pair<KeyRef, TenantName>> tenantList = tenantCache->getTenantList();
+			state int i;
+			for (i = 0; i < tenantList.size(); i++) {
+				state ReadYourWritesTransaction tr(tenantCache->dbcx(), tenantList[i].second);
+				loop {
+					try {
+						state int64_t size = wait(tr.getEstimatedRangeSizeBytes(normalKeys));
+						tenantCache->updateStorageUsage(tenantList[i].first, size);
+					} catch (Error& e) {
+						TraceEvent("TenantCacheGetStorageUsageError", tenantCache->id()).error(e);
+						wait(tr.onError(e));
+					}
+				}
+			}
+
+			lastTenantListFetchTime = now();
+			if (lastTenantListFetchTime - fetchStartTime > (2 * refreshInterval)) {
+				TraceEvent(SevWarn, "TenantCacheGetStorageUsageRefreshSlow", tenantCache->id()).log();
+			}
+			wait(delay(refreshInterval));
 		}
 	}
 };
@@ -165,6 +203,21 @@ int TenantCache::cleanup() {
 	return tenantsRemoved;
 }
 
+std::vector<std::pair<KeyRef, TenantName>> TenantCache::getTenantList() const {
+	std::vector<std::pair<KeyRef, TenantName>> tenants;
+	for (const auto& [prefix, entry] : tenantCache) {
+		tenants.push_back({ prefix, entry->name() });
+	}
+	return tenants;
+}
+
+void TenantCache::updateStorageUsage(KeyRef prefix, int64_t size) {
+	auto it = tenantCache.find(prefix);
+	if (it != tenantCache.end()) {
+		it->value->updateStorageUsage(size);
+	}
+}
+
 std::string TenantCache::desc() const {
 	std::string s("@Generation: ");
 	s += std::to_string(generation) + " ";
@@ -174,7 +227,7 @@ std::string TenantCache::desc() const {
 			s += ", ";
 		}
 
-		s += "Name: " + tenant->name().toString() + " Prefix: " + tenantPrefix.printable();
+		s += "Name: " + tenant->name().toString() + " Prefix: " + tenantPrefix.toString();
 		count++;
 	}
 
@@ -194,12 +247,29 @@ bool TenantCache::isTenantKey(KeyRef key) const {
 	return true;
 }
 
-Future<Void> TenantCache::build(Database cx) {
+Future<Void> TenantCache::build() {
 	return TenantCacheImpl::build(this);
+}
+
+Optional<Reference<TCTenantInfo>> TenantCache::tenantOwning(KeyRef key) const {
+	auto it = tenantCache.lastLessOrEqual(key);
+	if (it == tenantCache.end()) {
+		return {};
+	}
+
+	if (!key.startsWith(it->key)) {
+		return {};
+	}
+
+	return it->value;
 }
 
 Future<Void> TenantCache::monitorTenantMap() {
 	return TenantCacheImpl::monitorTenantMap(this);
+}
+
+Future<Void> TenantCache::monitorStorageUsage() {
+	return TenantCacheImpl::monitorStorageUsage(this);
 }
 
 class TenantCacheUnitTest {

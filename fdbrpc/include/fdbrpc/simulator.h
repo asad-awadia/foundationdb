@@ -54,6 +54,7 @@ public:
 		FailDisk,
 		RebootAndDelete,
 		RebootProcessAndDelete,
+		RebootProcessAndSwitch,
 		Reboot,
 		RebootProcess,
 		None
@@ -104,6 +105,7 @@ public:
 		bool excluded;
 		bool cleared;
 		bool rebooting;
+		bool drProcess;
 		std::vector<flowGlobalType> globals;
 
 		INetworkConnections* network;
@@ -128,8 +130,8 @@ public:
 		            const char* coordinationFolder)
 		  : name(name), coordinationFolder(coordinationFolder), dataFolder(dataFolder), machine(nullptr),
 		    addresses(addresses), address(addresses.address), locality(locality), startingClass(startingClass),
-		    failed(false), excluded(false), cleared(false), rebooting(false), network(net), fault_injection_r(0),
-		    fault_injection_p1(0), fault_injection_p2(0), failedDisk(false) {
+		    failed(false), excluded(false), cleared(false), rebooting(false), drProcess(false), network(net),
+		    fault_injection_r(0), fault_injection_p1(0), fault_injection_p2(0), failedDisk(false) {
 			uid = deterministicRandom()->randomUniqueID();
 		}
 
@@ -185,6 +187,8 @@ public:
 			case ProcessClass::DataDistributorClass:
 				return false;
 			case ProcessClass::RatekeeperClass:
+				return false;
+			case ProcessClass::ConsistencyScanClass:
 				return false;
 			case ProcessClass::BlobManagerClass:
 				return false;
@@ -281,7 +285,8 @@ public:
 	                                ProcessClass startingClass,
 	                                const char* dataFolder,
 	                                const char* coordinationFolder,
-	                                ProtocolVersion protocol) = 0;
+	                                ProtocolVersion protocol,
+	                                bool drProcess) = 0;
 	virtual void killProcess(ProcessInfo* machine, KillType) = 0;
 	virtual void rebootProcess(Optional<Standalone<StringRef>> zoneId, bool allProcesses) = 0;
 	virtual void rebootProcess(ProcessInfo* process, KillType kt) = 0;
@@ -302,6 +307,7 @@ public:
 	                          KillType kt,
 	                          bool forceKill = false,
 	                          KillType* ktFinal = nullptr) = 0;
+	virtual bool killAll(KillType kt, bool forceKill = false, KillType* ktFinal = nullptr) = 0;
 	// virtual KillType getMachineKillState( UID zoneID ) = 0;
 	virtual bool canKillProcesses(std::vector<ProcessInfo*> const& availableProcesses,
 	                              std::vector<ProcessInfo*> const& deadProcesses,
@@ -388,6 +394,13 @@ public:
 		return clearedAddresses.find(address) != clearedAddresses.end();
 	}
 
+	void switchCluster(NetworkAddress const& address) { switchedCluster[address] = !switchedCluster[address]; }
+	bool hasSwitchedCluster(NetworkAddress const& address) const {
+		return switchedCluster.find(address) != switchedCluster.end() ? switchedCluster.at(address) : false;
+	}
+	void toggleGlobalSwitchCluster() { globalSwitchedCluster = !globalSwitchedCluster; }
+	bool globalHasSwitchedCluster() const { return globalSwitchedCluster; }
+
 	void excludeAddress(NetworkAddress const& address) {
 		excludedAddresses[address]++;
 		TraceEvent("ExcludeAddress").detail("Address", address).detail("Value", excludedAddresses[address]);
@@ -449,7 +462,13 @@ public:
 	int physicalDatacenters;
 	int processesPerMachine;
 	int listenersPerProcess;
+
+	// We won't kill machines in this set, but we might reboot
+	// them.  This is a conservative mechanism to prevent the
+	// simulator from killing off important processes and rendering
+	// the cluster unrecoverable, e.g. a quorum of coordinators.
 	std::set<NetworkAddress> protectedAddresses;
+
 	std::map<NetworkAddress, ProcessInfo*> currentlyRebootingProcesses;
 	std::vector<std::string> extraDatabases;
 	Reference<IReplicationPolicy> storagePolicy;
@@ -474,6 +493,7 @@ public:
 	TSSMode tssMode;
 	std::map<NetworkAddress, bool> corruptWorkerMap;
 	ConfigDBType configDBType;
+	bool blobGranulesEnabled;
 
 	// Used by workloads that perform reconfigurations
 	int testerCount;
@@ -494,6 +514,8 @@ public:
 	bool allowStorageMigrationTypeChange = false;
 	double injectTargetedSSRestartTime = std::numeric_limits<double>::max();
 	double injectSSDelayTime = std::numeric_limits<double>::max();
+	double injectTargetedBMRestartTime = std::numeric_limits<double>::max();
+	double injectTargetedBWRestartTime = std::numeric_limits<double>::max();
 
 	std::unordered_map<Standalone<StringRef>, PrivateKey> authKeys;
 
@@ -529,14 +551,14 @@ private:
 	std::set<Optional<Standalone<StringRef>>> swapsDisabled;
 	std::map<NetworkAddress, int> excludedAddresses;
 	std::map<NetworkAddress, int> clearedAddresses;
+	std::map<NetworkAddress, bool> switchedCluster;
+	bool globalSwitchedCluster = false;
 	std::map<NetworkAddress, std::map<std::string, int>> roleAddresses;
 	std::map<std::string, double> disabledMap;
 	bool allSwapsDisabled;
 };
 
-// Quickly make existing code work that expects g_simulator to be of class type (not a pointer)
-extern ISimulator* g_pSimulator;
-#define g_simulator (*g_pSimulator)
+extern ISimulator* g_simulator;
 
 void startNewSimulator(bool printSimTime);
 

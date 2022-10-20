@@ -27,6 +27,7 @@
 #include "fdbclient/VersionedMap.h"
 #include "fdbclient/KeyBackedTypes.h"
 #include "fdbrpc/TenantInfo.h"
+#include "flow/BooleanParam.h"
 #include "flow/flat_buffers.h"
 
 typedef StringRef TenantNameRef;
@@ -64,11 +65,13 @@ enum class TenantLockState { UNLOCKED, READ_ONLY, LOCKED };
 
 constexpr int TENANT_PREFIX_SIZE = sizeof(int64_t);
 
+FDB_DECLARE_BOOLEAN_PARAM(EnforceValidTenantId);
+
 struct TenantMapEntry {
 	constexpr static FileIdentifier file_identifier = 12247338;
 
 	static Key idToPrefix(int64_t id);
-	static int64_t prefixToId(KeyRef prefix);
+	static int64_t prefixToId(KeyRef prefix, EnforceValidTenantId enforceTenantId = EnforceValidTenantId::True);
 
 	static std::string tenantStateToString(TenantState tenantState);
 	static TenantState stringToTenantState(std::string stateStr);
@@ -96,7 +99,7 @@ struct TenantMapEntry {
 	TenantMapEntry(int64_t id, TenantState tenantState, Optional<TenantGroupName> tenantGroup, bool encrypted);
 
 	void setId(int64_t id);
-	std::string toJson(int apiVersion) const;
+	std::string toJson() const;
 
 	bool matchesConfiguration(TenantMapEntry const& other) const;
 	void configure(Standalone<StringRef> parameter, Optional<Value> value);
@@ -134,6 +137,8 @@ struct TenantGroupEntry {
 
 	TenantGroupEntry() = default;
 	TenantGroupEntry(Optional<ClusterName> assignedCluster) : assignedCluster(assignedCluster) {}
+
+	json_spirit::mObject toJson() const;
 
 	Value encode() { return ObjectWriter::toValue(*this, IncludeVersion()); }
 	static TenantGroupEntry decode(ValueRef const& value) {
@@ -176,6 +181,7 @@ struct TenantMetadataSpecification {
 	KeyBackedObjectProperty<TenantTombstoneCleanupData, decltype(IncludeVersion())> tombstoneCleanupData;
 	KeyBackedSet<Tuple> tenantGroupTenantIndex;
 	KeyBackedObjectMap<TenantGroupName, TenantGroupEntry, decltype(IncludeVersion()), NullCodec> tenantGroupMap;
+	KeyBackedBinaryValue<Versionstamp> lastTenantModification;
 
 	TenantMetadataSpecification(KeyRef prefix)
 	  : subspace(prefix.withSuffix("tenant/"_sr)), tenantMap(subspace.withSuffix("map/"_sr), IncludeVersion()),
@@ -183,7 +189,8 @@ struct TenantMetadataSpecification {
 	    tenantCount(subspace.withSuffix("count"_sr)), tenantTombstones(subspace.withSuffix("tombstones/"_sr)),
 	    tombstoneCleanupData(subspace.withSuffix("tombstoneCleanup"_sr), IncludeVersion()),
 	    tenantGroupTenantIndex(subspace.withSuffix("tenantGroup/tenantIndex/"_sr)),
-	    tenantGroupMap(subspace.withSuffix("tenantGroup/map/"_sr), IncludeVersion()) {}
+	    tenantGroupMap(subspace.withSuffix("tenantGroup/map/"_sr), IncludeVersion()),
+	    lastTenantModification(subspace.withSuffix("lastModification"_sr)) {}
 };
 
 struct TenantMetadata {
@@ -198,6 +205,7 @@ struct TenantMetadata {
 	static inline auto& tombstoneCleanupData() { return instance().tombstoneCleanupData; }
 	static inline auto& tenantGroupTenantIndex() { return instance().tenantGroupTenantIndex; }
 	static inline auto& tenantGroupMap() { return instance().tenantGroupMap; }
+	static inline auto& lastTenantModification() { return instance().lastTenantModification; }
 
 	static Key tenantMapPrivatePrefix();
 };

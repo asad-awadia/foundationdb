@@ -178,6 +178,7 @@ Future<std::pair<Optional<TenantMapEntry>, bool>> createTenantTransaction(
 
 	TenantMetadata::tenantMap().set(tr, name, tenantEntry);
 	TenantMetadata::tenantIdIndex().set(tr, tenantEntry.id, name);
+	TenantMetadata::lastTenantModification().setVersionstamp(tr, Versionstamp(), 0);
 
 	if (tenantEntry.tenantGroup.present()) {
 		TenantMetadata::tenantGroupTenantIndex().insert(tr, Tuple::makeTuple(tenantEntry.tenantGroup.get(), name));
@@ -346,6 +347,7 @@ Future<Void> deleteTenantTransaction(Transaction tr,
 		TenantMetadata::tenantMap().erase(tr, name);
 		TenantMetadata::tenantIdIndex().erase(tr, tenantEntry.get().id);
 		TenantMetadata::tenantCount().atomicOp(tr, -1, MutationRef::AddValue);
+		TenantMetadata::lastTenantModification().setVersionstamp(tr, Versionstamp(), 0);
 
 		if (tenantEntry.get().tenantGroup.present()) {
 			TenantMetadata::tenantGroupTenantIndex().erase(tr,
@@ -420,6 +422,7 @@ Future<Void> configureTenantTransaction(Transaction tr,
 
 	tr->setOption(FDBTransactionOptions::RAW_ACCESS);
 	TenantMetadata::tenantMap().set(tr, tenantName, updatedTenantEntry);
+	TenantMetadata::lastTenantModification().setVersionstamp(tr, Versionstamp(), 0);
 
 	// If the tenant group was changed, we need to update the tenant group metadata structures
 	if (originalEntry.tenantGroup != updatedTenantEntry.tenantGroup) {
@@ -462,8 +465,8 @@ Future<Void> configureTenantTransaction(Transaction tr,
 
 ACTOR template <class Transaction>
 Future<std::vector<std::pair<TenantName, TenantMapEntry>>> listTenantsTransaction(Transaction tr,
-                                                                                  TenantNameRef begin,
-                                                                                  TenantNameRef end,
+                                                                                  TenantName begin,
+                                                                                  TenantName end,
                                                                                   int limit) {
 	tr->setOption(FDBTransactionOptions::RAW_ACCESS);
 
@@ -523,6 +526,7 @@ Future<Void> renameTenantTransaction(Transaction tr,
 	TenantMetadata::tenantMap().erase(tr, oldName);
 	TenantMetadata::tenantMap().set(tr, newName, oldEntry.get());
 	TenantMetadata::tenantIdIndex().set(tr, oldEntry.get().id, newName);
+	TenantMetadata::lastTenantModification().setVersionstamp(tr, Versionstamp(), 0);
 
 	// Update the tenant group index to reflect the new tenant name
 	if (oldEntry.get().tenantGroup.present()) {
@@ -598,6 +602,62 @@ Future<Void> renameTenant(Reference<DB> db,
 		}
 	}
 }
+
+template <class Transaction>
+Future<Optional<TenantGroupEntry>> tryGetTenantGroupTransaction(Transaction tr, TenantGroupName name) {
+	tr->setOption(FDBTransactionOptions::RAW_ACCESS);
+	return TenantMetadata::tenantGroupMap().get(tr, name);
+}
+
+ACTOR template <class DB>
+Future<Optional<TenantGroupEntry>> tryGetTenantGroup(Reference<DB> db, TenantGroupName name) {
+	state Reference<typename DB::TransactionT> tr = db->createTransaction();
+
+	loop {
+		try {
+			tr->setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
+			tr->setOption(FDBTransactionOptions::READ_LOCK_AWARE);
+			Optional<TenantGroupEntry> entry = wait(tryGetTenantGroupTransaction(tr, name));
+			return entry;
+		} catch (Error& e) {
+			wait(safeThreadFutureToFuture(tr->onError(e)));
+		}
+	}
+}
+
+ACTOR template <class Transaction>
+Future<std::vector<std::pair<TenantGroupName, TenantGroupEntry>>> listTenantGroupsTransaction(Transaction tr,
+                                                                                              TenantGroupName begin,
+                                                                                              TenantGroupName end,
+                                                                                              int limit) {
+	tr->setOption(FDBTransactionOptions::RAW_ACCESS);
+
+	KeyBackedRangeResult<std::pair<TenantGroupName, TenantGroupEntry>> results =
+	    wait(TenantMetadata::tenantGroupMap().getRange(tr, begin, end, limit));
+
+	return results.results;
+}
+
+ACTOR template <class DB>
+Future<std::vector<std::pair<TenantGroupName, TenantGroupEntry>>> listTenantGroups(Reference<DB> db,
+                                                                                   TenantGroupName begin,
+                                                                                   TenantGroupName end,
+                                                                                   int limit) {
+	state Reference<typename DB::TransactionT> tr = db->createTransaction();
+
+	loop {
+		try {
+			tr->setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
+			tr->setOption(FDBTransactionOptions::READ_LOCK_AWARE);
+			std::vector<std::pair<TenantGroupName, TenantGroupEntry>> tenantGroups =
+			    wait(listTenantGroupsTransaction(tr, begin, end, limit));
+			return tenantGroups;
+		} catch (Error& e) {
+			wait(safeThreadFutureToFuture(tr->onError(e)));
+		}
+	}
+}
+
 } // namespace TenantAPI
 
 #include "flow/unactorcompiler.h"

@@ -26,7 +26,6 @@
 #include "fdbclient/RunTransaction.actor.h"
 #include "fdbclient/SystemData.h"
 #include "fdbclient/FDBTypes.h"
-#include "fdbclient/ManagementAPI.actor.h"
 #include "fdbserver/WorkerInterface.actor.h"
 #include "fdbserver/SpanContextMessage.h"
 #include "fdbserver/TLogInterface.h"
@@ -157,7 +156,7 @@ private:
 			Standalone<StringRef> h = wait(self->queue->readNext(sizeof(uint32_t)));
 			if (h.size() != sizeof(uint32_t)) {
 				if (h.size()) {
-					CODE_PROBE(true, "Zero fill within size field");
+					CODE_PROBE(true, "Zero fill within size field", probe::decoration::rare);
 					int payloadSize = 0;
 					memcpy(&payloadSize, h.begin(), h.size());
 					zeroFillSize = sizeof(uint32_t) - h.size(); // zero fill the size itself
@@ -200,32 +199,22 @@ private:
 // Immutable keys
 // persistFormat has been mostly invalidated by TLogVersion, and can probably be removed when
 // 4.6's TLog code is removed.
-static const KeyValueRef persistFormat(LiteralStringRef("Format"), LiteralStringRef("FoundationDB/LogServer/3/0"));
-static const KeyRangeRef persistFormatReadableRange(LiteralStringRef("FoundationDB/LogServer/3/0"),
-                                                    LiteralStringRef("FoundationDB/LogServer/4/0"));
-static const KeyRangeRef persistProtocolVersionKeys(LiteralStringRef("ProtocolVersion/"),
-                                                    LiteralStringRef("ProtocolVersion0"));
-static const KeyRangeRef persistTLogSpillTypeKeys(LiteralStringRef("TLogSpillType/"),
-                                                  LiteralStringRef("TLogSpillType0"));
-static const KeyRangeRef persistRecoveryCountKeys =
-    KeyRangeRef(LiteralStringRef("DbRecoveryCount/"), LiteralStringRef("DbRecoveryCount0"));
+static const KeyValueRef persistFormat("Format"_sr, "FoundationDB/LogServer/3/0"_sr);
+static const KeyRangeRef persistFormatReadableRange("FoundationDB/LogServer/3/0"_sr, "FoundationDB/LogServer/4/0"_sr);
+static const KeyRangeRef persistProtocolVersionKeys("ProtocolVersion/"_sr, "ProtocolVersion0"_sr);
+static const KeyRangeRef persistTLogSpillTypeKeys("TLogSpillType/"_sr, "TLogSpillType0"_sr);
+static const KeyRangeRef persistRecoveryCountKeys = KeyRangeRef("DbRecoveryCount/"_sr, "DbRecoveryCount0"_sr);
 
 // Updated on updatePersistentData()
-static const KeyRangeRef persistCurrentVersionKeys =
-    KeyRangeRef(LiteralStringRef("version/"), LiteralStringRef("version0"));
-static const KeyRangeRef persistKnownCommittedVersionKeys =
-    KeyRangeRef(LiteralStringRef("knownCommitted/"), LiteralStringRef("knownCommitted0"));
-static const KeyRef persistRecoveryLocationKey = KeyRef(LiteralStringRef("recoveryLocation"));
-static const KeyRangeRef persistLocalityKeys =
-    KeyRangeRef(LiteralStringRef("Locality/"), LiteralStringRef("Locality0"));
-static const KeyRangeRef persistLogRouterTagsKeys =
-    KeyRangeRef(LiteralStringRef("LogRouterTags/"), LiteralStringRef("LogRouterTags0"));
-static const KeyRangeRef persistTxsTagsKeys = KeyRangeRef(LiteralStringRef("TxsTags/"), LiteralStringRef("TxsTags0"));
-static const KeyRange persistTagMessagesKeys = prefixRange(LiteralStringRef("TagMsg/"));
-static const KeyRange persistTagMessageRefsKeys = prefixRange(LiteralStringRef("TagMsgRef/"));
-static const KeyRange persistTagPoppedKeys = prefixRange(LiteralStringRef("TagPop/"));
-
-static const KeyRef persistClusterIdKey = LiteralStringRef("clusterId");
+static const KeyRangeRef persistCurrentVersionKeys = KeyRangeRef("version/"_sr, "version0"_sr);
+static const KeyRangeRef persistKnownCommittedVersionKeys = KeyRangeRef("knownCommitted/"_sr, "knownCommitted0"_sr);
+static const KeyRef persistRecoveryLocationKey = KeyRef("recoveryLocation"_sr);
+static const KeyRangeRef persistLocalityKeys = KeyRangeRef("Locality/"_sr, "Locality0"_sr);
+static const KeyRangeRef persistLogRouterTagsKeys = KeyRangeRef("LogRouterTags/"_sr, "LogRouterTags0"_sr);
+static const KeyRangeRef persistTxsTagsKeys = KeyRangeRef("TxsTags/"_sr, "TxsTags0"_sr);
+static const KeyRange persistTagMessagesKeys = prefixRange("TagMsg/"_sr);
+static const KeyRange persistTagMessageRefsKeys = prefixRange("TagMsgRef/"_sr);
+static const KeyRange persistTagPoppedKeys = prefixRange("TagPop/"_sr);
 
 static Key persistTagMessagesKey(UID id, Tag tag, Version version) {
 	BinaryWriter wr(Unversioned());
@@ -314,13 +303,6 @@ struct TLogData : NonCopyable {
 	Deque<UID> spillOrder;
 	std::map<UID, Reference<struct LogData>> id_data;
 
-	// The durable cluster ID identifies which cluster the tlogs persistent
-	// data is written from. This value is restored from disk when the tlog
-	// restarts.
-	UID durableClusterId;
-	// The cluster-controller cluster ID stores the cluster ID read from the txnStateStore.
-	// It is cached in this variable.
-	UID ccClusterId;
 	UID dbgid;
 	UID workerID;
 
@@ -386,9 +368,8 @@ struct TLogData : NonCopyable {
 	    targetVolatileBytes(SERVER_KNOBS->TLOG_SPILL_THRESHOLD), overheadBytesInput(0), overheadBytesDurable(0),
 	    peekMemoryLimiter(SERVER_KNOBS->TLOG_SPILL_REFERENCE_MAX_PEEK_MEMORY_BYTES),
 	    concurrentLogRouterReads(SERVER_KNOBS->CONCURRENT_LOG_ROUTER_READS), ignorePopDeadline(0), dataFolder(folder),
-	    degraded(degraded), commitLatencyDist(Histogram::getHistogram(LiteralStringRef("tLog"),
-	                                                                  LiteralStringRef("commit"),
-	                                                                  Histogram::Unit::microseconds)) {
+	    degraded(degraded),
+	    commitLatencyDist(Histogram::getHistogram("tLog"_sr, "commit"_sr, Histogram::Unit::microseconds)) {
 		cx = openDBOnServer(dbInfo, TaskPriority::DefaultEndpoint, LockAware::True);
 	}
 };
@@ -661,10 +642,10 @@ struct LogData : NonCopyable, public ReferenceCounted<LogData> {
 		          context);
 		addActor.send(traceRole(Role::TRANSACTION_LOG, interf.id()));
 
-		persistentDataVersion.init(LiteralStringRef("TLog.PersistentDataVersion"), cc.id);
-		persistentDataDurableVersion.init(LiteralStringRef("TLog.PersistentDataDurableVersion"), cc.id);
-		version.initMetric(LiteralStringRef("TLog.Version"), cc.id);
-		queueCommittedVersion.initMetric(LiteralStringRef("TLog.QueueCommittedVersion"), cc.id);
+		persistentDataVersion.init("TLog.PersistentDataVersion"_sr, cc.id);
+		persistentDataDurableVersion.init("TLog.PersistentDataDurableVersion"_sr, cc.id);
+		version.initMetric("TLog.Version"_sr, cc.id);
+		queueCommittedVersion.initMetric("TLog.QueueCommittedVersion"_sr, cc.id);
 
 		specialCounter(cc, "Version", [this]() { return this->version.get(); });
 		specialCounter(cc, "QueueCommittedVersion", [this]() { return this->queueCommittedVersion.get(); });
@@ -1102,9 +1083,16 @@ ACTOR Future<Void> updatePersistentData(TLogData* self, Reference<LogData> logDa
 	    BinaryWriter::toValue(logData->knownCommittedVersion, Unversioned())));
 	logData->persistentDataVersion = newPersistentDataVersion;
 
+	// In some rare simulation tests, particularly with log_spill:=1 configured, the TLOG_MAX_CREATE_DURATION limit is
+	// exceeded, causing SevError trace events and simulation test failure. Increasing the value is a workaround to
+	// avoid these failures.
+	state double tLogMaxCreateDuration = SERVER_KNOBS->TLOG_MAX_CREATE_DURATION;
+	if (g_network->isSimulated() && logData->logSpillType == TLogSpillType::VALUE) {
+		tLogMaxCreateDuration = SERVER_KNOBS->TLOG_MAX_CREATE_DURATION * 2;
+	}
 	// SOMEDAY: This seems to be running pretty often, should we slow it down???
 	// This needs a timeout since nothing prevents I/O operations from hanging indefinitely.
-	wait(ioTimeoutError(self->persistentData->commit(), SERVER_KNOBS->TLOG_MAX_CREATE_DURATION));
+	wait(ioTimeoutError(self->persistentData->commit(), tLogMaxCreateDuration));
 
 	wait(delay(0, TaskPriority::UpdateStorage));
 
@@ -2161,7 +2149,7 @@ ACTOR Future<Void> doQueueCommit(TLogData* self,
 
 	wait(ioDegradedOrTimeoutError(
 	    c, SERVER_KNOBS->MAX_STORAGE_COMMIT_TIME, self->degraded, SERVER_KNOBS->TLOG_DEGRADED_DURATION));
-	if (g_network->isSimulated() && !g_simulator.speedUpSimulation && BUGGIFY_WITH_PROB(0.0001)) {
+	if (g_network->isSimulated() && !g_simulator->speedUpSimulation && BUGGIFY_WITH_PROB(0.0001)) {
 		wait(delay(6.0));
 	}
 	wait(self->queueCommitEnd.whenAtLeast(commitNumber - 1));
@@ -2198,7 +2186,7 @@ ACTOR Future<Void> doQueueCommit(TLogData* self,
 		    .detail("LogId", logData->logId)
 		    .detail("Version", it->version.get())
 		    .detail("QueueVer", it->queueCommittedVersion.get());
-		CODE_PROBE(true, "A TLog was replaced before having a chance to commit its queue");
+		CODE_PROBE(true, "A TLog was replaced before having a chance to commit its queue", probe::decoration::rare);
 		it->queueCommittedVersion.set(it->version.get());
 	}
 	return Void();
@@ -2368,10 +2356,7 @@ ACTOR Future<Void> initPersistentState(TLogData* self, Reference<LogData> logDat
 	wait(self->persistentDataCommitLock.take());
 	state FlowLock::Releaser commitLockReleaser(self->persistentDataCommitLock);
 
-	// PERSIST: Initial setup of persistentData for a brand new tLog for a new database
 	state IKeyValueStore* storage = self->persistentData;
-	wait(storage->init());
-	storage->set(persistFormat);
 	storage->set(
 	    KeyValueRef(BinaryWriter::toValue(logData->logId, Unversioned()).withPrefix(persistCurrentVersionKeys.begin),
 	                BinaryWriter::toValue(logData->version.get(), Unversioned())));
@@ -2401,27 +2386,9 @@ ACTOR Future<Void> initPersistentState(TLogData* self, Reference<LogData> logDat
 		updatePersistentPopped(self, logData, logData->getTagData(tag));
 	}
 
-	TraceEvent("TLogInitCommit", logData->logId).log();
+	TraceEvent("TLogInitCommit", logData->logId);
 	wait(self->persistentData->commit());
 	return Void();
-}
-
-ACTOR Future<UID> getClusterId(TLogData* self) {
-	state ReadYourWritesTransaction tr(self->cx);
-	loop {
-		try {
-			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
-			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-			Optional<Value> clusterId = wait(tr.get(clusterIdKey));
-			if (clusterId.present()) {
-				return BinaryReader::fromStringRef<UID>(clusterId.get(), Unversioned());
-			} else {
-				return UID();
-			}
-		} catch (Error& e) {
-			wait(tr.onError(e));
-		}
-	}
 }
 
 // send stopped promise instead of LogData* to avoid reference cycles
@@ -2446,26 +2413,14 @@ ACTOR Future<Void> rejoinClusterController(TLogData* self,
 		}
 		isDisplaced = isDisplaced && !inf.logSystemConfig.hasTLog(tli.id());
 		if (isDisplaced) {
-			state TraceEvent ev("TLogDisplaced", tli.id());
-			ev.detail("Reason", "DBInfoDoesNotContain")
+			TraceEvent("TLogDisplaced", tli.id())
+			    .detail("Reason", "DBInfoDoesNotContain")
 			    .detail("RecoveryCount", recoveryCount)
 			    .detail("InfRecoveryCount", inf.recoveryCount)
 			    .detail("RecoveryState", (int)inf.recoveryState)
 			    .detail("LogSysConf", describe(inf.logSystemConfig.tLogs))
 			    .detail("PriorLogs", describe(inf.priorCommittedLogServers))
 			    .detail("OldLogGens", inf.logSystemConfig.oldTLogs.size());
-			// Read and cache cluster ID before displacing this tlog. We want
-			// to avoid removing the tlogs data if it has joined a new cluster
-			// with a different cluster ID.
-
-			// TODO: #5375
-			/*
-			            state UID clusterId = wait(getClusterId(self));
-			            ASSERT(clusterId.isValid());
-			            self->ccClusterId = clusterId;
-			            ev.detail("ClusterId", clusterId).detail("SelfClusterId", self->durableClusterId);
-			*/
-
 			if (BUGGIFY)
 				wait(delay(SERVER_KNOBS->BUGGIFY_WORKER_REMOVED_MAX_LAG * deterministicRandom()->random01()));
 			throw worker_removed();
@@ -2657,17 +2612,6 @@ ACTOR Future<Void> serveTLogInterface(TLogData* self,
 				}
 			} else {
 				logData->logSystem->set(Reference<ILogSystem>());
-			}
-
-			// Persist cluster ID once cluster has recovered.
-			auto ccClusterId = self->dbInfo->get().client.clusterId;
-			if (self->dbInfo->get().recoveryState == RecoveryState::FULLY_RECOVERED &&
-			    !self->durableClusterId.isValid()) {
-				ASSERT(ccClusterId.isValid());
-				self->durableClusterId = ccClusterId;
-				self->persistentData->set(
-				    KeyValueRef(persistClusterIdKey, BinaryWriter::toValue(ccClusterId, Unversioned())));
-				wait(self->persistentData->commit());
 			}
 		}
 		when(TLogPeekStreamRequest req = waitNext(tli.peekStreamMessages.getFuture())) {
@@ -2990,10 +2934,19 @@ ACTOR Future<Void> checkEmptyQueue(TLogData* self) {
 	}
 }
 
-ACTOR Future<Void> checkRecovered(TLogData* self) {
-	TraceEvent("TLogCheckRecoveredBegin", self->dbgid).log();
-	Optional<Value> v = wait(self->persistentData->readValue(StringRef()));
-	TraceEvent("TLogCheckRecoveredEnd", self->dbgid).log();
+ACTOR Future<Void> initPersistentStorage(TLogData* self) {
+	TraceEvent("TLogInitPersistentStorageStart", self->dbgid);
+
+	wait(self->persistentDataCommitLock.take());
+	state FlowLock::Releaser commitLockReleaser(self->persistentDataCommitLock);
+
+	// PERSIST: Initial setup of persistentData for a brand new tLog for a new database
+	state IKeyValueStore* storage = self->persistentData;
+	storage->set(persistFormat);
+
+	wait(storage->commit());
+
+	TraceEvent("TLogInitPersistentStorageDone", self->dbgid);
 	return Void();
 }
 
@@ -3011,10 +2964,8 @@ ACTOR Future<Void> restorePersistentState(TLogData* self,
 	TraceEvent("TLogRestorePersistentState", self->dbgid).log();
 
 	state IKeyValueStore* storage = self->persistentData;
-	wait(storage->init());
 	state Future<Optional<Value>> fFormat = storage->readValue(persistFormat.key);
 	state Future<Optional<Value>> fRecoveryLocation = storage->readValue(persistRecoveryLocationKey);
-	state Future<Optional<Value>> fClusterId = storage->readValue(persistClusterIdKey);
 	state Future<RangeResult> fVers = storage->readRange(persistCurrentVersionKeys);
 	state Future<RangeResult> fKnownCommitted = storage->readRange(persistKnownCommittedVersionKeys);
 	state Future<RangeResult> fLocality = storage->readRange(persistLocalityKeys);
@@ -3026,7 +2977,7 @@ ACTOR Future<Void> restorePersistentState(TLogData* self,
 
 	// FIXME: metadata in queue?
 
-	wait(waitForAll(std::vector{ fFormat, fRecoveryLocation, fClusterId }));
+	wait(waitForAll(std::vector{ fFormat, fRecoveryLocation }));
 	wait(waitForAll(std::vector{ fVers,
 	                             fKnownCommitted,
 	                             fLocality,
@@ -3035,10 +2986,6 @@ ACTOR Future<Void> restorePersistentState(TLogData* self,
 	                             fRecoverCounts,
 	                             fProtocolVersions,
 	                             fTLogSpillTypes }));
-
-	if (fClusterId.get().present()) {
-		self->durableClusterId = BinaryReader::fromStringRef<UID>(fClusterId.get().get(), Unversioned());
-	}
 
 	if (fFormat.get().present() && !persistFormatReadableRange.contains(fFormat.get().get())) {
 		// FIXME: remove when we no longer need to test upgrades from 4.X releases
@@ -3054,7 +3001,7 @@ ACTOR Future<Void> restorePersistentState(TLogData* self,
 	}
 
 	if (!fFormat.get().present()) {
-		RangeResult v = wait(self->persistentData->readRange(KeyRangeRef(StringRef(), LiteralStringRef("\xff")), 1));
+		RangeResult v = wait(self->persistentData->readRange(KeyRangeRef(StringRef(), "\xff"_sr), 1));
 		if (!v.size()) {
 			CODE_PROBE(true, "The DB is completely empty, so it was never initialized.  Delete it.");
 			throw worker_removed();
@@ -3068,7 +3015,7 @@ ACTOR Future<Void> restorePersistentState(TLogData* self,
 
 	state std::vector<Future<ErrorOr<Void>>> removed;
 
-	ASSERT(fFormat.get().get() == LiteralStringRef("FoundationDB/LogServer/3/0"));
+	ASSERT(fFormat.get().get() == "FoundationDB/LogServer/3/0"_sr);
 
 	ASSERT(fVers.get().size() == fRecoverCounts.get().size());
 
@@ -3302,7 +3249,7 @@ bool tlogTerminated(TLogData* self, IKeyValueStore* persistentData, TLogQueue* p
 	}
 
 	if (e.code() == error_code_worker_removed || e.code() == error_code_recruitment_failed ||
-	    e.code() == error_code_file_not_found || e.code() == error_code_invalid_cluster_id) {
+	    e.code() == error_code_file_not_found) {
 		TraceEvent("TLogTerminated", self->dbgid).errorUnsuppressed(e);
 		return true;
 	} else
@@ -3576,98 +3523,52 @@ ACTOR Future<Void> tLog(IKeyValueStore* persistentData,
 	state TLogData self(tlogId, workerID, persistentData, persistentQueue, db, degraded, folder);
 	state Future<Void> error = actorCollection(self.sharedActors.getFuture());
 
-	TraceEvent("SharedTlog", tlogId).log();
+	TraceEvent("SharedTlog", tlogId);
 	try {
-		try {
-			if (restoreFromDisk) {
-				wait(restorePersistentState(&self, locality, oldLog, recovered, tlogRequests));
-			} else {
-				wait(ioTimeoutError(checkEmptyQueue(&self) && checkRecovered(&self),
-				                    SERVER_KNOBS->TLOG_MAX_CREATE_DURATION));
-			}
+		wait(ioTimeoutError(persistentData->init(), SERVER_KNOBS->TLOG_MAX_CREATE_DURATION));
 
-			// Disk errors need a chance to kill this actor.
-			wait(delay(0.000001));
+		if (restoreFromDisk) {
+			wait(restorePersistentState(&self, locality, oldLog, recovered, tlogRequests));
+		} else {
+			wait(ioTimeoutError(checkEmptyQueue(&self) && initPersistentStorage(&self),
+			                    SERVER_KNOBS->TLOG_MAX_CREATE_DURATION));
+		}
 
-			if (recovered.canBeSet())
-				recovered.send(Void());
+		// Disk errors need a chance to kill this actor.
+		wait(delay(0.000001));
 
-			self.sharedActors.send(commitQueue(&self));
-			self.sharedActors.send(updateStorageLoop(&self));
-			self.sharedActors.send(traceRole(Role::SHARED_TRANSACTION_LOG, tlogId));
-			state Future<Void> activeSharedChange = Void();
+		if (recovered.canBeSet())
+			recovered.send(Void());
 
-			loop {
-				choose {
-					when(state InitializeTLogRequest req = waitNext(tlogRequests.getFuture())) {
-						ASSERT(req.clusterId.isValid());
-						// Durably persist the cluster ID if it is not already
-						// durable and the cluster has progressed far enough
-						// through recovery. To avoid different partitions from
-						// persisting different cluster IDs, we need to wait
-						// until a single cluster ID has been persisted in the
-						// txnStateStore before finally writing it to disk.
-						auto recoveryState = self.dbInfo->get().recoveryState;
-						if (!self.durableClusterId.isValid() && recoveryState >= RecoveryState::ACCEPTING_COMMITS) {
-							self.durableClusterId = req.clusterId;
-							// Will let commit loop durably write the cluster ID.
-							self.persistentData->set(
-							    KeyValueRef(persistClusterIdKey, BinaryWriter::toValue(req.clusterId, Unversioned())));
-						}
+		self.sharedActors.send(commitQueue(&self));
+		self.sharedActors.send(updateStorageLoop(&self));
+		self.sharedActors.send(traceRole(Role::SHARED_TRANSACTION_LOG, tlogId));
+		state Future<Void> activeSharedChange = Void();
 
-						if (!self.tlogCache.exists(req.recruitmentID)) {
-							self.tlogCache.set(req.recruitmentID, req.reply.getFuture());
-							self.sharedActors.send(
-							    self.tlogCache.removeOnReady(req.recruitmentID, tLogStart(&self, req, locality)));
-						} else {
-							forwardPromise(req.reply, self.tlogCache.get(req.recruitmentID));
-						}
-					}
-					when(wait(error)) { throw internal_error(); }
-					when(wait(activeSharedChange)) {
-						if (activeSharedTLog->get() == tlogId) {
-							TraceEvent("SharedTLogNowActive", self.dbgid).detail("NowActive", activeSharedTLog->get());
-							self.targetVolatileBytes = SERVER_KNOBS->TLOG_SPILL_THRESHOLD;
-						} else {
-							stopAllTLogs(&self, tlogId);
-							TraceEvent("SharedTLogQueueSpilling", self.dbgid)
-							    .detail("NowActive", activeSharedTLog->get());
-							self.sharedActors.send(startSpillingInTenSeconds(&self, tlogId, activeSharedTLog));
-						}
-						activeSharedChange = activeSharedTLog->onChange();
+		loop {
+			choose {
+				when(state InitializeTLogRequest req = waitNext(tlogRequests.getFuture())) {
+					if (!self.tlogCache.exists(req.recruitmentID)) {
+						self.tlogCache.set(req.recruitmentID, req.reply.getFuture());
+						self.sharedActors.send(
+						    self.tlogCache.removeOnReady(req.recruitmentID, tLogStart(&self, req, locality)));
+					} else {
+						forwardPromise(req.reply, self.tlogCache.get(req.recruitmentID));
 					}
 				}
+				when(wait(error)) { throw internal_error(); }
+				when(wait(activeSharedChange)) {
+					if (activeSharedTLog->get() == tlogId) {
+						TraceEvent("SharedTLogNowActive", self.dbgid).detail("NowActive", activeSharedTLog->get());
+						self.targetVolatileBytes = SERVER_KNOBS->TLOG_SPILL_THRESHOLD;
+					} else {
+						stopAllTLogs(&self, tlogId);
+						TraceEvent("SharedTLogQueueSpilling", self.dbgid).detail("NowActive", activeSharedTLog->get());
+						self.sharedActors.send(startSpillingInTenSeconds(&self, tlogId, activeSharedTLog));
+					}
+					activeSharedChange = activeSharedTLog->onChange();
+				}
 			}
-		} catch (Error& e) {
-			throw;
-
-			// TODO: #5375
-			/*
-			            if (e.code() != error_code_worker_removed) {
-			                throw;
-			            }
-			            // Don't need to worry about deleting data if there is no durable
-			            // cluster ID.
-			            if (!self.durableClusterId.isValid()) {
-			                throw;
-			            }
-			            // When a tlog joins a new cluster and has data for an old cluster,
-			            // it should automatically exclude itself to avoid being used in
-			            // the new cluster.
-			            auto recoveryState = self.dbInfo->get().recoveryState;
-			            if (recoveryState == RecoveryState::FULLY_RECOVERED && self.ccClusterId.isValid() &&
-			                self.durableClusterId.isValid() && self.ccClusterId != self.durableClusterId) {
-			                state NetworkAddress address = g_network->getLocalAddress();
-			                wait(excludeServers(self.cx, { AddressExclusion{ address.ip, address.port } }));
-			                TraceEvent(SevWarnAlways, "TLogBelongsToExistingCluster")
-			                    .detail("ClusterId", self.durableClusterId)
-			                    .detail("NewClusterId", self.ccClusterId);
-			            }
-			            // If the tlog has a valid durable cluster ID, we don't want it to
-			            // wipe its data! Throw this error to signal to `tlogTerminated` to
-			            // close the persistent data store instead of deleting it.
-			            throw invalid_cluster_id();
-			*/
 		}
 	} catch (Error& e) {
 		self.terminated.send(Void());

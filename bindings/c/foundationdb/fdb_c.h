@@ -84,12 +84,12 @@ DLLEXPORT WARN_UNUSED_RESULT fdb_error_t fdb_network_set_option(FDBNetworkOption
                                                                 int value_length);
 
 #if FDB_API_VERSION >= 14
-DLLEXPORT WARN_UNUSED_RESULT fdb_error_t fdb_setup_network();
+DLLEXPORT WARN_UNUSED_RESULT fdb_error_t fdb_setup_network(void);
 #endif
 
-DLLEXPORT WARN_UNUSED_RESULT fdb_error_t fdb_run_network();
+DLLEXPORT WARN_UNUSED_RESULT fdb_error_t fdb_run_network(void);
 
-DLLEXPORT WARN_UNUSED_RESULT fdb_error_t fdb_stop_network();
+DLLEXPORT WARN_UNUSED_RESULT fdb_error_t fdb_stop_network(void);
 
 DLLEXPORT WARN_UNUSED_RESULT fdb_error_t fdb_add_network_thread_completion_hook(void (*hook)(void*),
                                                                                 void* hook_parameter);
@@ -376,6 +376,39 @@ DLLEXPORT WARN_UNUSED_RESULT FDBFuture* fdb_tenant_wait_purge_granules_complete(
                                                                                 uint8_t const* purge_key_name,
                                                                                 int purge_key_name_length);
 
+DLLEXPORT WARN_UNUSED_RESULT FDBFuture* fdb_tenant_blobbify_range(FDBTenant* tenant,
+                                                                  uint8_t const* begin_key_name,
+                                                                  int begin_key_name_length,
+                                                                  uint8_t const* end_key_name,
+                                                                  int end_key_name_length);
+
+DLLEXPORT WARN_UNUSED_RESULT FDBFuture* fdb_tenant_unblobbify_range(FDBTenant* tenant,
+                                                                    uint8_t const* begin_key_name,
+                                                                    int begin_key_name_length,
+                                                                    uint8_t const* end_key_name,
+                                                                    int end_key_name_length);
+
+DLLEXPORT WARN_UNUSED_RESULT FDBFuture* fdb_tenant_list_blobbified_ranges(FDBTenant* tenant,
+                                                                          uint8_t const* begin_key_name,
+                                                                          int begin_key_name_length,
+                                                                          uint8_t const* end_key_name,
+                                                                          int end_key_name_length,
+                                                                          int rangeLimit);
+
+DLLEXPORT WARN_UNUSED_RESULT FDBFuture* fdb_tenant_list_blobbified_ranges(FDBTenant* tenant,
+                                                                          uint8_t const* begin_key_name,
+                                                                          int begin_key_name_length,
+                                                                          uint8_t const* end_key_name,
+                                                                          int end_key_name_length,
+                                                                          int rangeLimit);
+
+DLLEXPORT WARN_UNUSED_RESULT FDBFuture* fdb_tenant_verify_blob_range(FDBTenant* tenant,
+                                                                     uint8_t const* begin_key_name,
+                                                                     int begin_key_name_length,
+                                                                     uint8_t const* end_key_name,
+                                                                     int end_key_name_length,
+                                                                     int64_t version);
+
 DLLEXPORT void fdb_tenant_destroy(FDBTenant* tenant);
 
 DLLEXPORT void fdb_transaction_destroy(FDBTransaction* tr);
@@ -548,8 +581,8 @@ DLLEXPORT WARN_UNUSED_RESULT FDBFuture* fdb_transaction_summarize_blob_granules(
 
 DLLEXPORT WARN_UNUSED_RESULT fdb_error_t fdb_select_api_version_impl(int runtime_version, int header_version);
 
-DLLEXPORT int fdb_get_max_api_version();
-DLLEXPORT const char* fdb_get_client_version();
+DLLEXPORT int fdb_get_max_api_version(void);
+DLLEXPORT const char* fdb_get_client_version(void);
 
 /* LEGACY API VERSIONS */
 

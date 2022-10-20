@@ -1,5 +1,5 @@
 /*
- * Versionstamp.h
+ * SignalSafeUnwind.h
  *
  * This source file is part of the FoundationDB open source project
  *
@@ -18,27 +18,13 @@
  * limitations under the License.
  */
 
-#ifndef FDBCLIENT_VERSIONSTAMP_H
-#define FDBCLIENT_VERSIONSTAMP_H
-
+#ifndef FLOW_SIGNAL_SAFE_UNWIND
+#define FLOW_SIGNAL_SAFE_UNWIND
 #pragma once
 
-#include "flow/Arena.h"
+#include "flow/Platform.h"
 
-const size_t VERSIONSTAMP_TUPLE_SIZE = 12;
-
-struct Versionstamp {
-	Versionstamp(StringRef);
-
-	int64_t getVersion() const;
-	int16_t getBatchNumber() const;
-	int16_t getUserVersion() const;
-	size_t size() const;
-	const uint8_t* begin() const;
-	bool operator==(const Versionstamp&) const;
-
-private:
-	Standalone<StringRef> data;
-};
+// This can be used by tests to measure the number of calls to dl_iterate_phdr intercepted
+extern int64_t dl_iterate_phdr_calls;
 
 #endif

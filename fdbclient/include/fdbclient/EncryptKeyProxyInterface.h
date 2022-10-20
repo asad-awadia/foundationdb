@@ -132,7 +132,7 @@ struct EKPGetBaseCipherKeysByIdsReply {
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, arena, baseCipherDetails, numHits, error);
+		serializer(ar, baseCipherDetails, numHits, error, arena);
 	}
 };
 
@@ -147,7 +147,7 @@ struct EKPGetBaseCipherKeysRequestInfo {
 	EncryptCipherDomainNameRef domainName;
 
 	EKPGetBaseCipherKeysRequestInfo()
-	  : domainId(ENCRYPT_INVALID_DOMAIN_ID), baseCipherId(ENCRYPT_INVALID_CIPHER_KEY_ID) {}
+	  : domainId(INVALID_ENCRYPT_DOMAIN_ID), baseCipherId(INVALID_ENCRYPT_CIPHER_KEY_ID) {}
 	EKPGetBaseCipherKeysRequestInfo(const EncryptCipherDomainId dId,
 	                                const EncryptCipherBaseKeyId bCId,
 	                                StringRef name,
@@ -197,6 +197,7 @@ struct EKPGetLatestBaseCipherKeysReply {
 	}
 };
 
+// TODO: also used for blob metadata, fix name
 struct EKPGetLatestCipherKeysRequestInfo {
 	constexpr static FileIdentifier file_identifier = 2180516;
 	// Encryption domain identifier
@@ -205,8 +206,8 @@ struct EKPGetLatestCipherKeysRequestInfo {
 	// {domainId, cipherBaseId} tuple
 	EncryptCipherDomainNameRef domainName;
 
-	EKPGetLatestCipherKeysRequestInfo() : domainId(ENCRYPT_INVALID_DOMAIN_ID) {}
-	EKPGetLatestCipherKeysRequestInfo(const EncryptCipherDomainId dId, StringRef name, Arena& arena)
+	EKPGetLatestCipherKeysRequestInfo() : domainId(INVALID_ENCRYPT_DOMAIN_ID) {}
+	explicit EKPGetLatestCipherKeysRequestInfo(Arena& arena, const EncryptCipherDomainId dId, StringRef name)
 	  : domainId(dId), domainName(StringRef(arena, name)) {}
 
 	bool operator==(const EKPGetLatestCipherKeysRequestInfo& info) const {
@@ -261,16 +262,15 @@ struct EKPGetLatestBlobMetadataReply {
 
 struct EKPGetLatestBlobMetadataRequest {
 	constexpr static FileIdentifier file_identifier = 3821549;
-	std::vector<BlobMetadataDomainId> domainIds;
+	Standalone<VectorRef<EKPGetLatestCipherKeysRequestInfo>> domainInfos;
 	Optional<UID> debugId;
 	ReplyPromise<EKPGetLatestBlobMetadataReply> reply;
 
 	EKPGetLatestBlobMetadataRequest() {}
-	explicit EKPGetLatestBlobMetadataRequest(const std::vector<BlobMetadataDomainId>& ids) : domainIds(ids) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, domainIds, debugId, reply);
+		serializer(ar, domainInfos, debugId, reply);
 	}
 };
 

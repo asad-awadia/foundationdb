@@ -132,7 +132,7 @@ struct KmsConnLookupKeyIdsReqInfoRef {
 	EncryptCipherDomainNameRef domainName;
 
 	KmsConnLookupKeyIdsReqInfoRef()
-	  : domainId(ENCRYPT_INVALID_DOMAIN_ID), baseCipherId(ENCRYPT_INVALID_CIPHER_KEY_ID) {}
+	  : domainId(INVALID_ENCRYPT_DOMAIN_ID), baseCipherId(INVALID_ENCRYPT_CIPHER_KEY_ID) {}
 	explicit KmsConnLookupKeyIdsReqInfoRef(Arena& arena,
 	                                       const EncryptCipherDomainId dId,
 	                                       const EncryptCipherBaseKeyId bCId,
@@ -185,7 +185,9 @@ struct KmsConnLookupDomainIdsReqInfoRef {
 	EncryptCipherDomainId domainId;
 	EncryptCipherDomainNameRef domainName;
 
-	KmsConnLookupDomainIdsReqInfoRef() : domainId(ENCRYPT_INVALID_DOMAIN_ID) {}
+	KmsConnLookupDomainIdsReqInfoRef() : domainId(INVALID_ENCRYPT_DOMAIN_ID) {}
+	explicit KmsConnLookupDomainIdsReqInfoRef(Arena& arena, const KmsConnLookupDomainIdsReqInfoRef& from)
+	  : domainId(from.domainId), domainName(StringRef(arena, from.domainName)) {}
 	explicit KmsConnLookupDomainIdsReqInfoRef(Arena& arena, const EncryptCipherDomainId dId, StringRef name)
 	  : domainId(dId), domainName(StringRef(arena, name)) {}
 	explicit KmsConnLookupDomainIdsReqInfoRef(const EncryptCipherDomainId dId, StringRef name)
@@ -232,17 +234,15 @@ struct KmsConnBlobMetadataRep {
 
 struct KmsConnBlobMetadataReq {
 	constexpr static FileIdentifier file_identifier = 3913147;
-	std::vector<BlobMetadataDomainId> domainIds;
+	Standalone<VectorRef<KmsConnLookupDomainIdsReqInfoRef>> domainInfos;
 	Optional<UID> debugId;
 	ReplyPromise<KmsConnBlobMetadataRep> reply;
 
 	KmsConnBlobMetadataReq() {}
-	explicit KmsConnBlobMetadataReq(const std::vector<BlobMetadataDomainId>& ids, Optional<UID> dbgId)
-	  : domainIds(ids), debugId(dbgId) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, domainIds, debugId, reply);
+		serializer(ar, domainInfos, debugId, reply);
 	}
 };
 

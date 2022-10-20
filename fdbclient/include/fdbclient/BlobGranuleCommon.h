@@ -22,10 +22,10 @@
 #define FDBCLIENT_BLOBGRANULECOMMON_H
 #pragma once
 
+#include "fdbclient/BlobCipher.h"
 #include "fdbclient/CommitTransaction.h"
 #include "fdbclient/FDBTypes.h"
 
-#include "flow/BlobCipher.h"
 #include "flow/EncryptUtils.h"
 #include "flow/IRandom.h"
 #include "flow/serialize.h"
@@ -53,6 +53,21 @@ struct GranuleDeltas : VectorRef<MutationsAndVersionRef> {
 	void serialize(Ar& ar) {
 		serializer(ar, ((VectorRef<MutationsAndVersionRef>&)*this));
 	}
+};
+
+struct GranuleMaterializeStats {
+	// file-level stats
+	int64_t inputBytes;
+	int64_t outputBytes;
+
+	// merge stats
+	int32_t snapshotRows;
+	int32_t rowsCleared;
+	int32_t rowsInserted;
+	int32_t rowsUpdated;
+
+	GranuleMaterializeStats()
+	  : inputBytes(0), outputBytes(0), snapshotRows(0), rowsCleared(0), rowsInserted(0), rowsUpdated(0) {}
 };
 
 struct BlobGranuleCipherKeysMeta {
@@ -273,6 +288,28 @@ struct BlobGranuleHistoryValue {
 	template <class Ar>
 	void serialize(Ar& ar) {
 		serializer(ar, granuleID, parentBoundaries, parentVersions);
+	}
+};
+
+struct GranuleHistory {
+	KeyRange range;
+	Version version;
+	Standalone<BlobGranuleHistoryValue> value;
+
+	GranuleHistory() {}
+
+	GranuleHistory(KeyRange range, Version version, Standalone<BlobGranuleHistoryValue> value)
+	  : range(range), version(version), value(value) {}
+};
+
+// A manifest to assist full fdb restore from blob granule files
+struct BlobManifest {
+	constexpr static FileIdentifier file_identifier = 298872;
+	VectorRef<KeyValueRef> rows;
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, rows);
 	}
 };
 

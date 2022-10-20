@@ -26,6 +26,7 @@
 #include "fdbrpc/TokenCache.h"
 #include "fdbrpc/FlowTransport.h"
 #include "flow/Arena.h"
+#include "flow/Knobs.h"
 
 struct TenantInfo {
 	static constexpr const int64_t INVALID_TENANT = -1;
@@ -41,6 +42,8 @@ struct TenantInfo {
 	// Is set during deserialization. It will be set to true if the tenant
 	// name is set and the client is authorized to use this tenant.
 	bool tenantAuthorized = false;
+	// Number of storage bytes currently used by this tenant.
+	int64_t storageUsage = 0;
 
 	// Helper function for most endpoints that read/write data. This returns true iff
 	// the client is either a) a trusted peer or b) is accessing keyspace belonging to a tenant,
@@ -69,8 +72,8 @@ struct serializable_traits<TenantInfo> : std::true_type {
 	static void serialize(Archiver& ar, TenantInfo& v) {
 		serializer(ar, v.name, v.tenantId, v.token, v.arena);
 		if constexpr (Archiver::isDeserializing) {
-			bool tenantAuthorized = false;
-			if (v.name.present() && v.token.present()) {
+			bool tenantAuthorized = FLOW_KNOBS->ALLOW_TOKENLESS_TENANT_ACCESS;
+			if (!tenantAuthorized && v.name.present() && v.token.present()) {
 				tenantAuthorized = TokenCache::instance().validate(v.name.get(), v.token.get());
 			}
 			v.trusted = FlowTransport::transport().currentDeliveryPeerIsTrusted();
