@@ -1121,6 +1121,7 @@ void clusterRegisterMaster(ClusterControllerData* self, RegisterMasterRequest co
 	    db->clientInfo->get().grvProxies != req.grvProxies ||
 	    db->clientInfo->get().tenantMode != db->config.tenantMode ||
 	    db->clientInfo->get().isEncryptionEnabled != SERVER_KNOBS->ENABLE_ENCRYPTION ||
+	    db->clientInfo->get().clusterId != db->serverInfo->get().client.clusterId ||
 	    db->clientInfo->get().clusterType != db->clusterType ||
 	    db->clientInfo->get().metaclusterName != db->metaclusterName ||
 	    db->clientInfo->get().encryptKeyProxy != db->serverInfo->get().encryptKeyProxy) {
@@ -1133,6 +1134,8 @@ void clusterRegisterMaster(ClusterControllerData* self, RegisterMasterRequest co
 		    .detail("TenantMode", db->clientInfo->get().tenantMode.toString())
 		    .detail("ReqTenantMode", db->config.tenantMode.toString())
 		    .detail("EncryptionEnabled", SERVER_KNOBS->ENABLE_ENCRYPTION)
+		    .detail("ClusterId", db->serverInfo->get().client.clusterId)
+		    .detail("ClientClusterId", db->clientInfo->get().clusterId)
 		    .detail("ClusterType", db->clientInfo->get().clusterType)
 		    .detail("ReqClusterType", db->clusterType)
 		    .detail("MetaclusterName", db->clientInfo->get().metaclusterName)
@@ -1146,6 +1149,7 @@ void clusterRegisterMaster(ClusterControllerData* self, RegisterMasterRequest co
 		clientInfo.commitProxies = req.commitProxies;
 		clientInfo.grvProxies = req.grvProxies;
 		clientInfo.tenantMode = TenantAPI::tenantModeForClusterType(db->clusterType, db->config.tenantMode);
+		clientInfo.clusterId = db->serverInfo->get().client.clusterId;
 		clientInfo.clusterType = db->clusterType;
 		clientInfo.metaclusterName = db->metaclusterName;
 		db->clientInfo->set(clientInfo);
@@ -2622,8 +2626,9 @@ ACTOR Future<Void> monitorBlobMigrator(ClusterControllerData* self) {
 	}
 	loop {
 		if (self->db.serverInfo->get().blobMigrator.present() && !self->recruitBlobMigrator.get()) {
-			state Future<Void> wfClient = waitFailureClient(self->db.serverInfo->get().blobMigrator.get().waitFailure,
-			                                                SERVER_KNOBS->BLOB_MIGRATOR_FAILURE_TIME);
+			state Future<Void> wfClient =
+			    waitFailureClient(self->db.serverInfo->get().blobMigrator.get().ssi.waitFailure,
+			                      SERVER_KNOBS->BLOB_MIGRATOR_FAILURE_TIME);
 			loop {
 				choose {
 					when(wait(wfClient)) {
@@ -3007,6 +3012,11 @@ ACTOR Future<Void> updateClusterId(ClusterControllerData* self) {
 				serverInfo.id = deterministicRandom()->randomUniqueID();
 				serverInfo.client.clusterId = durableClusterId.get();
 				self->db.serverInfo->set(serverInfo);
+
+				ClientDBInfo clientInfo = self->db.clientInfo->get();
+				clientInfo.id = deterministicRandom()->randomUniqueID();
+				clientInfo.clusterId = durableClusterId.get();
+				self->db.clientInfo->set(clientInfo);
 			}
 			return Void();
 		} catch (Error& e) {
@@ -3060,11 +3070,10 @@ ACTOR Future<Void> clusterControllerCore(ClusterControllerFullInterface interf,
 	self.addActor.send(metaclusterMetricsUpdater(&self));
 	self.addActor.send(dbInfoUpdater(&self));
 	self.addActor.send(updateClusterId(&self));
-	self.addActor.send(traceCounters("ClusterControllerMetrics",
-	                                 self.id,
-	                                 SERVER_KNOBS->STORAGE_LOGGING_DELAY,
-	                                 &self.clusterControllerMetrics,
-	                                 self.id.toString() + "/ClusterControllerMetrics"));
+	self.addActor.send(self.clusterControllerMetrics.traceCounters("ClusterControllerMetrics",
+	                                                               self.id,
+	                                                               SERVER_KNOBS->STORAGE_LOGGING_DELAY,
+	                                                               self.id.toString() + "/ClusterControllerMetrics"));
 	self.addActor.send(traceRole(Role::CLUSTER_CONTROLLER, interf.id()));
 	// printf("%s: I am the cluster controller\n", g_network->getLocalAddress().toString().c_str());
 

@@ -18,14 +18,23 @@
  * limitations under the License.
  */
 
+#include "fdbclient/Knobs.h"
 #include "fdbserver/GrvProxyTransactionTagThrottler.h"
+#include "fdbserver/Knobs.h"
 #include "flow/UnitTest.h"
 #include "flow/actorcompiler.h" // must be last include
 
 uint64_t GrvProxyTransactionTagThrottler::DelayedRequest::lastSequenceNumber = 0;
 
-void GrvProxyTransactionTagThrottler::DelayedRequest::updateProxyTagThrottledDuration() {
+void GrvProxyTransactionTagThrottler::DelayedRequest::updateProxyTagThrottledDuration(
+    LatencyBandsMap& latencyBandsMap) {
 	req.proxyTagThrottledDuration = now() - startTime;
+	auto const& [tag, count] = *req.tags.begin();
+	latencyBandsMap.addMeasurement(tag, req.proxyTagThrottledDuration, count);
+}
+
+bool GrvProxyTransactionTagThrottler::DelayedRequest::isMaxThrottled() const {
+	return now() - startTime > CLIENT_KNOBS->PROXY_MAX_TAG_THROTTLE_DURATION;
 }
 
 void GrvProxyTransactionTagThrottler::TagQueue::setRate(double rate) {
@@ -35,6 +44,26 @@ void GrvProxyTransactionTagThrottler::TagQueue::setRate(double rate) {
 		rateInfo = GrvTransactionRateInfo(rate);
 	}
 }
+
+bool GrvProxyTransactionTagThrottler::TagQueue::isMaxThrottled() const {
+	return !requests.empty() && requests.front().isMaxThrottled();
+}
+
+void GrvProxyTransactionTagThrottler::TagQueue::rejectRequests(LatencyBandsMap& latencyBandsMap) {
+	CODE_PROBE(true, "GrvProxyTransactionTagThrottler rejecting requests");
+	while (!requests.empty()) {
+		auto& delayedReq = requests.front();
+		delayedReq.updateProxyTagThrottledDuration(latencyBandsMap);
+		delayedReq.req.reply.sendError(proxy_tag_throttled());
+		requests.pop_front();
+	}
+}
+
+GrvProxyTransactionTagThrottler::GrvProxyTransactionTagThrottler()
+  : latencyBandsMap("GrvProxyTagThrottler",
+                    deterministicRandom()->randomUniqueID(),
+                    SERVER_KNOBS->GLOBAL_TAG_THROTTLING_PROXY_LOGGING_INTERVAL,
+                    SERVER_KNOBS->GLOBAL_TAG_THROTTLING_MAX_TAGS_TRACKED) {}
 
 void GrvProxyTransactionTagThrottler::updateRates(TransactionTagMap<double> const& newRates) {
 	for (const auto& [tag, rate] : newRates) {
@@ -73,6 +102,7 @@ void GrvProxyTransactionTagThrottler::addRequest(GetReadVersionRequest const& re
 		// SERVER_KNOBS->ENFORCE_TAG_THROTTLING_ON_PROXIES is enabled, there may be
 		// unexpected behaviour, because only one tag is used for throttling.
 		TraceEvent(SevWarnAlways, "GrvProxyTransactionTagThrottler_MultipleTags")
+		    .suppressFor(1.0)
 		    .detail("NumTags", req.tags.size())
 		    .detail("UsingTag", printable(tag));
 	}
@@ -80,8 +110,8 @@ void GrvProxyTransactionTagThrottler::addRequest(GetReadVersionRequest const& re
 }
 
 void GrvProxyTransactionTagThrottler::releaseTransactions(double elapsed,
-                                                          SpannedDeque<GetReadVersionRequest>& outBatchPriority,
-                                                          SpannedDeque<GetReadVersionRequest>& outDefaultPriority) {
+                                                          Deque<GetReadVersionRequest>& outBatchPriority,
+                                                          Deque<GetReadVersionRequest>& outDefaultPriority) {
 	// Pointer to a TagQueue with some extra metadata stored alongside
 	struct TagQueueHandle {
 		// Store pointers here to avoid frequent std::unordered_map lookups
@@ -140,12 +170,17 @@ void GrvProxyTransactionTagThrottler::releaseTransactions(double elapsed,
 				// Cannot release any more transaction from this tag (don't push the tag queue handle back into
 				// pqOfQueues)
 				CODE_PROBE(true, "GrvProxyTransactionTagThrottler throttling transaction");
+				if (tagQueueHandle.queue->isMaxThrottled()) {
+					// Requests in this queue have been throttled too long and errors
+					// should be sent to clients.
+					tagQueueHandle.queue->rejectRequests(latencyBandsMap);
+				}
 				break;
 			} else {
 				if (tagQueueHandle.nextSeqNo < nextQueueSeqNo) {
 					// Releasing transaction
 					*(tagQueueHandle.numReleased) += count;
-					delayedReq.updateProxyTagThrottledDuration();
+					delayedReq.updateProxyTagThrottledDuration(latencyBandsMap);
 					if (delayedReq.req.priority == TransactionPriority::BATCH) {
 						outBatchPriority.push_back(delayedReq.req);
 					} else if (delayedReq.req.priority == TransactionPriority::DEFAULT) {
@@ -184,7 +219,12 @@ void GrvProxyTransactionTagThrottler::releaseTransactions(double elapsed,
 	ASSERT_EQ(transactionsReleased.capacity(), transactionsReleasedInitialCapacity);
 }
 
-uint32_t GrvProxyTransactionTagThrottler::size() {
+void GrvProxyTransactionTagThrottler::addLatencyBandThreshold(double value) {
+	CODE_PROBE(size() > 0, "GrvProxyTransactionTagThrottler adding latency bands while actively throttling");
+	latencyBandsMap.addThreshold(value);
+}
+
+uint32_t GrvProxyTransactionTagThrottler::size() const {
 	return queues.size();
 }
 
@@ -255,8 +295,8 @@ ACTOR static Future<Void> mockFifoClient(GrvProxyTransactionTagThrottler* thrott
 }
 
 ACTOR static Future<Void> mockServer(GrvProxyTransactionTagThrottler* throttler) {
-	state SpannedDeque<GetReadVersionRequest> outBatchPriority("TestGrvProxyTransactionTagThrottler_Batch"_loc);
-	state SpannedDeque<GetReadVersionRequest> outDefaultPriority("TestGrvProxyTransactionTagThrottler_Default"_loc);
+	state Deque<GetReadVersionRequest> outBatchPriority;
+	state Deque<GetReadVersionRequest> outDefaultPriority;
 	loop {
 		state double elapsed = (0.009 + 0.002 * deterministicRandom()->random01());
 		wait(delay(elapsed));
@@ -379,8 +419,8 @@ TEST_CASE("/GrvProxyTransactionTagThrottler/Cleanup2") {
 	throttler.updateRates(TransactionTagMap<double>{});
 	ASSERT_EQ(throttler.size(), 1);
 	{
-		SpannedDeque<GetReadVersionRequest> outBatchPriority("TestGrvProxyTransactionTagThrottler_Batch"_loc);
-		SpannedDeque<GetReadVersionRequest> outDefaultPriority("TestGrvProxyTransactionTagThrottler_Default"_loc);
+		Deque<GetReadVersionRequest> outBatchPriority;
+		Deque<GetReadVersionRequest> outDefaultPriority;
 		throttler.releaseTransactions(0.1, outBatchPriority, outDefaultPriority);
 	}
 	// Calling updates cleans up the queues in throttler
