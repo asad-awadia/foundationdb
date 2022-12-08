@@ -435,7 +435,7 @@ namespace {
 EncryptionAtRestMode getEncryptionAtRest() {
 	// TODO: Use db-config encryption config to determine cluster encryption status
 	if (SERVER_KNOBS->ENABLE_ENCRYPTION) {
-		return EncryptionAtRestMode(EncryptionAtRestMode::Mode::AES_256_CTR);
+		return EncryptionAtRestMode(EncryptionAtRestMode::Mode::DOMAIN_AWARE);
 	} else {
 		return EncryptionAtRestMode();
 	}
@@ -1127,10 +1127,14 @@ ACTOR Future<Void> readTransactionSystemState(Reference<ClusterRecoveryData> sel
 
 		if (self->recoveryTransactionVersion < minRequiredCommitVersion)
 			self->recoveryTransactionVersion = minRequiredCommitVersion;
-	}
 
-	if (BUGGIFY) {
-		self->recoveryTransactionVersion += deterministicRandom()->randomInt64(0, 10000000);
+		// Test randomly increasing the recovery version by a large number.
+		// When the version epoch is enabled, versions stay in sync with time.
+		// An offline cluster could see a large version jump when it comes back
+		// online, so test this behavior in simulation.
+		if (BUGGIFY) {
+			self->recoveryTransactionVersion += deterministicRandom()->randomInt64(0, 10000000);
+		}
 	}
 
 	TraceEvent(getRecoveryEventName(ClusterRecoveryEventType::CLUSTER_RECOVERY_RECOVERING_EVENT_NAME).c_str(),
