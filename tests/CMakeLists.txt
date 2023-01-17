@@ -141,6 +141,7 @@ if(WITH_PYTHON)
   add_fdb_test(TEST_FILES fast/BlobGranuleVerifySmallClean.toml)
   # TODO: test occasionally times out due to too many change feed shard parts
   add_fdb_test(TEST_FILES fast/BlobGranuleMoveVerifyCycle.toml IGNORE)
+  add_fdb_test(TEST_FILES fast/BlobRestoreBasic.toml)
   add_fdb_test(TEST_FILES fast/CacheTest.toml)
   add_fdb_test(TEST_FILES fast/CloggedSideband.toml)
   add_fdb_test(TEST_FILES fast/CompressionUtilsUnit.toml)
@@ -209,7 +210,7 @@ if(WITH_PYTHON)
   add_fdb_test(TEST_FILES fast/WriteDuringReadClean.toml)
   add_fdb_test(TEST_FILES noSim/RandomUnitTests.toml UNIT)
   if(WITH_ROCKSDB_EXPERIMENTAL)
-    add_fdb_test(TEST_FILES fast/ValidateStorage.toml IGNORE)
+    add_fdb_test(TEST_FILES fast/ValidateStorage.toml)
     add_fdb_test(TEST_FILES noSim/KeyValueStoreRocksDBTest.toml UNIT)
     add_fdb_test(TEST_FILES noSim/ShardedRocksDBTest.toml UNIT)
     add_fdb_test(TEST_FILES fast/PhysicalShardMove.toml)
@@ -315,8 +316,8 @@ if(WITH_PYTHON)
     TEST_FILES restarting/from_7.1.0/VersionVectorEnableRestart-1.toml
     restarting/from_7.1.0/VersionVectorEnableRestart-2.toml)
   add_fdb_test(
-    TEST_FILES restarting/from_7.2.0/DrUpgradeRestart-1.txt
-    restarting/from_7.2.0/DrUpgradeRestart-2.txt)
+    TEST_FILES restarting/from_7.2.0/DrUpgradeRestart-1.toml
+          restarting/from_7.2.0/DrUpgradeRestart-2.toml)
   add_fdb_test(
     TEST_FILES restarting/to_7.2.0/CycleTestRestart-1.toml
     restarting/to_7.2.0/CycleTestRestart-2.toml)
