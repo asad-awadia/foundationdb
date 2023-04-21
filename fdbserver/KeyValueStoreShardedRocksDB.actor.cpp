@@ -1,3 +1,4 @@
+#include "fdbclient/FDBTypes.h"
 #ifdef SSD_ROCKSDB_EXPERIMENTAL
 
 #include "fdbclient/KeyRangeMap.h"
@@ -43,9 +44,9 @@
 
 #ifdef SSD_ROCKSDB_EXPERIMENTAL
 
-// Enforcing rocksdb version to be 7.7.3.
-static_assert((ROCKSDB_MAJOR == 7 && ROCKSDB_MINOR == 7 && ROCKSDB_PATCH == 3),
-              "Unsupported rocksdb version. Update the rocksdb to 7.7.3 version");
+// Enforcing rocksdb version to be 7.10.2
+static_assert((ROCKSDB_MAJOR == 7 && ROCKSDB_MINOR == 10 && ROCKSDB_PATCH == 2),
+              "Unsupported rocksdb version. Update the rocksdb to 7.10.2 version");
 
 const std::string rocksDataFolderSuffix = "-data";
 const std::string METADATA_SHARD_ID = "kvs-metadata";
@@ -167,10 +168,14 @@ rocksdb::ExportImportFilesMetaData getMetaData(const CheckpointMetaData& checkpo
 
 	for (const LiveFileMetaData& fileMetaData : rocksCF.sstFiles) {
 		rocksdb::LiveFileMetaData liveFileMetaData;
-		liveFileMetaData.size = fileMetaData.size;
-		liveFileMetaData.name = fileMetaData.name;
+		liveFileMetaData.relative_filename = fileMetaData.relative_filename;
+		liveFileMetaData.directory = fileMetaData.directory;
 		liveFileMetaData.file_number = fileMetaData.file_number;
-		liveFileMetaData.db_path = fileMetaData.db_path;
+		liveFileMetaData.file_type = static_cast<rocksdb::FileType>(fileMetaData.file_type);
+		liveFileMetaData.size = fileMetaData.size;
+		liveFileMetaData.temperature = static_cast<rocksdb::Temperature>(fileMetaData.temperature);
+		liveFileMetaData.file_checksum = fileMetaData.file_checksum;
+		liveFileMetaData.file_checksum_func_name = fileMetaData.file_checksum_func_name;
 		liveFileMetaData.smallest_seqno = fileMetaData.smallest_seqno;
 		liveFileMetaData.largest_seqno = fileMetaData.largest_seqno;
 		liveFileMetaData.smallestkey = fileMetaData.smallestkey;
@@ -179,12 +184,12 @@ rocksdb::ExportImportFilesMetaData getMetaData(const CheckpointMetaData& checkpo
 		liveFileMetaData.being_compacted = fileMetaData.being_compacted;
 		liveFileMetaData.num_entries = fileMetaData.num_entries;
 		liveFileMetaData.num_deletions = fileMetaData.num_deletions;
-		liveFileMetaData.temperature = static_cast<rocksdb::Temperature>(fileMetaData.temperature);
 		liveFileMetaData.oldest_blob_file_number = fileMetaData.oldest_blob_file_number;
 		liveFileMetaData.oldest_ancester_time = fileMetaData.oldest_ancester_time;
 		liveFileMetaData.file_creation_time = fileMetaData.file_creation_time;
-		liveFileMetaData.file_checksum = fileMetaData.file_checksum;
-		liveFileMetaData.file_checksum_func_name = fileMetaData.file_checksum_func_name;
+		liveFileMetaData.epoch_number = fileMetaData.epoch_number;
+		liveFileMetaData.name = fileMetaData.name;
+		liveFileMetaData.db_path = fileMetaData.db_path;
 		liveFileMetaData.column_family_name = fileMetaData.column_family_name;
 		liveFileMetaData.level = fileMetaData.level;
 		metaData.files.push_back(liveFileMetaData);
@@ -198,10 +203,14 @@ void populateMetaData(CheckpointMetaData* checkpoint, const rocksdb::ExportImpor
 	rocksCF.dbComparatorName = metaData.db_comparator_name;
 	for (const rocksdb::LiveFileMetaData& fileMetaData : metaData.files) {
 		LiveFileMetaData liveFileMetaData;
-		liveFileMetaData.size = fileMetaData.size;
-		liveFileMetaData.name = fileMetaData.name;
+		liveFileMetaData.relative_filename = fileMetaData.relative_filename;
+		liveFileMetaData.directory = fileMetaData.directory;
 		liveFileMetaData.file_number = fileMetaData.file_number;
-		liveFileMetaData.db_path = fileMetaData.db_path;
+		liveFileMetaData.file_type = static_cast<int>(fileMetaData.file_type);
+		liveFileMetaData.size = fileMetaData.size;
+		liveFileMetaData.temperature = static_cast<uint8_t>(fileMetaData.temperature);
+		liveFileMetaData.file_checksum = fileMetaData.file_checksum;
+		liveFileMetaData.file_checksum_func_name = fileMetaData.file_checksum_func_name;
 		liveFileMetaData.smallest_seqno = fileMetaData.smallest_seqno;
 		liveFileMetaData.largest_seqno = fileMetaData.largest_seqno;
 		liveFileMetaData.smallestkey = fileMetaData.smallestkey;
@@ -210,12 +219,12 @@ void populateMetaData(CheckpointMetaData* checkpoint, const rocksdb::ExportImpor
 		liveFileMetaData.being_compacted = fileMetaData.being_compacted;
 		liveFileMetaData.num_entries = fileMetaData.num_entries;
 		liveFileMetaData.num_deletions = fileMetaData.num_deletions;
-		liveFileMetaData.temperature = static_cast<uint8_t>(fileMetaData.temperature);
 		liveFileMetaData.oldest_blob_file_number = fileMetaData.oldest_blob_file_number;
 		liveFileMetaData.oldest_ancester_time = fileMetaData.oldest_ancester_time;
 		liveFileMetaData.file_creation_time = fileMetaData.file_creation_time;
-		liveFileMetaData.file_checksum = fileMetaData.file_checksum;
-		liveFileMetaData.file_checksum_func_name = fileMetaData.file_checksum_func_name;
+		liveFileMetaData.epoch_number = fileMetaData.epoch_number;
+		liveFileMetaData.name = fileMetaData.name;
+		liveFileMetaData.db_path = fileMetaData.db_path;
 		liveFileMetaData.column_family_name = fileMetaData.column_family_name;
 		liveFileMetaData.level = fileMetaData.level;
 		rocksCF.sstFiles.push_back(liveFileMetaData);
@@ -747,13 +756,15 @@ public:
 					}
 					std::string propValue = "";
 					ASSERT(shard->db->GetProperty(shard->cf, rocksdb::DB::Properties::kCFStats, &propValue));
-					TraceEvent(SevInfo, "PhysicalShardCFStats").detail("ShardId", id).detail("Detail", propValue);
+					TraceEvent(SevInfo, "PhysicalShardCFStats")
+					    .detail("PhysicalShardID", id)
+					    .detail("Detail", propValue);
 
 					// Get compression ratio for each level.
 					rocksdb::ColumnFamilyMetaData cfMetadata;
 					shard->db->GetColumnFamilyMetaData(shard->cf, &cfMetadata);
 					TraceEvent e(SevInfo, "PhysicalShardLevelStats");
-					e.detail("ShardId", id);
+					e.detail("PhysicalShardID", id);
 					std::string levelProp;
 					for (auto it = cfMetadata.levels.begin(); it != cfMetadata.levels.end(); ++it) {
 						std::string propValue = "";
@@ -815,7 +826,8 @@ public:
 				}
 				physicalShards[shard->id] = shard;
 				columnFamilyMap[handle->GetID()] = handle;
-				TraceEvent(SevVerbose, "ShardedRocksInitPhysicalShard", this->logId).detail("PhysicalShard", shard->id);
+				TraceEvent(SevVerbose, "ShardedRocksInitPhysicalShard", this->logId)
+				    .detail("PhysicalShardID", shard->id);
 			}
 
 			std::set<std::string> unusedShards(columnFamilies.begin(), columnFamilies.end());
@@ -994,7 +1006,7 @@ public:
 	}
 
 	PhysicalShard* addRange(KeyRange range, std::string id) {
-		TraceEvent(SevInfo, "ShardedRocksAddRangeBegin", this->logId)
+		TraceEvent(SevVerbose, "ShardedRocksAddRangeBegin", this->logId)
 		    .detail("Range", range)
 		    .detail("PhysicalShardID", id);
 
@@ -1002,11 +1014,23 @@ public:
 		auto ranges = dataShardMap.intersectingRanges(range);
 
 		for (auto it = ranges.begin(); it != ranges.end(); ++it) {
-			if (it.value() != nullptr && it.value()->physicalShard->id != id) {
-				TraceEvent(SevError, "ShardedRocksAddOverlappingRanges")
-				    .detail("IntersectingRange", it->range())
-				    .detail("DataShardRange", it->value()->range)
-				    .detail("PhysicalShard", it->value()->physicalShard->toString());
+			if (it.value()) {
+				if (it.value()->physicalShard->id == id) {
+					TraceEvent(SevError, "ShardedRocksDBAddRange")
+					    .detail("ErrorType", "RangeAlreadyExist")
+					    .detail("IntersectingRange", it->range())
+					    .detail("DataShardRange", it->value()->range)
+					    .detail("ExpectedShardId", id)
+					    .detail("PhysicalShardID", it->value()->physicalShard->toString());
+				} else {
+					TraceEvent(SevError, "ShardedRocksDBAddRange")
+					    .detail("ErrorType", "ConflictingRange")
+					    .detail("IntersectingRange", it->range())
+					    .detail("DataShardRange", it->value()->range)
+					    .detail("ExpectedShardId", id)
+					    .detail("PhysicalShardID", it->value()->physicalShard->toString());
+				}
+				return nullptr;
 			}
 		}
 
@@ -1022,7 +1046,7 @@ public:
 
 		validate();
 
-		TraceEvent(SevInfo, "ShardedRocksAddRangeEnd", this->logId)
+		TraceEvent(SevInfo, "ShardedRocksDBRangeAdded", this->logId)
 		    .detail("Range", range)
 		    .detail("PhysicalShardID", id);
 
@@ -1031,7 +1055,6 @@ public:
 
 	std::vector<std::string> removeRange(KeyRange range) {
 		TraceEvent(SevInfo, "ShardedRocksRemoveRangeBegin", this->logId).detail("Range", range);
-
 		std::vector<std::string> shardIds;
 
 		std::vector<DataShard*> newShards;
@@ -1048,6 +1071,22 @@ public:
 			auto existingShard = it.value()->physicalShard;
 			auto shardRange = it.range();
 
+			if (SERVER_KNOBS->ROCKSDB_EMPTY_RANGE_CHECK) {
+				// Enable consistency validation.
+				RangeResult rangeResult;
+				auto bytesRead = readRangeInDb(existingShard, range, 1, UINT16_MAX, &rangeResult);
+				if (bytesRead > 0) {
+					TraceEvent(SevError, "ShardedRocksDBRangeNotEmpty")
+					    .detail("PhysicalShard", existingShard->toString())
+					    .detail("Range", range)
+					    .detail("DataShardRange", shardRange);
+				}
+
+				// Force clear range.
+				writeBatch->DeleteRange(it.value()->physicalShard->cf, toSlice(range.begin), toSlice(range.end));
+				dirtyShards->insert(it.value()->physicalShard);
+			}
+
 			TraceEvent(SevDebug, "ShardedRocksRemoveRange")
 			    .detail("Range", range)
 			    .detail("IntersectingRange", shardRange)
@@ -1055,6 +1094,7 @@ public:
 			    .detail("PhysicalShard", existingShard->toString());
 
 			ASSERT(it.value()->range == shardRange); // Ranges should be consistent.
+
 			if (range.contains(shardRange)) {
 				existingShard->dataShards.erase(shardRange.begin.toString());
 				TraceEvent(SevInfo, "ShardedRocksRemovedRange")
@@ -1076,9 +1116,11 @@ public:
 			if (shardRange.begin < range.begin) {
 				auto dataShard =
 				    std::make_unique<DataShard>(KeyRange(KeyRangeRef(shardRange.begin, range.begin)), existingShard);
+
 				newShards.push_back(dataShard.get());
 				const std::string msg = "Shrink shard from " + Traceable<KeyRangeRef>::toString(shardRange) + " to " +
 				                        Traceable<KeyRangeRef>::toString(dataShard->range);
+
 				existingShard->dataShards[shardRange.begin.toString()] = std::move(dataShard);
 				logShardEvent(existingShard->id, shardRange, ShardOp::MODIFY_RANGE, SevInfo, msg);
 			}
@@ -1086,9 +1128,11 @@ public:
 			if (shardRange.end > range.end) {
 				auto dataShard =
 				    std::make_unique<DataShard>(KeyRange(KeyRangeRef(range.end, shardRange.end)), existingShard);
+
 				newShards.push_back(dataShard.get());
 				const std::string msg = "Shrink shard from " + Traceable<KeyRangeRef>::toString(shardRange) + " to " +
 				                        Traceable<KeyRangeRef>::toString(dataShard->range);
+
 				existingShard->dataShards[range.end.toString()] = std::move(dataShard);
 				logShardEvent(existingShard->id, shardRange, ShardOp::MODIFY_RANGE, SevInfo, msg);
 			}
@@ -1198,7 +1242,7 @@ public:
 					    .detail("Action", "PersistRangeMapping")
 					    .detail("BeginKey", it.range().begin)
 					    .detail("EndKey", it.range().end)
-					    .detail("ShardId", it.value()->physicalShard->id);
+					    .detail("PhysicalShardID", it.value()->physicalShard->id);
 
 				} else {
 					// Empty range.
@@ -1207,7 +1251,7 @@ public:
 					    .detail("Action", "PersistRangeMapping")
 					    .detail("BeginKey", it.range().begin)
 					    .detail("EndKey", it.range().end)
-					    .detail("ShardId", "None");
+					    .detail("PhysicalShardID", "None");
 				}
 				lastKey = it.range().end;
 			}
@@ -1302,6 +1346,23 @@ public:
 		return dataMap;
 	}
 
+	CoalescedKeyRangeMap<std::string> getExistingRanges() {
+		CoalescedKeyRangeMap<std::string> existingRanges;
+		existingRanges.insert(allKeys, "");
+		for (auto it : dataShardMap.intersectingRanges(allKeys)) {
+			if (!it.value()) {
+				continue;
+			}
+
+			if (it.value()->physicalShard->id == "kvs-metadata") {
+				continue;
+			}
+
+			existingRanges.insert(it.range(), it.value()->physicalShard->id);
+		}
+		return existingRanges;
+	}
+
 	void validate() {
 		TraceEvent(SevVerbose, "ShardedRocksValidateShardManager", this->logId);
 		for (auto s = dataShardMap.ranges().begin(); s != dataShardMap.ranges().end(); ++s) {
@@ -1315,6 +1376,10 @@ public:
 				e.detail("Shard", "Empty");
 			}
 			if (shard != nullptr) {
+				if (shard->range != static_cast<KeyRangeRef>(s->range())) {
+					TraceEvent(SevWarn, "ShardRangeMismatch").detail("Range", s->range());
+				}
+
 				ASSERT(shard->range == static_cast<KeyRangeRef>(s->range()));
 				ASSERT(shard->physicalShard != nullptr);
 				auto it = shard->physicalShard->dataShards.find(shard->range.begin.toString());
@@ -2367,6 +2432,7 @@ struct ShardedRocksDBKeyValueStore : IKeyValueStore {
 					TraceEvent(SevError, "ShardedRocksDBRestoreFailed", logId)
 					    .detail("Reason", "RestoreFilesRangesMismatch")
 					    .detail("Ranges", describe(a.ranges))
+					    .setMaxFieldLength(1000)
 					    .detail("FetchedFiles", describe(rkvs));
 					a.done.sendError(failed_to_restore_checkpoint());
 					return;
@@ -2847,7 +2913,7 @@ struct ShardedRocksDBKeyValueStore : IKeyValueStore {
 
 	void set(KeyValueRef kv, const Arena*) override { shardManager.put(kv.key, kv.value); }
 
-	void clear(KeyRangeRef range, const StorageServerMetrics*, const Arena*) override {
+	void clear(KeyRangeRef range, const Arena*) override {
 		if (range.singleKeyRange()) {
 			shardManager.clear(range.begin);
 		} else {
@@ -3040,11 +3106,13 @@ struct ShardedRocksDBKeyValueStore : IKeyValueStore {
 					break;
 				}
 				auto shards = shardManager->getPendingDeletionShards(cleanUpDelay);
-				auto a = new Writer::RemoveShardAction(shards);
-				Future<Void> f = a->done.getFuture();
-				writeThread->post(a);
-				TraceEvent(SevInfo, "ShardedRocksDB").detail("DeleteEmptyShards", shards.size());
-				wait(f);
+				if (shards.size() > 0) {
+					auto a = new Writer::RemoveShardAction(shards);
+					Future<Void> f = a->done.getFuture();
+					writeThread->post(a);
+					TraceEvent(SevInfo, "ShardedRocksDB").detail("DeleteEmptyShards", shards.size());
+					wait(f);
+				}
 			}
 		} catch (Error& e) {
 			if (e.code() != error_code_actor_cancelled) {
@@ -3101,6 +3169,12 @@ struct ShardedRocksDBKeyValueStore : IKeyValueStore {
 
 	// Used for debugging shard mapping issue.
 	std::vector<std::pair<KeyRange, std::string>> getDataMapping() { return shardManager.getDataMapping(); }
+
+	Future<EncryptionAtRestMode> encryptionMode() override {
+		return EncryptionAtRestMode(EncryptionAtRestMode::DISABLED);
+	}
+
+	CoalescedKeyRangeMap<std::string> getExistingRanges() override { return shardManager.getExistingRanges(); }
 
 	std::shared_ptr<ShardedRocksDBState> rState;
 	rocksdb::Options dbOptions;
@@ -3698,6 +3772,94 @@ TEST_CASE("noSim/ShardedRocksDB/CheckpointBasic") {
 
 	return Void();
 }
+
+TEST_CASE("noSim/ShardedRocksDB/RocksDBSstFileWriter") {
+	state std::string localFile = "rocksdb-sst-file-dump.sst";
+	state std::unique_ptr<IRocksDBSstFileWriter> sstWriter = newRocksDBSstFileWriter();
+	// Write nothing to sst file
+	sstWriter->open(localFile);
+	bool anyFileCreated = sstWriter->finish();
+	ASSERT(!anyFileCreated);
+	// Write kvs1 to sst file
+	state std::map<Key, Value> kvs1({ { "a"_sr, "1"_sr },
+	                                  { "ab"_sr, "12"_sr },
+	                                  { "ad"_sr, "14"_sr },
+	                                  { "b"_sr, "2"_sr },
+	                                  { "ba"_sr, "21"_sr },
+	                                  { "c"_sr, "3"_sr },
+	                                  { "d"_sr, "4"_sr },
+	                                  { "e"_sr, "5"_sr },
+	                                  { "h"_sr, "8"_sr },
+	                                  { "ha"_sr, "81"_sr } });
+	sstWriter = newRocksDBSstFileWriter();
+	sstWriter->open(localFile);
+	for (const auto& [key, value] : kvs1) {
+		sstWriter->write(key, value);
+	}
+	anyFileCreated = sstWriter->finish();
+	ASSERT(anyFileCreated);
+	// Write kvs2 to the same sst file where kvs2 keys are different from kvs1
+	state std::map<Key, Value> kvs2({ { "fa"_sr, "61"_sr },
+	                                  { "fab"_sr, "612"_sr },
+	                                  { "fad"_sr, "614"_sr },
+	                                  { "fb"_sr, "62"_sr },
+	                                  { "fba"_sr, "621"_sr },
+	                                  { "fc"_sr, "63"_sr },
+	                                  { "fd"_sr, "64"_sr },
+	                                  { "fe"_sr, "65"_sr },
+	                                  { "fh"_sr, "68"_sr },
+	                                  { "fha"_sr, "681"_sr } });
+	sstWriter->open(localFile);
+	for (const auto& [key, value] : kvs2) {
+		sstWriter->write(key, value);
+	}
+	anyFileCreated = sstWriter->finish();
+	ASSERT(anyFileCreated);
+	// Write kvs3 to the same sst file where kvs3 modifies values of kvs2
+	state std::map<Key, Value> kvs3({ { "fa"_sr, "1"_sr },
+	                                  { "fab"_sr, "12"_sr },
+	                                  { "fad"_sr, "14"_sr },
+	                                  { "fb"_sr, "2"_sr },
+	                                  { "fba"_sr, "21"_sr },
+	                                  { "fc"_sr, "3"_sr },
+	                                  { "fd"_sr, "4"_sr },
+	                                  { "fe"_sr, "5"_sr },
+	                                  { "fh"_sr, "8"_sr },
+	                                  { "fha"_sr, "81"_sr } });
+	sstWriter->open(localFile);
+	for (const auto& [key, value] : kvs3) {
+		sstWriter->write(key, value);
+	}
+	anyFileCreated = sstWriter->finish();
+	ASSERT(anyFileCreated);
+	// Check: sst only contains kv of kvs3
+	rocksdb::Status status;
+	rocksdb::IngestExternalFileOptions ingestOptions;
+	rocksdb::DB* db;
+	rocksdb::Options options;
+	options.create_if_missing = true;
+	status = rocksdb::DB::Open(options, "testdb", &db);
+	ASSERT(status.ok());
+	status = db->IngestExternalFile({ localFile }, ingestOptions);
+	ASSERT(status.ok());
+	std::string value;
+	for (const auto& [key, targetValue] : kvs1) {
+		status = db->Get(rocksdb::ReadOptions(), key.toString(), &value);
+		ASSERT(status.IsNotFound());
+	}
+	for (const auto& [key, targetValue] : kvs2) {
+		status = db->Get(rocksdb::ReadOptions(), key.toString(), &value);
+		ASSERT(value != targetValue.toString());
+	}
+	for (const auto& [key, targetValue] : kvs3) {
+		status = db->Get(rocksdb::ReadOptions(), key.toString(), &value);
+		ASSERT(status.ok());
+		ASSERT(value == targetValue.toString());
+	}
+	delete db;
+	return Void();
+}
+
 } // namespace
 
 #endif // SSD_ROCKSDB_EXPERIMENTAL

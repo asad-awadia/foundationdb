@@ -20,6 +20,7 @@
 
 #ifndef FDBSERVER_IKEYVALUESTORE_H
 #define FDBSERVER_IKEYVALUESTORE_H
+#include "flow/Trace.h"
 #pragma once
 
 #include "fdbclient/FDBTypes.h"
@@ -53,9 +54,7 @@ public:
 	// persistRangeMapping().
 	virtual bool shardAware() const { return false; }
 	virtual void set(KeyValueRef keyValue, const Arena* arena = nullptr) = 0;
-	virtual void clear(KeyRangeRef range,
-	                   const StorageServerMetrics* storageMetrics = nullptr,
-	                   const Arena* arena = nullptr) = 0;
+	virtual void clear(KeyRangeRef range, const Arena* arena = nullptr) = 0;
 	virtual Future<Void> canCommit() { return Void(); }
 	virtual Future<Void> commit(
 	    bool sequential = false) = 0; // returns when prior sets and clears are (atomically) durable
@@ -81,8 +80,14 @@ public:
 	// Removes a key range from KVS and returns a list of empty physical shards after the removal.
 	virtual std::vector<std::string> removeRange(KeyRangeRef range) { return std::vector<std::string>(); }
 
+	// Replace the specified range, the default implementation ignores `blockRange` and writes the key one by one.
+	virtual Future<Void> replaceRange(KeyRange range, Standalone<VectorRef<KeyValueRef>> data);
+
 	// Persists key range and physical shard mapping.
 	virtual void persistRangeMapping(KeyRangeRef range, bool isAdd) {}
+
+	// Returns key range to physical shard mapping.
+	virtual CoalescedKeyRangeMap<std::string> getExistingRanges() { throw not_implemented(); }
 
 	// To debug MEMORY_RADIXTREE type ONLY
 	// Returns (1) how many key & value pairs have been inserted (2) how many nodes have been created (3) how many
@@ -133,6 +138,9 @@ public:
 	// of a rollback.
 	virtual Future<Void> init() { return Void(); }
 
+	// Obtain the encryption mode of the storage. The encryption mode needs to match the encryption mode of the cluster.
+	virtual Future<EncryptionAtRestMode> encryptionMode() = 0;
+
 protected:
 	virtual ~IKeyValueStore() {}
 };
@@ -144,7 +152,8 @@ extern IKeyValueStore* keyValueStoreSQLite(std::string const& filename,
                                            bool checkIntegrity = false);
 extern IKeyValueStore* keyValueStoreRedwoodV1(std::string const& filename,
                                               UID logID,
-                                              Reference<IPageEncryptionKeyProvider> encryptionKeyProvider = {});
+                                              Reference<AsyncVar<ServerDBInfo> const> db = {},
+                                              Optional<EncryptionAtRestMode> encryptionMode = {});
 extern IKeyValueStore* keyValueStoreRocksDB(std::string const& path,
                                             UID logID,
                                             KeyValueStoreType storeType,
@@ -183,7 +192,16 @@ inline IKeyValueStore* openKVStore(KeyValueStoreType storeType,
                                    bool checkChecksums = false,
                                    bool checkIntegrity = false,
                                    bool openRemotely = false,
-                                   Reference<IPageEncryptionKeyProvider> encryptionKeyProvider = {}) {
+                                   Reference<AsyncVar<ServerDBInfo> const> db = {},
+                                   Optional<EncryptionAtRestMode> encryptionMode = {}) {
+	// Only Redwood support encryption currently.
+	if (encryptionMode.present() && encryptionMode.get().isEncryptionEnabled() &&
+	    storeType != KeyValueStoreType::SSD_REDWOOD_V1) {
+		TraceEvent(SevWarn, "KVStoreTypeNotSupportingEncryption")
+		    .detail("KVStoreType", storeType)
+		    .detail("EncryptionMode", encryptionMode);
+		throw encrypt_mode_mismatch();
+	}
 	if (openRemotely) {
 		return openRemoteKVStore(storeType, filename, logID, memoryLimit, checkChecksums, checkIntegrity);
 	}
@@ -195,7 +213,7 @@ inline IKeyValueStore* openKVStore(KeyValueStoreType storeType,
 	case KeyValueStoreType::MEMORY:
 		return keyValueStoreMemory(filename, logID, memoryLimit);
 	case KeyValueStoreType::SSD_REDWOOD_V1:
-		return keyValueStoreRedwoodV1(filename, logID, encryptionKeyProvider);
+		return keyValueStoreRedwoodV1(filename, logID, db, encryptionMode);
 	case KeyValueStoreType::SSD_ROCKSDB_V1:
 		return keyValueStoreRocksDB(filename, logID, storeType);
 	case KeyValueStoreType::SSD_SHARDED_ROCKSDB:

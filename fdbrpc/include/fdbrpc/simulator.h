@@ -32,6 +32,7 @@
 #include "flow/Histogram.h"
 #include "flow/ChaosMetrics.h"
 #include "flow/ProtocolVersion.h"
+#include "flow/WipedString.h"
 #include "fdbrpc/FailureMonitor.h"
 #include "fdbrpc/Locality.h"
 #include "flow/IAsyncFile.h"
@@ -53,6 +54,8 @@ namespace simulator {
 struct ProcessInfo;
 struct MachineInfo;
 } // namespace simulator
+
+constexpr double DISABLE_CONNECTION_FAILURE_FOREVER = 1e6;
 
 class ISimulator : public INetwork {
 
@@ -125,11 +128,14 @@ public:
 	                          KillType* ktFinal = nullptr) = 0;
 	virtual bool killAll(KillType kt, bool forceKill = false, KillType* ktFinal = nullptr) = 0;
 	// virtual KillType getMachineKillState( UID zoneID ) = 0;
+	virtual void processInjectBlobFault(ProcessInfo* machine, double failureRate) = 0;
+	virtual void processStopInjectBlobFault(ProcessInfo* machine) = 0;
 	virtual bool canKillProcesses(std::vector<ProcessInfo*> const& availableProcesses,
 	                              std::vector<ProcessInfo*> const& deadProcesses,
 	                              KillType kt,
 	                              KillType* newKillType) const = 0;
 	virtual bool isAvailable() const = 0;
+	virtual std::vector<AddressExclusion> getAllAddressesInDCToExclude(Optional<Standalone<StringRef>> dcId) const = 0;
 	virtual bool datacenterDead(Optional<Standalone<StringRef>> dcId) const = 0;
 	virtual void displayWorkers() const;
 	ProtocolVersion protocolVersion() const override = 0;
@@ -266,6 +272,7 @@ public:
 
 	virtual void clogInterface(const IPAddress& ip, double seconds, ClogMode mode = ClogDefault) = 0;
 	virtual void clogPair(const IPAddress& from, const IPAddress& to, double seconds) = 0;
+	virtual void unclogPair(const IPAddress& from, const IPAddress& to) = 0;
 	virtual std::vector<ProcessInfo*> getAllProcesses() const = 0;
 	virtual ProcessInfo* getProcessByAddress(NetworkAddress const& address) = 0;
 	virtual MachineInfo* getMachineByNetworkAddress(NetworkAddress const& address) = 0;
@@ -320,8 +327,11 @@ public:
 	double lastConnectionFailure;
 	double connectionFailuresDisableDuration;
 	bool speedUpSimulation;
+	double connectionFailureEnableTime; // Last time connection failure is enabled.
+	bool disableTLogRecoveryFinish;
 	BackupAgentType backupAgents;
 	BackupAgentType drAgents;
+	bool willRestart = false;
 	bool restarted = false;
 	ValidationData validationData;
 
@@ -338,6 +348,15 @@ public:
 
 	std::set<std::pair<std::string, unsigned>> corruptedBlocks;
 
+	// Valdiate at-rest encryption guarantees. If enabled, tests should inject a known 'marker' in Key and/or Values
+	// inserted into FDB by the workload. On shutdown, all test generated files (under simfdb/) are scanned to find if
+	// 'plaintext marker' is present.
+	Optional<std::string> dataAtRestPlaintextMarker;
+
+	// A collection of custom shard boundaries (begin, end, replication factor) that will be removed once this feature
+	// is integrated with a way to set these boundaries in the database
+	std::vector<std::tuple<std::string, std::string, int>> customReplicas;
+
 	flowGlobalType global(int id) const final;
 	void setGlobal(size_t id, flowGlobalType v) final;
 
@@ -346,7 +365,7 @@ public:
 	double checkDisabled(const std::string& desc) const;
 
 	// generate authz token for use in simulation environment
-	Standalone<StringRef> makeToken(StringRef tenantName, uint64_t ttlSecondsFromNow);
+	WipedString makeToken(int64_t tenantId, uint64_t ttlSecondsFromNow);
 
 	static thread_local ProcessInfo* currentProcess;
 
@@ -384,6 +403,12 @@ struct DiskParameters : ReferenceCounted<DiskParameters> {
 
 // Simulates delays for performing operations on disk
 extern Future<Void> waitUntilDiskReady(Reference<DiskParameters> parameters, int64_t size, bool sync = false);
+
+// Enables connection failures, i.e., clogging, in simulation
+void enableConnectionFailures(std::string const& context);
+
+// Disables connection failures, i.e., clogging, in simulation
+void disableConnectionFailures(std::string const& context);
 
 class Sim2FileSystem : public IAsyncFileSystem {
 public:

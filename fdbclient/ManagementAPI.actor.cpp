@@ -218,18 +218,58 @@ std::map<std::string, std::string> configForToken(std::string const& mode) {
 			out[p + key] = format("%d", mode);
 		}
 
+		if (key == "exclude") {
+			int p = 0;
+			while (p < value.size()) {
+				int end = value.find_first_of(',', p);
+				if (end == value.npos) {
+					end = value.size();
+				}
+				auto addrRef = StringRef(value).substr(p, end - p);
+				AddressExclusion addr = AddressExclusion::parse(addrRef);
+				if (addr.isValid()) {
+					out[encodeExcludedServersKey(addr)] = "";
+				} else {
+					printf("Error: invalid address format: %s\n", addrRef.toString().c_str());
+				}
+				p = end + 1;
+			}
+		}
+
+		if (key == "storage_engine" || key == "log_engine") {
+			StringRef s = value;
+
+			// Parse as engine_name[:p=v]... to handle future storage engine params
+			Value engine = s.eat(":");
+			std::map<Key, Value> params;
+			while (!s.empty()) {
+				params[s.eat("=")] = s.eat(":");
+			}
+
+			try {
+				out[p + key] = format("%d", KeyValueStoreType::fromString(engine.toString()).storeType());
+			} catch (Error& e) {
+				printf("Error: Invalid value for %s (%s): %s\n", key.c_str(), value.c_str(), e.what());
+			}
+			return out;
+		}
+
 		return out;
 	}
 
 	Optional<KeyValueStoreType> logType;
 	Optional<KeyValueStoreType> storeType;
+
+	// These are legacy shorthand commands to set a specific log engine and storage engine
+	// based only on the storage engine name.  Most of them assume SQLite should be the
+	// log engine.
 	if (mode == "ssd-1") {
 		logType = KeyValueStoreType::SSD_BTREE_V1;
 		storeType = KeyValueStoreType::SSD_BTREE_V1;
 	} else if (mode == "ssd" || mode == "ssd-2") {
 		logType = KeyValueStoreType::SSD_BTREE_V2;
 		storeType = KeyValueStoreType::SSD_BTREE_V2;
-	} else if (mode == "ssd-redwood-1-experimental") {
+	} else if (mode == "ssd-redwood-1" || mode == "ssd-redwood-1-experimental") {
 		logType = KeyValueStoreType::SSD_BTREE_V2;
 		storeType = KeyValueStoreType::SSD_REDWOOD_V1;
 	} else if (mode == "ssd-rocksdb-v1") {
@@ -252,7 +292,7 @@ std::map<std::string, std::string> configForToken(std::string const& mode) {
 
 	if (storeType.present()) {
 		out[p + "log_engine"] = format("%d", logType.get().storeType());
-		out[p + "storage_engine"] = format("%d", KeyValueStoreType::StoreType(storeType.get()));
+		out[p + "storage_engine"] = format("%d", storeType.get().storeType());
 		return out;
 	}
 
@@ -389,7 +429,10 @@ ConfigurationResult buildConfiguration(std::vector<StringRef> const& modeTokens,
 
 		for (auto t = m.begin(); t != m.end(); ++t) {
 			if (outConf.count(t->first)) {
-				TraceEvent(SevWarnAlways, "ConflictingOption").detail("Option", t->first);
+				TraceEvent(SevWarnAlways, "ConflictingOption")
+				    .detail("Option", t->first)
+				    .detail("Value", t->second)
+				    .detail("ExistingValue", outConf[t->first]);
 				return ConfigurationResult::CONFLICTING_OPTIONS;
 			}
 			outConf[t->first] = t->second;
@@ -630,7 +673,10 @@ TEST_CASE("/ManagementAPI/ChangeConfig/TenantAndEncryptMode") {
 	return Void();
 }
 
-ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration(Transaction* tr) {
+ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration(Transaction* tr, bool useSystemPriority) {
+	if (useSystemPriority) {
+		tr->setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+	}
 	tr->setOption(FDBTransactionOptions::READ_LOCK_AWARE);
 	tr->setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
 	RangeResult res = wait(tr->getRange(configKeys, CLIENT_KNOBS->TOO_MANY));
@@ -640,11 +686,11 @@ ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration(Transaction* tr) {
 	return config;
 }
 
-ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration(Database cx) {
+ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration(Database cx, bool useSystemPriority) {
 	state Transaction tr(cx);
 	loop {
 		try {
-			DatabaseConfiguration config = wait(getDatabaseConfiguration(&tr));
+			DatabaseConfiguration config = wait(getDatabaseConfiguration(&tr, useSystemPriority));
 			return config;
 		} catch (Error& e) {
 			wait(tr.onError(e));
@@ -1414,7 +1460,7 @@ struct AutoQuorumChange final : IQuorumChange {
 			desiredCount = redundancy * 2 - 1;
 		}
 
-		std::vector<AddressExclusion> excl = wait(getExcludedServers(tr));
+		std::vector<AddressExclusion> excl = wait(getAllExcludedServers(tr));
 		state std::set<AddressExclusion> excluded(excl.begin(), excl.end());
 
 		std::vector<ProcessData> _workers = wait(getWorkers(tr));
@@ -1560,23 +1606,37 @@ Reference<IQuorumChange> autoQuorumChange(int desired) {
 	return Reference<IQuorumChange>(new AutoQuorumChange(desired));
 }
 
-void excludeServers(Transaction& tr, std::vector<AddressExclusion>& servers, bool failed) {
-	tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
-	tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
-	tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-	tr.setOption(FDBTransactionOptions::USE_PROVISIONAL_PROXIES);
-	std::string excludeVersionKey = deterministicRandom()->randomUniqueID().toString();
-	auto serversVersionKey = failed ? failedServersVersionKey : excludedServersVersionKey;
-	tr.addReadConflictRange(singleKeyRange(serversVersionKey)); // To conflict with parallel includeServers
-	tr.set(serversVersionKey, excludeVersionKey);
+ACTOR Future<Void> excludeServers(Transaction* tr, std::vector<AddressExclusion> servers, bool failed) {
+	tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+	tr->setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+	tr->setOption(FDBTransactionOptions::LOCK_AWARE);
+	tr->setOption(FDBTransactionOptions::USE_PROVISIONAL_PROXIES);
+	std::vector<AddressExclusion> excl = wait(failed ? getExcludedFailedServerList(tr) : getExcludedServerList(tr));
+	std::set<AddressExclusion> exclusions(excl.begin(), excl.end());
+	bool containNewExclusion = false;
 	for (auto& s : servers) {
+		if (exclusions.find(s) != exclusions.end()) {
+			continue;
+		}
+		containNewExclusion = true;
 		if (failed) {
-			tr.set(encodeFailedServersKey(s), StringRef());
+			tr->set(encodeFailedServersKey(s), StringRef());
 		} else {
-			tr.set(encodeExcludedServersKey(s), StringRef());
+			tr->set(encodeExcludedServersKey(s), StringRef());
 		}
 	}
-	TraceEvent("ExcludeServersCommit").detail("Servers", describe(servers)).detail("ExcludeFailed", failed);
+
+	if (containNewExclusion) {
+		std::string excludeVersionKey = deterministicRandom()->randomUniqueID().toString();
+		auto serversVersionKey = failed ? failedServersVersionKey : excludedServersVersionKey;
+		tr->addReadConflictRange(singleKeyRange(serversVersionKey)); // To conflict with parallel includeServers
+		tr->set(serversVersionKey, excludeVersionKey);
+	}
+	TraceEvent("ExcludeServersCommit")
+	    .detail("Servers", describe(servers))
+	    .detail("ExcludeFailed", failed)
+	    .detail("ExclusionUpdated", containNewExclusion);
+	return Void();
 }
 
 ACTOR Future<Void> excludeServers(Database cx, std::vector<AddressExclusion> servers, bool failed) {
@@ -1609,7 +1669,7 @@ ACTOR Future<Void> excludeServers(Database cx, std::vector<AddressExclusion> ser
 		state Transaction tr(cx);
 		loop {
 			try {
-				excludeServers(tr, servers, failed);
+				wait(excludeServers(&tr, servers, failed));
 				wait(tr.commit());
 				return Void();
 			} catch (Error& e) {
@@ -1621,23 +1681,36 @@ ACTOR Future<Void> excludeServers(Database cx, std::vector<AddressExclusion> ser
 }
 
 // excludes localities by setting the keys in api version below 7.0
-void excludeLocalities(Transaction& tr, std::unordered_set<std::string> localities, bool failed) {
-	tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
-	tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
-	tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-	tr.setOption(FDBTransactionOptions::USE_PROVISIONAL_PROXIES);
-	std::string excludeVersionKey = deterministicRandom()->randomUniqueID().toString();
-	auto localityVersionKey = failed ? failedLocalityVersionKey : excludedLocalityVersionKey;
-	tr.addReadConflictRange(singleKeyRange(localityVersionKey)); // To conflict with parallel includeLocalities
-	tr.set(localityVersionKey, excludeVersionKey);
+ACTOR Future<Void> excludeLocalities(Transaction* tr, std::unordered_set<std::string> localities, bool failed) {
+	tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+	tr->setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+	tr->setOption(FDBTransactionOptions::LOCK_AWARE);
+	tr->setOption(FDBTransactionOptions::USE_PROVISIONAL_PROXIES);
+	std::vector<std::string> excl = wait(failed ? getExcludedFailedLocalityList(tr) : getExcludedLocalityList(tr));
+	std::set<std::string> exclusion(excl.begin(), excl.end());
+	bool containNewExclusion = false;
 	for (const auto& l : localities) {
+		if (exclusion.find(l) != exclusion.end()) {
+			continue;
+		}
+		containNewExclusion = true;
 		if (failed) {
-			tr.set(encodeFailedLocalityKey(l), StringRef());
+			tr->set(encodeFailedLocalityKey(l), StringRef());
 		} else {
-			tr.set(encodeExcludedLocalityKey(l), StringRef());
+			tr->set(encodeExcludedLocalityKey(l), StringRef());
 		}
 	}
-	TraceEvent("ExcludeLocalitiesCommit").detail("Localities", describe(localities)).detail("ExcludeFailed", failed);
+	if (containNewExclusion) {
+		std::string excludeVersionKey = deterministicRandom()->randomUniqueID().toString();
+		auto localityVersionKey = failed ? failedLocalityVersionKey : excludedLocalityVersionKey;
+		tr->addReadConflictRange(singleKeyRange(localityVersionKey)); // To conflict with parallel includeLocalities
+		tr->set(localityVersionKey, excludeVersionKey);
+	}
+	TraceEvent("ExcludeLocalitiesCommit")
+	    .detail("Localities", describe(localities))
+	    .detail("ExcludeFailed", failed)
+	    .detail("ExclusionUpdated", containNewExclusion);
+	return Void();
 }
 
 // Exclude the servers matching the given set of localities from use as state servers.
@@ -1673,7 +1746,7 @@ ACTOR Future<Void> excludeLocalities(Database cx, std::unordered_set<std::string
 		state Transaction tr(cx);
 		loop {
 			try {
-				excludeLocalities(tr, localities, failed);
+				wait(excludeLocalities(&tr, localities, failed));
 				wait(tr.commit());
 				return Void();
 			} catch (Error& e) {
@@ -1907,11 +1980,9 @@ ACTOR Future<Void> setClass(Database cx, AddressExclusion server, ProcessClass p
 	}
 }
 
-ACTOR Future<std::vector<AddressExclusion>> getExcludedServers(Transaction* tr) {
+ACTOR Future<std::vector<AddressExclusion>> getExcludedServerList(Transaction* tr) {
 	state RangeResult r = wait(tr->getRange(excludedServersKeys, CLIENT_KNOBS->TOO_MANY));
 	ASSERT(!r.more && r.size() < CLIENT_KNOBS->TOO_MANY);
-	state RangeResult r2 = wait(tr->getRange(failedServersKeys, CLIENT_KNOBS->TOO_MANY));
-	ASSERT(!r2.more && r2.size() < CLIENT_KNOBS->TOO_MANY);
 
 	std::vector<AddressExclusion> exclusions;
 	for (auto i = r.begin(); i != r.end(); ++i) {
@@ -1919,7 +1990,16 @@ ACTOR Future<std::vector<AddressExclusion>> getExcludedServers(Transaction* tr) 
 		if (a.isValid())
 			exclusions.push_back(a);
 	}
-	for (auto i = r2.begin(); i != r2.end(); ++i) {
+	uniquify(exclusions);
+	return exclusions;
+}
+
+ACTOR Future<std::vector<AddressExclusion>> getExcludedFailedServerList(Transaction* tr) {
+	state RangeResult r = wait(tr->getRange(failedServersKeys, CLIENT_KNOBS->TOO_MANY));
+	ASSERT(!r.more && r.size() < CLIENT_KNOBS->TOO_MANY);
+
+	std::vector<AddressExclusion> exclusions;
+	for (auto i = r.begin(); i != r.end(); ++i) {
 		auto a = decodeFailedServersKey(i->key);
 		if (a.isValid())
 			exclusions.push_back(a);
@@ -1928,14 +2008,24 @@ ACTOR Future<std::vector<AddressExclusion>> getExcludedServers(Transaction* tr) 
 	return exclusions;
 }
 
-ACTOR Future<std::vector<AddressExclusion>> getExcludedServers(Database cx) {
+ACTOR Future<std::vector<AddressExclusion>> getAllExcludedServers(Transaction* tr) {
+	state std::vector<AddressExclusion> exclusions;
+	std::vector<AddressExclusion> excludedServers = wait(getExcludedServerList(tr));
+	exclusions.insert(exclusions.end(), excludedServers.begin(), excludedServers.end());
+	std::vector<AddressExclusion> excludedFailed = wait(getExcludedFailedServerList(tr));
+	exclusions.insert(exclusions.end(), excludedFailed.begin(), excludedFailed.end());
+	uniquify(exclusions);
+	return exclusions;
+}
+
+ACTOR Future<std::vector<AddressExclusion>> getAllExcludedServers(Database cx) {
 	state Transaction tr(cx);
 	loop {
 		try {
 			tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
 			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE); // necessary?
 			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-			std::vector<AddressExclusion> exclusions = wait(getExcludedServers(&tr));
+			std::vector<AddressExclusion> exclusions = wait(getAllExcludedServers(&tr));
 			return exclusions;
 		} catch (Error& e) {
 			wait(tr.onError(e));
@@ -1943,19 +2033,25 @@ ACTOR Future<std::vector<AddressExclusion>> getExcludedServers(Database cx) {
 	}
 }
 
-// Get the current list of excluded localities by reading the keys.
-ACTOR Future<std::vector<std::string>> getExcludedLocalities(Transaction* tr) {
+ACTOR Future<std::vector<std::string>> getExcludedLocalityList(Transaction* tr) {
 	state RangeResult r = wait(tr->getRange(excludedLocalityKeys, CLIENT_KNOBS->TOO_MANY));
 	ASSERT(!r.more && r.size() < CLIENT_KNOBS->TOO_MANY);
-	state RangeResult r2 = wait(tr->getRange(failedLocalityKeys, CLIENT_KNOBS->TOO_MANY));
-	ASSERT(!r2.more && r2.size() < CLIENT_KNOBS->TOO_MANY);
 
 	std::vector<std::string> excludedLocalities;
 	for (const auto& i : r) {
 		auto a = decodeExcludedLocalityKey(i.key);
 		excludedLocalities.push_back(a);
 	}
-	for (const auto& i : r2) {
+	uniquify(excludedLocalities);
+	return excludedLocalities;
+}
+
+ACTOR Future<std::vector<std::string>> getExcludedFailedLocalityList(Transaction* tr) {
+	state RangeResult r = wait(tr->getRange(failedLocalityKeys, CLIENT_KNOBS->TOO_MANY));
+	ASSERT(!r.more && r.size() < CLIENT_KNOBS->TOO_MANY);
+
+	std::vector<std::string> excludedLocalities;
+	for (const auto& i : r) {
 		auto a = decodeFailedLocalityKey(i.key);
 		excludedLocalities.push_back(a);
 	}
@@ -1963,15 +2059,25 @@ ACTOR Future<std::vector<std::string>> getExcludedLocalities(Transaction* tr) {
 	return excludedLocalities;
 }
 
+ACTOR Future<std::vector<std::string>> getAllExcludedLocalities(Transaction* tr) {
+	state std::vector<std::string> exclusions;
+	std::vector<std::string> excludedLocalities = wait(getExcludedLocalityList(tr));
+	exclusions.insert(exclusions.end(), excludedLocalities.begin(), excludedLocalities.end());
+	std::vector<std::string> failedLocalities = wait(getExcludedFailedLocalityList(tr));
+	exclusions.insert(exclusions.end(), failedLocalities.begin(), failedLocalities.end());
+	uniquify(exclusions);
+	return exclusions;
+}
+
 // Get the list of excluded localities by reading the keys.
-ACTOR Future<std::vector<std::string>> getExcludedLocalities(Database cx) {
+ACTOR Future<std::vector<std::string>> getAllExcludedLocalities(Database cx) {
 	state Transaction tr(cx);
 	loop {
 		try {
 			tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
 			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-			std::vector<std::string> exclusions = wait(getExcludedLocalities(&tr));
+			std::vector<std::string> exclusions = wait(getAllExcludedLocalities(&tr));
 			return exclusions;
 		} catch (Error& e) {
 			wait(tr.onError(e));
@@ -2743,27 +2849,6 @@ bool schemaMatch(json_spirit::mValue const& schemaValue,
 		    .detail("SchemaPath", schemaPath);
 		throw unknown_error();
 	}
-}
-
-void setStorageQuota(Transaction& tr, StringRef tenantGroupName, int64_t quota) {
-	tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
-	auto key = storageQuotaKey(tenantGroupName);
-	tr.set(key, BinaryWriter::toValue<int64_t>(quota, Unversioned()));
-}
-
-void clearStorageQuota(Transaction& tr, StringRef tenantGroupName) {
-	tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
-	auto key = storageQuotaKey(tenantGroupName);
-	tr.clear(key);
-}
-
-ACTOR Future<Optional<int64_t>> getStorageQuota(Transaction* tr, StringRef tenantGroupName) {
-	tr->setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
-	state Optional<Value> v = wait(tr->get(storageQuotaKey(tenantGroupName)));
-	if (!v.present()) {
-		return Optional<int64_t>();
-	}
-	return BinaryReader::fromStringRef<int64_t>(v.get(), Unversioned());
 }
 
 std::string ManagementAPI::generateErrorMessage(const CoordinatorsResult& res) {

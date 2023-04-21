@@ -117,7 +117,7 @@ enum {
 	OPT_TRACECLOCK, OPT_NUMTESTERS, OPT_DEVHELP, OPT_PRINT_CODE_PROBES, OPT_ROLLSIZE, OPT_MAXLOGS, OPT_MAXLOGSSIZE, OPT_KNOB, OPT_UNITTESTPARAM, OPT_TESTSERVERS, OPT_TEST_ON_SERVERS, OPT_METRICSCONNFILE,
 	OPT_METRICSPREFIX, OPT_LOGGROUP, OPT_LOCALITY, OPT_IO_TRUST_SECONDS, OPT_IO_TRUST_WARN_ONLY, OPT_FILESYSTEM, OPT_PROFILER_RSS_SIZE, OPT_KVFILE,
 	OPT_TRACE_FORMAT, OPT_WHITELIST_BINPATH, OPT_BLOB_CREDENTIAL_FILE, OPT_CONFIG_PATH, OPT_USE_TEST_CONFIG_DB, OPT_NO_CONFIG_DB, OPT_FAULT_INJECTION, OPT_PROFILER, OPT_PRINT_SIMTIME,
-	OPT_FLOW_PROCESS_NAME, OPT_FLOW_PROCESS_ENDPOINT, OPT_IP_TRUSTED_MASK, OPT_KMS_CONN_DISCOVERY_URL_FILE, OPT_KMS_CONNECTOR_TYPE, OPT_KMS_CONN_VALIDATION_TOKEN_DETAILS,
+	OPT_FLOW_PROCESS_NAME, OPT_FLOW_PROCESS_ENDPOINT, OPT_IP_TRUSTED_MASK, OPT_KMS_CONN_DISCOVERY_URL_FILE, OPT_KMS_CONNECTOR_TYPE, OPT_KMS_REST_ALLOW_NOT_SECURE_CONECTION, OPT_KMS_CONN_VALIDATION_TOKEN_DETAILS,
 	OPT_KMS_CONN_GET_ENCRYPTION_KEYS_ENDPOINT, OPT_KMS_CONN_GET_LATEST_ENCRYPTION_KEYS_ENDPOINT, OPT_KMS_CONN_GET_BLOB_METADATA_ENDPOINT, OPT_NEW_CLUSTER_KEY, OPT_AUTHZ_PUBLIC_KEY_FILE, OPT_USE_FUTURE_PROTOCOL_VERSION
 };
 
@@ -216,7 +216,8 @@ CSimpleOpt::SOption g_rgOptions[] = {
 	{ OPT_NEW_CLUSTER_KEY,       "--new-cluster-key",           SO_REQ_SEP },
 	{ OPT_AUTHZ_PUBLIC_KEY_FILE, "--authorization-public-key-file", SO_REQ_SEP },
 	{ OPT_KMS_CONN_DISCOVERY_URL_FILE,           "--discover-kms-conn-url-file",            SO_REQ_SEP },
-	{ OPT_KMS_CONNECTOR_TYPE,    "--kms-connector-type",        SO_REQ_SEP },
+	{ OPT_KMS_CONNECTOR_TYPE,    "--kms-connector-type",                                    SO_REQ_SEP },
+	{ OPT_KMS_REST_ALLOW_NOT_SECURE_CONECTION,  "--kms-rest-allow-not-secure-connection",      SO_NONE },
 	{ OPT_KMS_CONN_VALIDATION_TOKEN_DETAILS,     "--kms-conn-validation-token-details",     SO_REQ_SEP },
 	{ OPT_KMS_CONN_GET_ENCRYPTION_KEYS_ENDPOINT, "--kms-conn-get-encryption-keys-endpoint", SO_REQ_SEP },
 	{ OPT_KMS_CONN_GET_LATEST_ENCRYPTION_KEYS_ENDPOINT, "--kms-conn-get-latest-encryption-keys-endpoint", SO_REQ_SEP },
@@ -233,8 +234,6 @@ extern void pingtest();
 extern void copyTest();
 extern void versionedMapTest();
 extern void createTemplateDatabase();
-// FIXME: this really belongs in a header somewhere since it is actually used.
-extern IPAddress determinePublicIPAutomatically(ClusterConnectionString& ccs);
 
 extern const char* getSourceVersion();
 
@@ -896,7 +895,7 @@ std::pair<NetworkAddressList, NetworkAddressList> buildNetworkAddresses(
 		if (autoPublicAddress) {
 			try {
 				const NetworkAddress& parsedAddress = NetworkAddress::parse("0.0.0.0:" + publicAddressStr.substr(5));
-				const IPAddress publicIP = determinePublicIPAutomatically(connectionRecord.getConnectionString());
+				const IPAddress publicIP = connectionRecord.getConnectionString().determineLocalSourceIP();
 				currentPublicAddress = NetworkAddress(publicIP, parsedAddress.port, true, parsedAddress.isTLS());
 			} catch (Error& e) {
 				fprintf(stderr,
@@ -1113,7 +1112,7 @@ struct CLIOptions {
 				printHelpTeaser(name);
 				flushAndExit(FDB_EXIT_ERROR);
 			}
-			auto publicIP = determinePublicIPAutomatically(connectionFile->getConnectionString());
+			auto publicIP = connectionFile->getConnectionString().determineLocalSourceIP();
 			publicAddresses.address = NetworkAddress(publicIP, ::getpid());
 		}
 	}
@@ -1703,6 +1702,11 @@ private:
 				knobs.emplace_back("kms_connector_type", args.OptionArg());
 				break;
 			}
+			case OPT_KMS_REST_ALLOW_NOT_SECURE_CONECTION: {
+				TraceEvent(SevWarnAlways, "RESTKmsConnAllowNotSecureConnection");
+				knobs.emplace_back("rest_kms_allow_not_secure_connection", "true");
+				break;
+			}
 			case OPT_KMS_CONN_VALIDATION_TOKEN_DETAILS: {
 				knobs.emplace_back("rest_kms_connector_validation_token_details", args.OptionArg());
 				break;
@@ -2018,7 +2022,7 @@ int main(int argc, char* argv[]) {
 			// startOldSimulator();
 			opts.buildNetwork(argv[0]);
 			startNewSimulator(opts.printSimTime);
-			openTraceFile(NetworkAddress(), opts.rollsize, opts.maxLogsSize, opts.logFolder, "trace", opts.logGroup);
+			openTraceFile({}, opts.rollsize, opts.maxLogsSize, opts.logFolder, "trace", opts.logGroup);
 			openTracer(TracerType(deterministicRandom()->randomInt(static_cast<int>(TracerType::DISABLED),
 			                                                       static_cast<int>(TracerType::SIM_END))));
 		} else {
@@ -2050,6 +2054,8 @@ int main(int argc, char* argv[]) {
 			} else {
 				TraceEvent(SevInfo, "AuthzPublicKeyFileNotSet");
 			}
+			if (FLOW_KNOBS->ALLOW_TOKENLESS_TENANT_ACCESS)
+				TraceEvent(SevWarnAlways, "AuthzTokenlessAccessEnabled");
 
 			if (expectsPublicAddress) {
 				for (int ii = 0; ii < (opts.publicAddresses.secondaryAddress.present() ? 2 : 1); ++ii) {
@@ -2255,25 +2261,21 @@ int main(int argc, char* argv[]) {
 						}
 					}
 				}
-				g_knobs.setKnob("enable_encryption",
-				                KnobValue::create(ini.GetBoolValue("META", "enableEncryption", false)));
-				g_knobs.setKnob("enable_tlog_encryption",
-				                KnobValue::create(ini.GetBoolValue("META", "enableTLogEncryption", false)));
-				g_knobs.setKnob("enable_storage_server_encryption",
-				                KnobValue::create(ini.GetBoolValue("META", "enableStorageServerEncryption", false)));
-				g_knobs.setKnob("enable_blob_granule_encryption",
-				                KnobValue::create(ini.GetBoolValue("META", "enableBlobGranuleEncryption", false)));
 				g_knobs.setKnob("enable_blob_granule_compression",
 				                KnobValue::create(ini.GetBoolValue("META", "enableBlobGranuleEncryption", false)));
-				// Restart test does not preserve encryption mode (tenant-aware or domain-aware).
-				// Disable domain-aware encryption in Redwood until encryption mode from db config is being handled.
-				// TODO(yiwu): clean it up once we cleanup the knob.
-				g_knobs.setKnob("redwood_split_encrypted_pages_by_tenant", KnobValue::create(bool{ false }));
 				g_knobs.setKnob("encrypt_header_auth_token_enabled",
 				                KnobValue::create(ini.GetBoolValue("META", "encryptHeaderAuthTokenEnabled", false)));
 				g_knobs.setKnob("encrypt_header_auth_token_algo",
 				                KnobValue::create((int)ini.GetLongValue(
 				                    "META", "encryptHeaderAuthTokenAlgo", FLOW_KNOBS->ENCRYPT_HEADER_AUTH_TOKEN_ALGO)));
+				g_knobs.setKnob("enable_configurable_encryption",
+				                KnobValue::create(ini.GetBoolValue("META",
+				                                                   "enableConfigurableEncryption",
+				                                                   CLIENT_KNOBS->ENABLE_CONFIGURABLE_ENCRYPTION)));
+
+				g_knobs.setKnob(
+				    "shard_encode_location_metadata",
+				    KnobValue::create(ini.GetBoolValue("META", "enableShardEncodeLocationMetadata", false)));
 			}
 			setupAndRun(dataFolder, opts.testFile, opts.restarting, (isRestoring >= 1), opts.whitelistBinPaths);
 			g_simulator->run();

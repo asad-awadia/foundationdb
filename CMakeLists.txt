@@ -16,11 +16,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-if(WIN32)
-  cmake_minimum_required(VERSION 3.15)
-else()
-  cmake_minimum_required(VERSION 3.13)
-endif()
+cmake_minimum_required(VERSION 3.24.2)
 
 # silence deprecation warnings in newer versions of cmake
 if(POLICY CMP0135)
@@ -33,7 +29,8 @@ project(foundationdb
   HOMEPAGE_URL "http://www.foundationdb.org/"
   LANGUAGES C CXX ASM)
 
-set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${PROJECT_SOURCE_DIR}/cmake")
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+
 message (STATUS "${PROJECT_SOURCE_DIR} ${PROJECT_BINARY_DIR}")
 if("${PROJECT_SOURCE_DIR}" STREQUAL "${PROJECT_BINARY_DIR}")
   message(FATAL_ERROR "In-source builds are forbidden")
@@ -60,7 +57,7 @@ set(LIBRARY_OUTPUT_PATH ${PROJECT_BINARY_DIR}/lib)
 # Packages used for bindings
 ################################################################################
 
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 
 ################################################################################
 # Compiler configuration
@@ -69,7 +66,7 @@ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 include(ConfigureCompiler)
 
 ################################################################################
-# Compiler configuration
+# Components configuration
 ################################################################################
 
 include(FDBComponents)
@@ -97,7 +94,10 @@ else()
     set(FDB_VERSION ${PROJECT_VERSION})
 endif()
 if (NOT FDB_RELEASE)
-    string(TIMESTAMP FDB_BUILDTIME %Y%m%d%H%M%S)
+    string(TIMESTAMP FDB_BUILD_TIMESTMAP %Y%m%d%H%M%S)
+    # Adding support to pass custom fdb_build timestamp,
+    # required to achieve uniform naming across different builds
+    set(FDB_BUILDTIME "${FDB_BUILD_TIMESTMAP}" CACHE STRING "A timestamp for packages")
     set(FDB_BUILDTIME_STRING ".${FDB_BUILDTIME}")
     set(PRERELEASE_TAG "prerelease")
 endif()
@@ -192,6 +192,7 @@ else()
   add_subdirectory(fdbservice)
 endif()
 add_subdirectory(fdbbackup)
+add_subdirectory(metacluster)
 add_subdirectory(tests)
 add_subdirectory(flowbench EXCLUDE_FROM_ALL)
 if(WITH_PYTHON AND WITH_C_BINDING)

@@ -135,6 +135,13 @@ struct ThreadData : ReferenceCounted<ThreadData>, NonCopyable {
 		return tenant->ready();
 	}
 
+	// randomly reopen tenant and do not wait for it to be ready, to test races
+	void maybeReopenTenant(Database const& cx) {
+		if (BUGGIFY_WITH_PROB(0.01)) {
+			openTenant(cx);
+		}
+	}
+
 	// TODO could make keys variable length?
 	Key getKey(uint32_t key, uint32_t id) {
 		std::stringstream ss;
@@ -728,6 +735,8 @@ struct BlobGranuleCorrectnessWorkload : TestWorkload {
 					beginVersion = threadData->writeVersions[beginVersionIdx];
 				}
 
+				threadData->maybeReopenTenant(cx);
+
 				std::pair<RangeResult, Standalone<VectorRef<BlobGranuleChunkRef>>> blob =
 				    wait(readFromBlob(cx, threadData->bstore, range, beginVersion, readVersion, threadData->tenant));
 				self->validateResult(threadData, blob, startKey, endKey, beginVersion, readVersion);
@@ -917,7 +926,6 @@ struct BlobGranuleCorrectnessWorkload : TestWorkload {
 
 	ACTOR Future<Void> checkTenantRanges(BlobGranuleCorrectnessWorkload* self,
 	                                     Database cx,
-
 	                                     Reference<ThreadData> threadData) {
 		// check that reading ranges with tenant name gives valid result of ranges just for tenant, with no tenant
 		// prefix
@@ -1020,12 +1028,6 @@ struct BlobGranuleCorrectnessWorkload : TestWorkload {
 	ACTOR Future<bool> _check(Database cx, BlobGranuleCorrectnessWorkload* self) {
 		// check error counts, and do an availability check at the end
 		state std::vector<Future<bool>> results;
-		state Future<Void> checkFeedCleanupFuture;
-		if (self->clientId == 0) {
-			checkFeedCleanupFuture = checkFeedCleanup(cx, BGW_DEBUG);
-		} else {
-			checkFeedCleanupFuture = Future<Void>(Void());
-		}
 
 		for (auto& it : self->directories) {
 			results.push_back(self->checkDirectory(cx, self, it));
@@ -1034,6 +1036,14 @@ struct BlobGranuleCorrectnessWorkload : TestWorkload {
 		for (auto& f : results) {
 			bool dirSuccess = wait(f);
 			allSuccessful &= dirSuccess;
+		}
+
+		// do feed cleanup check only after data is guaranteed to be available for each granule
+		state Future<Void> checkFeedCleanupFuture;
+		if (self->clientId == 0) {
+			checkFeedCleanupFuture = checkFeedCleanup(cx, BGW_DEBUG);
+		} else {
+			checkFeedCleanupFuture = Future<Void>(Void());
 		}
 		wait(checkFeedCleanupFuture);
 		return allSuccessful;

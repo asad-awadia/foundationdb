@@ -21,14 +21,21 @@
 #include <cinttypes>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "flow/MkCert.h"
 #include "fmt/format.h"
 #include "fdbrpc/simulator.h"
 #include "flow/Arena.h"
+#ifndef BOOST_SYSTEM_NO_LIB
 #define BOOST_SYSTEM_NO_LIB
+#endif
+#ifndef BOOST_DATE_TIME_NO_LIB
 #define BOOST_DATE_TIME_NO_LIB
+#endif
+#ifndef BOOST_REGEX_NO_LIB
 #define BOOST_REGEX_NO_LIB
+#endif
 #include "fdbrpc/SimExternalConnection.h"
 #include "flow/ActorCollection.h"
 #include "flow/IRandom.h"
@@ -44,7 +51,6 @@
 #include "fdbrpc/AsyncFileChaos.h"
 #include "crc32/crc32c.h"
 #include "fdbrpc/TraceFileIO.h"
-#include "flow/FaultInjection.h"
 #include "flow/flow.h"
 #include "flow/genericactors.actor.h"
 #include "flow/network.h"
@@ -53,6 +59,7 @@
 #include "fdbrpc/Replication.h"
 #include "fdbrpc/ReplicationUtils.h"
 #include "fdbrpc/AsyncFileWriteChecker.h"
+#include "fdbrpc/genericactors.actor.h"
 #include "flow/FaultInjection.h"
 #include "flow/TaskQueue.h"
 #include "flow/IUDPSocket.h"
@@ -66,8 +73,8 @@ ISimulator::ISimulator()
   : desiredCoordinators(1), physicalDatacenters(1), processesPerMachine(0), listenersPerProcess(1), usableRegions(1),
     allowLogSetKills(true), tssMode(TSSMode::Disabled), configDBType(ConfigDBType::DISABLED), isStopped(false),
     lastConnectionFailure(0), connectionFailuresDisableDuration(0), speedUpSimulation(false),
-    backupAgents(BackupAgentType::WaitForType), drAgents(BackupAgentType::WaitForType), allSwapsDisabled(false),
-    blobGranulesEnabled(false) {}
+    connectionFailureEnableTime(0), disableTLogRecoveryFinish(false), backupAgents(BackupAgentType::WaitForType),
+    drAgents(BackupAgentType::WaitForType), allSwapsDisabled(false), blobGranulesEnabled(false) {}
 ISimulator::~ISimulator() = default;
 
 bool simulator_should_inject_fault(const char* context, const char* file, int line, int error_code) {
@@ -104,6 +111,29 @@ bool simulator_should_inject_fault(const char* context, const char* file, int li
 			}
 			return true;
 		}
+	}
+
+	return false;
+}
+
+bool simulator_should_inject_blob_fault(const char* context, const char* file, int line, int error_code) {
+	if (!g_network->isSimulated() || !faultInjectionActivated)
+		return false;
+
+	auto p = g_simulator->getCurrentProcess();
+
+	if (!g_simulator->speedUpSimulation && deterministicRandom()->random01() < p->blob_inject_failure_rate) {
+		CODE_PROBE(true, "A blob fault was injected", probe::assert::simOnly, probe::context::sim2);
+		CODE_PROBE(error_code == error_code_http_request_failed,
+		           "A failed http request was injected",
+		           probe::assert::simOnly,
+		           probe::context::sim2);
+		TraceEvent("BlobFaultInjected")
+		    .detail("Context", context)
+		    .detail("File", file)
+		    .detail("Line", line)
+		    .detail("ErrorCode", error_code);
+		return true;
 	}
 
 	return false;
@@ -172,7 +202,7 @@ void ISimulator::displayWorkers() const {
 	return;
 }
 
-Standalone<StringRef> ISimulator::makeToken(StringRef tenantName, uint64_t ttlSecondsFromNow) {
+WipedString ISimulator::makeToken(int64_t tenantId, uint64_t ttlSecondsFromNow) {
 	ASSERT_GT(authKeys.size(), 0);
 	auto tokenSpec = authz::jwt::TokenRef{};
 	auto [keyName, key] = *authKeys.begin();
@@ -186,10 +216,9 @@ Standalone<StringRef> ISimulator::makeToken(StringRef tenantName, uint64_t ttlSe
 	tokenSpec.expiresAtUnixTime = now + ttlSecondsFromNow;
 	auto const tokenId = deterministicRandom()->randomAlphaNumeric(10);
 	tokenSpec.tokenId = StringRef(tokenId);
-	tokenSpec.tenants = VectorRef<StringRef>(&tenantName, 1);
-	auto ret = Standalone<StringRef>();
-	ret.contents() = authz::jwt::signToken(ret.arena(), tokenSpec, key);
-	return ret;
+	tokenSpec.tenants = VectorRef<int64_t>(&tenantId, 1);
+	Arena arena;
+	return WipedString(authz::jwt::signToken(arena, tokenSpec, key));
 }
 
 int openCount = 0;
@@ -212,6 +241,10 @@ struct SimClogging {
 		if (!g_simulator->speedUpSimulation && !stableConnection && clogPairUntil.count(pair))
 			t = std::max(t, clogPairUntil[pair]);
 
+		auto p = std::make_pair(from, to);
+		if (!g_simulator->speedUpSimulation && !stableConnection && clogProcessPairUntil.count(p))
+			t = std::max(t, clogProcessPairUntil[p]);
+
 		if (!g_simulator->speedUpSimulation && !stableConnection && clogRecvUntil.count(to.ip))
 			t = std::max(t, clogRecvUntil[to.ip]);
 
@@ -222,6 +255,20 @@ struct SimClogging {
 		auto& u = clogPairUntil[std::make_pair(from, to)];
 		u = std::max(u, now() + t);
 	}
+
+	void unclogPair(const IPAddress& from, const IPAddress& to) {
+		auto pair = std::make_pair(from, to);
+		clogPairUntil.erase(pair);
+		clogPairLatency.erase(pair);
+	}
+
+	// Clog a pair of processes until a time. This is more fine-grained than
+	// the IPAddress based one.
+	void clogPairFor(const NetworkAddress& from, const NetworkAddress& to, double t) {
+		auto& u = clogProcessPairUntil[std::make_pair(from, to)];
+		u = std::max(u, now() + t);
+	}
+
 	void clogSendFor(const IPAddress& from, double t) {
 		auto& u = clogSendUntil[from];
 		u = std::max(u, now() + t);
@@ -241,6 +288,7 @@ private:
 	std::map<IPAddress, double> clogSendUntil, clogRecvUntil;
 	std::map<std::pair<IPAddress, IPAddress>, double> clogPairUntil;
 	std::map<std::pair<IPAddress, IPAddress>, double> clogPairLatency;
+	std::map<std::pair<NetworkAddress, NetworkAddress>, double> clogProcessPairUntil;
 	double halfLatency() const {
 		double a = deterministicRandom()->random01();
 		const double pFast = 0.999;
@@ -578,9 +626,7 @@ public:
 		}
 
 		if (openCount == 4000) {
-			TraceEvent(SevWarnAlways, "DisableConnectionFailures_TooManyFiles").log();
-			g_simulator->speedUpSimulation = true;
-			g_simulator->connectionFailuresDisableDuration = 1e6;
+			disableConnectionFailures("TooManyFiles");
 		}
 
 		// Filesystems on average these days seem to start to have limits of around 255 characters for a
@@ -1420,6 +1466,19 @@ public:
 		return canKillProcesses(processesLeft, processesDead, KillType::KillInstantly, nullptr);
 	}
 
+	std::vector<AddressExclusion> getAllAddressesInDCToExclude(Optional<Standalone<StringRef>> dcId) const override {
+		std::vector<AddressExclusion> addresses;
+		if (!dcId.present()) {
+			return addresses;
+		}
+		for (const auto& processInfo : getAllProcesses()) {
+			if (processInfo->locality.dcId() == dcId) {
+				addresses.emplace_back(processInfo->address.ip, processInfo->address.port);
+			}
+		}
+		return addresses;
+	}
+
 	bool datacenterDead(Optional<Standalone<StringRef>> dcId) const override {
 		if (!dcId.present()) {
 			return false;
@@ -1456,6 +1515,7 @@ public:
 	// The following function will determine if a machine can be remove in case when it has a blob worker
 	bool canKillMachineWithBlobWorkers(Optional<Standalone<StringRef>> machineId, KillType kt, KillType* ktFinal) {
 		// Allow if no blob workers, or it's a reboot(without removing the machine)
+		// FIXME: this should be ||
 		if (!blobGranulesEnabled && kt >= KillType::RebootAndDelete) {
 			return true;
 		}
@@ -1518,7 +1578,7 @@ public:
 			std::vector<LocalityData> badCombo;
 			std::set<Optional<Standalone<StringRef>>> uniqueMachines;
 
-			if (!primaryDcId.present()) {
+			if (!primaryDcId.present() || usableRegions == 1) {
 				for (auto processInfo : availableProcesses) {
 					primaryProcessesLeft.add(processInfo->locality);
 					primaryLocalitiesLeft.push_back(processInfo->locality);
@@ -1676,7 +1736,7 @@ public:
 			}
 
 			// Reboot if dead machines do fulfill policies
-			if (tooManyDead) {
+			if (tooManyDead || (usableRegions > 1 && notEnoughLeft)) {
 				newKt = KillType::Reboot;
 				canSurvive = false;
 				TraceEvent("KillChanged")
@@ -1911,8 +1971,10 @@ public:
 		KillType originalKt = kt;
 		// Reboot if any of the processes are protected and count the number of processes not rebooting
 		for (auto& process : machines[machineId].processes) {
-			if (protectedAddresses.count(process->address))
+			if (protectedAddresses.count(process->address) && kt != KillType::RebootProcessAndSwitch) {
 				kt = KillType::Reboot;
+			}
+
 			if (!process->rebooting)
 				processesOnMachine++;
 			if (process->drProcess) {
@@ -2295,6 +2357,24 @@ public:
 		TraceEvent("CloggingPair").detail("From", from).detail("To", to).detail("Seconds", seconds);
 		g_clogging.clogPairFor(from, to, seconds);
 	}
+
+	void unclogPair(const IPAddress& from, const IPAddress& to) override {
+		TraceEvent("UncloggingPair").detail("From", from).detail("To", to);
+		g_clogging.unclogPair(from, to);
+	}
+
+	void processInjectBlobFault(ProcessInfo* machine, double failureRate) override {
+		CODE_PROBE(true, "Simulated process beginning blob fault", probe::context::sim2, probe::assert::simOnly);
+		should_inject_blob_fault = simulator_should_inject_blob_fault;
+		ASSERT(machine->blob_inject_failure_rate == 0.0);
+		machine->blob_inject_failure_rate = failureRate;
+	}
+
+	void processStopInjectBlobFault(ProcessInfo* machine) override {
+		CODE_PROBE(true, "Simulated process stopping blob fault", probe::context::sim2, probe::assert::simOnly);
+		machine->blob_inject_failure_rate = 0.0;
+	}
+
 	std::vector<ProcessInfo*> getAllProcesses() const override {
 		std::vector<ProcessInfo*> processes;
 		for (auto& c : machines) {
@@ -2636,7 +2716,8 @@ Future<Reference<IUDPSocket>> Sim2::createUDPSocket(bool isV6) {
 void startNewSimulator(bool printSimTime) {
 	ASSERT(!g_network);
 	g_network = g_simulator = new Sim2(printSimTime);
-	g_simulator->connectionFailuresDisableDuration = deterministicRandom()->random01() < 0.5 ? 0 : 1e6;
+	g_simulator->connectionFailuresDisableDuration =
+	    deterministicRandom()->coinflip() ? 0 : DISABLE_CONNECTION_FAILURE_FOREVER;
 }
 
 ACTOR void doReboot(ISimulator::ProcessInfo* p, ISimulator::KillType kt) {
@@ -2736,6 +2817,23 @@ Future<Void> waitUntilDiskReady(Reference<DiskParameters> diskParameters, int64_
 		randomLatency = 10 * deterministicRandom()->random01() / diskParameters->iops;
 
 	return delayUntil(diskParameters->nextOperation + randomLatency);
+}
+
+void enableConnectionFailures(std::string const& context) {
+	if (g_network->isSimulated()) {
+		g_simulator->connectionFailuresDisableDuration = 0;
+		g_simulator->speedUpSimulation = false;
+		g_simulator->connectionFailureEnableTime = now();
+		TraceEvent(SevWarnAlways, ("EnableConnectionFailures_" + context).c_str());
+	}
+}
+
+void disableConnectionFailures(std::string const& context) {
+	if (g_network->isSimulated()) {
+		g_simulator->connectionFailuresDisableDuration = DISABLE_CONNECTION_FAILURE_FOREVER;
+		g_simulator->speedUpSimulation = true;
+		TraceEvent(SevWarnAlways, ("DisableConnectionFailures_" + context).c_str());
+	}
 }
 
 #if defined(_WIN32)

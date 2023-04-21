@@ -288,6 +288,9 @@ public:
 	bool isCurrentGrvProxy(UID proxyId) const;
 	Future<Void> onProxiesChanged() const;
 	Future<HealthMetrics> getHealthMetrics(bool detailed);
+	// Get storage stats of a storage server from the cached healthy metrics if now() - lastUpdate < maxStaleness.
+	// Otherwise, ask GRVProxy for the up-to-date health metrics.
+	Future<Optional<HealthMetrics::StorageStats>> getStorageStats(const UID& id, double maxStaleness);
 	// Pass a negative value for `shardLimit` to indicate no limit on the shard number.
 	// Pass a valid `trState` with `hasTenant() == true` to make the function tenant-aware.
 	Future<StorageMetrics> getStorageMetrics(
@@ -313,6 +316,10 @@ public:
 	                                                          Optional<int> const& minSplitBytes = {});
 
 	Future<Standalone<VectorRef<ReadHotRangeWithMetrics>>> getReadHotRanges(KeyRange const& keys);
+	Future<Standalone<VectorRef<ReadHotRangeWithMetrics>>> getHotRangeMetrics(StorageServerInterface ssi,
+	                                                                          KeyRange const& keys,
+	                                                                          ReadHotSubRangeRequest::SplitType type,
+	                                                                          int splitCount);
 
 	// Returns the protocol version reported by the coordinator this client is connected to
 	// If an expected version is given, the future won't return until the protocol version is different than expected
@@ -406,6 +413,7 @@ public:
 	Future<Void> waitPurgeGranulesComplete(Key purgeKey);
 
 	Future<bool> blobbifyRange(KeyRange range, Optional<Reference<Tenant>> tenant = {});
+	Future<bool> blobbifyRangeBlocking(KeyRange range, Optional<Reference<Tenant>> tenant = {});
 	Future<bool> unblobbifyRange(KeyRange range, Optional<Reference<Tenant>> tenant = {});
 	Future<Standalone<VectorRef<KeyRangeRef>>> listBlobbifiedRanges(KeyRange range,
 	                                                                int rangeLimit,
@@ -413,6 +421,10 @@ public:
 	Future<Version> verifyBlobRange(const KeyRange& range,
 	                                Optional<Version> version,
 	                                Optional<Reference<Tenant>> tenant = {});
+	Future<bool> flushBlobRange(const KeyRange& range,
+	                            bool compact,
+	                            Optional<Version> version,
+	                            Optional<Reference<Tenant>> tenant = {});
 	Future<bool> blobRestore(const KeyRange range, Optional<Version> version);
 
 	// private:
@@ -553,6 +565,8 @@ public:
 	Counter transactionsCommitCompleted;
 	Counter transactionKeyServerLocationRequests;
 	Counter transactionKeyServerLocationRequestsCompleted;
+	Counter transactionBlobGranuleLocationRequests;
+	Counter transactionBlobGranuleLocationRequestsCompleted;
 	Counter transactionStatusRequests;
 	Counter transactionTenantLookupRequests;
 	Counter transactionTenantLookupRequestsCompleted;

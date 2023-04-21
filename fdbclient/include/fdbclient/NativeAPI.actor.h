@@ -29,6 +29,7 @@
 
 #include "flow/BooleanParam.h"
 #include "flow/flow.h"
+#include "flow/WipedString.h"
 #include "flow/TDMetric.actor.h"
 #include "fdbclient/FDBTypes.h"
 #include "fdbclient/CommitProxyInterface.h"
@@ -46,7 +47,7 @@
 	(getSBVar(__FILE__, __LINE__, BuggifyType::Client) && deterministicRandom()->random01() < (x))
 #define CLIENT_BUGGIFY CLIENT_BUGGIFY_WITH_PROB(P_BUGGIFIED_SECTION_FIRES[int(BuggifyType::Client)])
 
-FDB_DECLARE_BOOLEAN_PARAM(UseProvisionalProxies);
+FDB_BOOLEAN_PARAM(UseProvisionalProxies);
 
 // Incomplete types that are reference counted
 class DatabaseContext;
@@ -71,6 +72,7 @@ struct NetworkOptions {
 	std::string traceClockSource;
 	std::string traceFileIdentifier;
 	std::string tracePartialFileSuffix;
+	bool traceInitializeOnSetup;
 	Optional<bool> logClientInfo;
 	Reference<ReferencedObject<Standalone<VectorRef<ClientVersionRef>>>> supportedVersions;
 	bool runLoopProfilingEnabled;
@@ -228,6 +230,7 @@ struct Watch : public ReferenceCounted<Watch>, NonCopyable {
 	Promise<Void> onChangeTrigger;
 	Promise<Void> onSetWatchTrigger;
 	Future<Void> watchFuture;
+	Optional<ReadOptions> readOptions;
 
 	Watch() : valuePresent(false), setPresent(false), watchFuture(Never()) {}
 	Watch(Key key) : key(key), valuePresent(false), setPresent(false), watchFuture(Never()) {}
@@ -247,6 +250,7 @@ public:
 
 	Future<Void> ready() const { return success(idFuture); }
 	int64_t id() const;
+	Future<int64_t> getIdFuture() const;
 	KeyRef prefix() const;
 	std::string description() const;
 
@@ -262,14 +266,14 @@ struct Traceable<Tenant> : std::true_type {
 	static std::string toString(const Tenant& tenant) { return printable(tenant.description()); }
 };
 
-FDB_DECLARE_BOOLEAN_PARAM(AllowInvalidTenantID);
-FDB_DECLARE_BOOLEAN_PARAM(ResolveDefaultTenant);
+FDB_BOOLEAN_PARAM(AllowInvalidTenantID);
+FDB_BOOLEAN_PARAM(ResolveDefaultTenant);
 
 struct TransactionState : ReferenceCounted<TransactionState> {
 	Database cx;
 	Future<Version> readVersionFuture;
 	Promise<Optional<Value>> metadataVersion;
-	Optional<Standalone<StringRef>> authToken;
+	Optional<WipedString> authToken;
 	Reference<TransactionLogInfo> trLogInfo;
 	TransactionOptions options;
 	Optional<ReadOptions> readOptions;
@@ -281,6 +285,8 @@ struct TransactionState : ReferenceCounted<TransactionState> {
 	// Measured by summing the bytes accessed by each read and write operation
 	// after rounding up to the nearest page size and applying a write penalty
 	int64_t totalCost = 0;
+
+	double proxyTagThrottledDuration = 0.0;
 
 	// Special flag to skip prepending tenant prefix to mutations and conflict ranges
 	// when a dummy, internal transaction gets commited. The sole purpose of commitDummyTransaction() is to
@@ -390,7 +396,6 @@ public:
 	                                                       const KeySelector& end,
 	                                                       const Key& mapper,
 	                                                       GetRangeLimits limits,
-	                                                       int matchIndex = MATCH_INDEX_ALL,
 	                                                       Snapshot = Snapshot::False,
 	                                                       Reverse = Reverse::False);
 
@@ -400,7 +405,6 @@ private:
 	                                           const KeySelector& end,
 	                                           const Key& mapper,
 	                                           GetRangeLimits limits,
-	                                           int matchIndex,
 	                                           Snapshot snapshot,
 	                                           Reverse reverse);
 
@@ -487,6 +491,8 @@ public:
 	Version getCommittedVersion() const { return trState->committedVersion; }
 
 	int64_t getTotalCost() const { return trState->totalCost; }
+
+	double getTagThrottledDuration() const;
 
 	// Will be fulfilled only after commit() returns success
 	[[nodiscard]] Future<Standalone<StringRef>> getVersionstamp();
@@ -596,14 +602,15 @@ Future<Void> createCheckpoint(Reference<ReadYourWritesTransaction> tr,
                               Optional<UID> dataMoveId = Optional<UID>());
 
 // Gets checkpoint metadata for `ranges` at the specific version, with the particular format.
-// The keyranges of the returned checkpoint is a super-set of `ranges`.
+// Returns a list of [range, checkpoint], where the `checkpoint` has data over `range`.
 // checkpoint_not_found() error will be returned if the specific checkpoint cannot be found.
-ACTOR Future<std::vector<CheckpointMetaData>> getCheckpointMetaData(Database cx,
-                                                                    std::vector<KeyRange> ranges,
-                                                                    Version version,
-                                                                    CheckpointFormat format,
-                                                                    Optional<UID> dataMoveId = Optional<UID>(),
-                                                                    double timeout = 5.0);
+ACTOR Future<std::vector<std::pair<KeyRange, CheckpointMetaData>>> getCheckpointMetaData(
+    Database cx,
+    std::vector<KeyRange> ranges,
+    Version version,
+    CheckpointFormat format,
+    Optional<UID> dataMoveId = Optional<UID>(),
+    double timeout = 5.0);
 
 // Checks with Data Distributor that it is safe to mark all servers in exclusions as failed
 ACTOR Future<bool> checkSafeExclusions(Database cx, std::vector<AddressExclusion> exclusions);
@@ -647,6 +654,7 @@ struct KeyRangeLocationInfo;
 // Return the aggregated StorageMetrics of range keys to the caller. The locations tell which interface should
 // serve the request. The final result is within (min-permittedError/2, max + permittedError/2) if valid.
 ACTOR Future<Optional<StorageMetrics>> waitStorageMetricsWithLocation(TenantInfo tenantInfo,
+                                                                      Version version,
                                                                       KeyRange keys,
                                                                       std::vector<KeyRangeLocationInfo> locations,
                                                                       StorageMetrics min,

@@ -121,12 +121,13 @@ class GlobalTagThrottlerImpl {
 		Smoother perClientRate;
 		Smoother targetRate;
 		double transactionsLastAdded;
+		double lastLogged;
 
 	public:
 		explicit PerTagStatistics()
 		  : transactionCounter(SERVER_KNOBS->GLOBAL_TAG_THROTTLING_FOLDING_TIME),
 		    perClientRate(SERVER_KNOBS->GLOBAL_TAG_THROTTLING_FOLDING_TIME),
-		    targetRate(SERVER_KNOBS->GLOBAL_TAG_THROTTLING_FOLDING_TIME), transactionsLastAdded(now()) {}
+		    targetRate(SERVER_KNOBS->GLOBAL_TAG_THROTTLING_FOLDING_TIME), transactionsLastAdded(now()), lastLogged(0) {}
 
 		Optional<ThrottleApi::TagQuotaValue> getQuota() const { return quota; }
 
@@ -159,6 +160,10 @@ class GlobalTagThrottlerImpl {
 		bool recentTransactionsAdded() const {
 			return now() - transactionsLastAdded < SERVER_KNOBS->GLOBAL_TAG_THROTTLING_TAG_EXPIRE_AFTER;
 		}
+
+		bool canLog() const { return now() - lastLogged > SERVER_KNOBS->GLOBAL_TAG_THROTTLING_TRACE_INTERVAL; }
+
+		void updateLastLogged() { lastLogged = now(); }
 	};
 
 	struct StorageServerInfo {
@@ -226,9 +231,9 @@ class GlobalTagThrottlerImpl {
 			return {};
 		}
 		auto const transactionRate = stats.get().getTransactionRate();
-		// If there is less than one transaction per second, we do not have enough data
+		// If there is less than GLOBAL_TAG_THROTTLING_MIN_TPS transactions per second, we do not have enough data
 		// to accurately compute an average transaction cost.
-		if (transactionRate < 1.0) {
+		if (transactionRate < SERVER_KNOBS->GLOBAL_TAG_THROTTLING_MIN_TPS) {
 			return {};
 		} else {
 			return std::max(static_cast<double>(CLIENT_KNOBS->TAG_THROTTLING_PAGE_SIZE), cost.get() / transactionRate);
@@ -236,8 +241,9 @@ class GlobalTagThrottlerImpl {
 	}
 
 	// For transactions with the provided tag, returns the average cost of all transactions
-	// accross the cluster. The minimum cost is 1.
-	double getAverageTransactionCost(TransactionTag tag, TraceEvent& te) const {
+	// accross the cluster. The minimum cost is one page. If the transaction rate is too low,
+	// return an empty Optional, because no accurate estimation can be made.
+	Optional<double> getAverageTransactionCost(TransactionTag tag, TraceEvent& te) const {
 		auto const cost = getCurrentCost(tag);
 		auto const stats = tryGet(tagStatistics, tag);
 		if (!stats.present()) {
@@ -246,8 +252,8 @@ class GlobalTagThrottlerImpl {
 		auto const transactionRate = stats.get().getTransactionRate();
 		te.detail("TransactionRate", transactionRate);
 		te.detail("Cost", cost);
-		if (transactionRate == 0.0) {
-			return CLIENT_KNOBS->TAG_THROTTLING_PAGE_SIZE;
+		if (transactionRate < SERVER_KNOBS->GLOBAL_TAG_THROTTLING_MIN_TPS) {
+			return {};
 		} else {
 			return std::max(static_cast<double>(CLIENT_KNOBS->TAG_THROTTLING_PAGE_SIZE), cost / transactionRate);
 		}
@@ -406,11 +412,11 @@ class GlobalTagThrottlerImpl {
 		auto const averageTransactionCost = getAverageTransactionCost(tag, te);
 		auto const totalQuota = getQuota(tag, LimitType::TOTAL);
 		auto const reservedQuota = getQuota(tag, LimitType::RESERVED);
-		if (!totalQuota.present() || !reservedQuota.present()) {
+		if (!averageTransactionCost.present() || !totalQuota.present() || !reservedQuota.present()) {
 			return {};
 		}
-		auto const desiredTps = totalQuota.get() / averageTransactionCost;
-		auto const reservedTps = reservedQuota.get() / averageTransactionCost;
+		auto const desiredTps = totalQuota.get() / averageTransactionCost.get();
+		auto const reservedTps = reservedQuota.get() / averageTransactionCost.get();
 		auto const targetTps = getMax(reservedTps, getMin(desiredTps, limitingTps));
 
 		isBusy = limitingTps.present() && limitingTps.get() < desiredTps;
@@ -459,6 +465,9 @@ public:
 		for (auto& [tag, stats] : tagStatistics) {
 			// Currently there is no differentiation between batch priority and default priority transactions
 			TraceEvent te("GlobalTagThrottler_GotRate", id);
+			if (!stats.canLog()) {
+				te.disable();
+			}
 			bool isBusy{ false };
 			auto const targetTps = getTargetTps(tag, isBusy, te);
 			if (isBusy) {
@@ -468,6 +477,7 @@ public:
 				auto const smoothedTargetTps = stats.updateAndGetTargetLimit(targetTps.get());
 				te.detail("SmoothedTargetTps", smoothedTargetTps).detail("NumProxies", numProxies);
 				result[tag] = std::max(1.0, smoothedTargetTps / numProxies);
+				stats.updateLastLogged();
 			} else {
 				te.disable();
 			}
@@ -484,6 +494,9 @@ public:
 			// Currently there is no differentiation between batch priority and default priority transactions
 			bool isBusy{ false };
 			TraceEvent te("GlobalTagThrottler_GotClientRate", id);
+			if (!stats.canLog()) {
+				te.disable();
+			}
 			auto const targetTps = getTargetTps(tag, isBusy, te);
 
 			if (isBusy) {
@@ -494,6 +507,7 @@ public:
 				auto const clientRate = stats.updateAndGetPerClientLimit(targetTps.get());
 				result[TransactionPriority::BATCH][tag] = result[TransactionPriority::DEFAULT][tag] = clientRate;
 				te.detail("ClientTps", clientRate.tpsRate);
+				stats.updateLastLogged();
 			} else {
 				te.disable();
 			}
@@ -516,18 +530,31 @@ public:
 
 	Future<Void> tryUpdateAutoThrottling(StorageQueueInfo const& ss) {
 		auto& ssInfo = ssInfos[ss.id];
-		ssInfo.throttlingRatio = ss.getTagThrottlingRatio(SERVER_KNOBS->TARGET_BYTES_PER_STORAGE_SERVER,
+		ssInfo.throttlingRatio = ss.getTagThrottlingRatio(SERVER_KNOBS->AUTO_TAG_THROTTLE_STORAGE_QUEUE_BYTES,
 		                                                  SERVER_KNOBS->SPRING_BYTES_STORAGE_SERVER);
 		ssInfo.zoneId = ss.locality.zoneId();
 
+		auto& tagToThroughputCounters = throughput[ss.id];
+		std::unordered_set<TransactionTag> busyReadTags, busyWriteTags;
 		for (const auto& busyReadTag : ss.busiestReadTags) {
+			busyReadTags.insert(busyReadTag.tag);
 			if (tagStatistics.find(busyReadTag.tag) != tagStatistics.end()) {
-				throughput[ss.id][busyReadTag.tag].updateCost(busyReadTag.rate, OpType::READ);
+				tagToThroughputCounters[busyReadTag.tag].updateCost(busyReadTag.rate, OpType::READ);
 			}
 		}
 		for (const auto& busyWriteTag : ss.busiestWriteTags) {
+			busyWriteTags.insert(busyWriteTag.tag);
 			if (tagStatistics.find(busyWriteTag.tag) != tagStatistics.end()) {
-				throughput[ss.id][busyWriteTag.tag].updateCost(busyWriteTag.rate, OpType::WRITE);
+				tagToThroughputCounters[busyWriteTag.tag].updateCost(busyWriteTag.rate, OpType::WRITE);
+			}
+		}
+
+		for (auto& [tag, throughputCounters] : tagToThroughputCounters) {
+			if (!busyReadTags.count(tag)) {
+				throughputCounters.updateCost(0.0, OpType::READ);
+			}
+			if (!busyWriteTags.count(tag)) {
+				throughputCounters.updateCost(0.0, OpType::WRITE);
 			}
 		}
 		return Void();
@@ -672,7 +699,7 @@ public:
 		}
 		result.lastReply.bytesInput = ((totalReadCost.smoothRate() + totalWriteCost.smoothRate()) /
 		                               (capacity * CLIENT_KNOBS->TAG_THROTTLING_PAGE_SIZE)) *
-		                              SERVER_KNOBS->TARGET_BYTES_PER_STORAGE_SERVER;
+		                              SERVER_KNOBS->AUTO_TAG_THROTTLE_STORAGE_QUEUE_BYTES;
 		return result;
 	}
 };

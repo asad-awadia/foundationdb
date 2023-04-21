@@ -8,6 +8,7 @@ import os
 import glob
 import unittest
 import json
+import re
 
 from threading import Thread
 import time
@@ -37,7 +38,9 @@ class TestCluster(LocalCluster):
         version: str,
     ):
         self.client_config_tester_bin = Path(args.client_config_tester_bin).resolve()
-        assert self.client_config_tester_bin.exists(), "{} does not exist".format(self.client_config_tester_bin)
+        assert self.client_config_tester_bin.exists(), "{} does not exist".format(
+            self.client_config_tester_bin
+        )
         self.build_dir = Path(args.build_dir).resolve()
         assert self.build_dir.exists(), "{} does not exist".format(args.build_dir)
         assert self.build_dir.is_dir(), "{} is not a directory".format(args.build_dir)
@@ -67,7 +70,10 @@ class TestCluster(LocalCluster):
         self.fdbmonitor_binary = downloader.binary_path(version, "fdbmonitor")
         self.fdbserver_binary = downloader.binary_path(version, "fdbserver")
         self.fdbcli_binary = downloader.binary_path(version, "fdbcli")
-        self.set_env_var("LD_LIBRARY_PATH", "%s:%s" % (downloader.lib_dir(version), os.getenv("LD_LIBRARY_PATH")))
+        self.set_env_var(
+            "LD_LIBRARY_PATH",
+            "%s:%s" % (downloader.lib_dir(version), os.getenv("LD_LIBRARY_PATH")),
+        )
         self.save_config()
         self.ensure_ports_released()
         self.start_cluster()
@@ -99,6 +105,9 @@ class ClientConfigTest:
         self.expected_error = None
         self.transaction_timeout = None
         self.print_status = False
+        self.trace_file_identifier = None
+        self.trace_initialize_on_setup = False
+        self.trace_format = None
 
     # ----------------------------
     # Configuration methods
@@ -109,26 +118,43 @@ class ClientConfigTest:
         self.external_lib_dir.mkdir(parents=True)
         for version in versions:
             src_file_path = downloader.lib_path(version)
-            self.tc.assertTrue(src_file_path.exists(), "{} does not exist".format(src_file_path))
-            target_file_path = self.external_lib_dir.joinpath("libfdb_c.{}.so".format(version))
+            self.tc.assertTrue(
+                src_file_path.exists(), "{} does not exist".format(src_file_path)
+            )
+            target_file_path = self.external_lib_dir.joinpath(
+                "libfdb_c.{}.so".format(version)
+            )
             shutil.copyfile(src_file_path, target_file_path)
-            self.tc.assertTrue(target_file_path.exists(), "{} does not exist".format(target_file_path))
+            self.tc.assertTrue(
+                target_file_path.exists(), "{} does not exist".format(target_file_path)
+            )
 
     def create_external_lib_path(self, version):
         src_file_path = downloader.lib_path(version)
-        self.tc.assertTrue(src_file_path.exists(), "{} does not exist".format(src_file_path))
-        self.external_lib_path = self.test_dir.joinpath("libfdb_c.{}.so".format(version))
+        self.tc.assertTrue(
+            src_file_path.exists(), "{} does not exist".format(src_file_path)
+        )
+        self.external_lib_path = self.test_dir.joinpath(
+            "libfdb_c.{}.so".format(version)
+        )
         shutil.copyfile(src_file_path, self.external_lib_path)
-        self.tc.assertTrue(self.external_lib_path.exists(), "{} does not exist".format(self.external_lib_path))
+        self.tc.assertTrue(
+            self.external_lib_path.exists(),
+            "{} does not exist".format(self.external_lib_path),
+        )
 
     def create_cluster_file_with_wrong_port(self):
-        self.test_cluster_file = self.test_dir.joinpath("{}.cluster".format(random_alphanum_string(16)))
+        self.test_cluster_file = self.test_dir.joinpath(
+            "{}.cluster".format(random_alphanum_string(16))
+        )
         port = self.cluster.port_provider.get_free_port()
         with open(self.test_cluster_file, "w") as file:
             file.write("abcde:fghijk@127.0.0.1:{}".format(port))
 
     def create_invalid_cluster_file(self):
-        self.test_cluster_file = self.test_dir.joinpath("{}.cluster".format(random_alphanum_string(16)))
+        self.test_cluster_file = self.test_dir.joinpath(
+            "{}.cluster".format(random_alphanum_string(16))
+        )
         port = self.cluster.port_provider.get_free_port()
         with open(self.test_cluster_file, "w") as file:
             file.write("abcde:fghijk@")
@@ -142,10 +168,17 @@ class ClientConfigTest:
         self.tc.assertTrue("InitializationState" in self.status_json)
         self.tc.assertEqual(expected_state, self.status_json["InitializationState"])
 
+    def get_initialization_state(self):
+        self.tc.assertIsNotNone(self.status_json)
+        self.tc.assertTrue("InitializationState" in self.status_json)
+        return self.status_json["InitializationState"]
+
     def check_available_clients(self, expected_clients):
         self.tc.assertIsNotNone(self.status_json)
         self.tc.assertTrue("AvailableClients" in self.status_json)
-        actual_clients = [client["ReleaseVersion"] for client in self.status_json["AvailableClients"]]
+        actual_clients = [
+            client["ReleaseVersion"] for client in self.status_json["AvailableClients"]
+        ]
         self.tc.assertEqual(set(expected_clients), set(actual_clients))
 
     def check_protocol_version_not_set(self):
@@ -208,12 +241,19 @@ class ClientConfigTest:
         self.tc.assertTrue("Healthy" in self.status_json)
         self.tc.assertEqual(expected_is_healthy, self.status_json["Healthy"])
 
+    def list_trace_files(self):
+        return glob.glob(os.path.join(self.log_dir, "*"))
+
     # ----------------------------
     # Executing the test
     # ----------------------------
 
     def exec(self):
-        cmd_args = [self.cluster.client_config_tester_bin, "--cluster-file", self.test_cluster_file]
+        cmd_args = [
+            self.cluster.client_config_tester_bin,
+            "--cluster-file",
+            self.test_cluster_file,
+        ]
 
         if self.tmp_dir is not None:
             cmd_args += ["--tmp-dir", self.tmp_dir]
@@ -222,10 +262,10 @@ class ClientConfigTest:
             cmd_args += ["--log", "--log-dir", self.log_dir]
 
         if self.disable_local_client:
-            cmd_args += ["--disable-local-client"]
+            cmd_args += ["--network-option-disable_local_client", ""]
 
         if self.disable_client_bypass:
-            cmd_args += ["--disable-client-bypass"]
+            cmd_args += ["--network-option-disable_client_bypass", ""]
 
         if self.external_lib_path is not None:
             cmd_args += ["--external-client-library", self.external_lib_path]
@@ -234,10 +274,22 @@ class ClientConfigTest:
             cmd_args += ["--external-client-dir", self.external_lib_dir]
 
         if self.ignore_external_client_failures:
-            cmd_args += ["--ignore-external-client-failures"]
+            cmd_args += ["--network-option-ignore_external_client_failures", ""]
 
         if self.fail_incompatible_client:
-            cmd_args += ["--fail-incompatible-client"]
+            cmd_args += ["--network-option-fail_incompatible_client", ""]
+
+        if self.trace_file_identifier is not None:
+            cmd_args += [
+                "--network-option-trace_file_identifier",
+                self.trace_file_identifier,
+            ]
+
+        if self.trace_initialize_on_setup:
+            cmd_args += ["--network-option-trace_initialize_on_setup", ""]
+
+        if self.trace_format is not None:
+            cmd_args += ["--network-option-trace_format", self.trace_format]
 
         if self.api_version is not None:
             cmd_args += ["--api-version", str(self.api_version)]
@@ -251,27 +303,29 @@ class ClientConfigTest:
         if self.print_status:
             cmd_args += ["--print-status"]
 
-        print("\nExecuting test command: {}".format(" ".join([str(c) for c in cmd_args])), file=sys.stderr)
-        try:
-            tester_proc = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=sys.stderr)
-            out, _ = tester_proc.communicate()
-            self.tc.assertEqual(0, tester_proc.returncode)
-            if self.print_status:
-                # Parse the output as status json
-                try:
-                    self.status_json = json.loads(out)
-                except json.JSONDecodeError as e:
-                    print("Error '{}' parsing output {}".format(e, out.decode()), file=sys.stderr)
-                self.tc.assertIsNotNone(self.status_json)
-                print("Status: ", self.status_json, file=sys.stderr)
-            else:
-                # Otherwise redirect the output to the console
-                print(out.decode(), file=sys.stderr)
-        finally:
-            self.cleanup()
-
-    def cleanup(self):
-        shutil.rmtree(self.test_dir)
+        print(
+            "\nExecuting test command: {}".format(" ".join([str(c) for c in cmd_args])),
+            file=sys.stderr,
+        )
+        tester_proc = subprocess.Popen(
+            cmd_args, stdout=subprocess.PIPE, stderr=sys.stderr
+        )
+        out, _ = tester_proc.communicate()
+        self.tc.assertEqual(0, tester_proc.returncode)
+        if self.print_status:
+            # Parse the output as status json
+            try:
+                self.status_json = json.loads(out)
+            except json.JSONDecodeError as e:
+                print(
+                    "Error '{}' parsing output {}".format(e, out.decode()),
+                    file=sys.stderr,
+                )
+            self.tc.assertIsNotNone(self.status_json)
+            print("Status: ", self.status_json, file=sys.stderr)
+        else:
+            # Otherwise redirect the output to the console
+            print(out.decode(), file=sys.stderr)
 
 
 class ClientConfigTests(unittest.TestCase):
@@ -326,12 +380,16 @@ class ClientConfigTests(unittest.TestCase):
         # Multiple external clients, normal case
         test = ClientConfigTest(self)
         test.print_status = True
-        test.create_external_lib_dir([CURRENT_VERSION, PREV_RELEASE_VERSION, PREV2_RELEASE_VERSION])
+        test.create_external_lib_dir(
+            [CURRENT_VERSION, PREV_RELEASE_VERSION, PREV2_RELEASE_VERSION]
+        )
         test.disable_local_client = True
         test.api_version = api_version_from_str(PREV2_RELEASE_VERSION)
         test.exec()
         test.check_healthy_status_report()
-        test.check_available_clients([CURRENT_VERSION, PREV_RELEASE_VERSION, PREV2_RELEASE_VERSION])
+        test.check_available_clients(
+            [CURRENT_VERSION, PREV_RELEASE_VERSION, PREV2_RELEASE_VERSION]
+        )
         test.check_current_client(CURRENT_VERSION)
 
     def test_no_external_client_support_api_version(self):
@@ -356,7 +414,9 @@ class ClientConfigTests(unittest.TestCase):
     def test_one_external_client_wrong_api_version(self):
         # Multiple external clients, API version unsupported by one of othem
         test = ClientConfigTest(self)
-        test.create_external_lib_dir([CURRENT_VERSION, PREV_RELEASE_VERSION, PREV2_RELEASE_VERSION])
+        test.create_external_lib_dir(
+            [CURRENT_VERSION, PREV_RELEASE_VERSION, PREV2_RELEASE_VERSION]
+        )
         test.disable_local_client = True
         test.api_version = api_version_from_str(CURRENT_VERSION)
         test.expected_error = 2204  # API function missing
@@ -366,7 +426,9 @@ class ClientConfigTests(unittest.TestCase):
         # Multiple external clients;  API version unsupported by one of them; Ignore failures
         test = ClientConfigTest(self)
         test.print_status = True
-        test.create_external_lib_dir([CURRENT_VERSION, PREV_RELEASE_VERSION, PREV2_RELEASE_VERSION])
+        test.create_external_lib_dir(
+            [CURRENT_VERSION, PREV_RELEASE_VERSION, PREV2_RELEASE_VERSION]
+        )
         test.disable_local_client = True
         test.api_version = api_version_from_str(CURRENT_VERSION)
         test.ignore_external_client_failures = True
@@ -404,10 +466,15 @@ class ClientConfigTests(unittest.TestCase):
         test.transaction_timeout = 100
         test.expected_error = 1031  # Timeout
         test.exec()
-        test.check_initialization_state("incompatible")
         test.check_healthy_status(False)
         test.check_available_clients([PREV_RELEASE_VERSION])
-        test.check_current_client(None)
+        init_state = test.get_initialization_state()
+        if init_state == "incompatible":
+            test.check_current_client(None)
+        elif init_state == "initializing":
+            test.check_protocol_version_not_set()
+        else:
+            self.fail("Unexpected initialization state {}".format(init_state))
 
     def test_cannot_connect_to_coordinator(self):
         # Testing a cluster file with a valid address, but no server behind it
@@ -514,6 +581,190 @@ class ClientConfigSeparateCluster(unittest.TestCase):
             t.join()
         finally:
             self.cluster.tear_down()
+
+
+# Test client-side tracing
+class ClientTracingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.cluster = TestCluster(CURRENT_VERSION)
+        cls.cluster.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.cluster.tear_down()
+
+    def test_default_config_normal_case(self):
+        # Test trace files created with a default trace configuration
+        # in a normal case
+        test = self.test
+        test.create_external_lib_dir([CURRENT_VERSION, PREV_RELEASE_VERSION])
+        test.api_version = api_version_from_str(PREV_RELEASE_VERSION)
+        test.disable_local_client = True
+
+        self.exec_test()
+        self.assertEqual(3, len(self.trace_files))
+        primary_trace = self.find_trace_file(with_ip=True)
+        self.find_and_check_event(primary_trace, "ClientStart", ["Machine"], [])
+        cur_ver_trace = self.find_trace_file(
+            with_ip=True, version=CURRENT_VERSION, thread_idx=0
+        )
+        self.find_and_check_event(cur_ver_trace, "ClientStart", ["Machine"], [])
+        prev_ver_trace = self.find_trace_file(
+            with_ip=True, version=PREV_RELEASE_VERSION, thread_idx=0
+        )
+        # there have been sporadic check failures in the trace check below, so we comment this out for the time being
+        # previous release version was likely not flushing trace correctly when network::stop() is called
+        # TODO: re-enable this check when we bump up PREV_RELEASE_VERSION to one where there is such a guarantee
+        # self.find_and_check_event(prev_ver_trace, "ClientStart", ["Machine"], [])
+
+    def test_default_config_error_case(self):
+        # Test that no trace files are created with a default configuration
+        # when an a client fails to initialize
+        test = self.test
+        test.create_external_lib_dir([CURRENT_VERSION, PREV_RELEASE_VERSION])
+        test.api_version = api_version_from_str(CURRENT_VERSION)
+        test.disable_local_client = True
+        test.expected_error = 2204  # API function missing
+
+        self.exec_test()
+        self.assertEqual(0, len(self.trace_files))
+
+    def test_init_on_setup_normal_case(self):
+        # Test trace files created with trace_initialize_on_setup option
+        # in a normal case
+        test = self.test
+        test.create_external_lib_dir([CURRENT_VERSION])
+        test.api_version = api_version_from_str(CURRENT_VERSION)
+        test.disable_local_client = True
+        test.trace_initialize_on_setup = True
+
+        self.exec_test()
+        self.assertEqual(2, len(self.trace_files))
+        primary_trace = self.find_trace_file()
+        # The machine address will be available only in the second ClientStart event
+        self.find_and_check_event(primary_trace, "ClientStart", [], ["Machine"])
+        self.find_and_check_event(
+            primary_trace, "ClientStart", ["Machine"], [], seqno=1
+        )
+        cur_ver_trace = self.find_trace_file(version=CURRENT_VERSION, thread_idx=0)
+        self.find_and_check_event(cur_ver_trace, "ClientStart", [], ["Machine"])
+        self.find_and_check_event(
+            cur_ver_trace, "ClientStart", ["Machine"], [], seqno=1
+        )
+
+    def test_init_on_setup_trace_error_case(self):
+        # Test trace files created with trace_initialize_on_setup option
+        # when an a client fails to initialize
+        test = self.test
+        test.create_external_lib_dir([CURRENT_VERSION, PREV_RELEASE_VERSION])
+        test.api_version = api_version_from_str(CURRENT_VERSION)
+        test.disable_local_client = True
+        test.trace_initialize_on_setup = True
+        test.expected_error = 2204  # API function missing
+
+        self.exec_test()
+        self.assertEqual(1, len(self.trace_files))
+        primary_trace = self.find_trace_file()
+        self.find_and_check_event(primary_trace, "ClientStart", [], ["Machine"])
+
+    def test_trace_identifier(self):
+        # Test trace files created with file identifier
+        test = self.test
+        test.create_external_lib_dir([CURRENT_VERSION])
+        test.api_version = api_version_from_str(CURRENT_VERSION)
+        test.disable_local_client = True
+        test.trace_file_identifier = "fdbclient"
+
+        self.exec_test()
+        self.assertEqual(2, len(self.trace_files))
+        self.find_trace_file(with_ip=True, identifier="fdbclient")
+        self.find_trace_file(
+            with_ip=True, identifier="fdbclient", version=CURRENT_VERSION, thread_idx=0
+        )
+
+    def test_init_on_setup_and_trace_identifier(self):
+        # Test trace files created with trace_initialize_on_setup option
+        # and file identifier
+        test = self.test
+        test.create_external_lib_dir([CURRENT_VERSION])
+        test.api_version = api_version_from_str(CURRENT_VERSION)
+        test.disable_local_client = True
+        test.trace_initialize_on_setup = True
+        test.trace_file_identifier = "fdbclient"
+
+        self.exec_test()
+        self.assertEqual(2, len(self.trace_files))
+        self.find_trace_file(identifier="fdbclient")
+        self.find_trace_file(
+            identifier="fdbclient", version=CURRENT_VERSION, thread_idx=0
+        )
+
+    # ---------------
+    # Helper methods
+    # ---------------
+
+    def setUp(self):
+        self.test = ClientConfigTest(self)
+        self.trace_files = None
+        self.test.trace_format = "json"
+
+    def exec_test(self):
+        self.test.exec()
+        self.trace_files = self.test.list_trace_files()
+        if self.test.trace_format == "json":
+            self.load_trace_file_events()
+
+    def load_trace_file_events(self):
+        self.trace_file_events = {}
+        for trace in self.trace_files:
+            events = []
+            with open(trace, "r") as f:
+                for line in f:
+                    events.append(json.loads(line))
+            self.trace_file_events[trace] = events
+
+    def find_trace_file(
+        self, with_ip=False, identifier=None, version=None, thread_idx=None
+    ):
+        self.assertIsNotNone(self.trace_files)
+        for trace_file in self.trace_files:
+            name = os.path.basename(trace_file)
+            # trace prefix must be in all files
+            self.assertTrue(name.startswith("trace."))
+            pattern = "^trace\."
+            if with_ip:
+                pattern += "127\.0\.0\.1\."
+            else:
+                pattern += "0\.0\.0\.0\."
+            if identifier is not None:
+                pattern += identifier
+            else:
+                pattern += "\d+"
+            if version is not None:
+                pattern += "_v{}".format(version.replace(".", "_"))
+            if thread_idx is not None:
+                pattern += "t{}".format(thread_idx)
+            pattern += "\.\d+\.\w+\.\d+\.\d+\.{}$".format(self.test.trace_format)
+            if re.match(pattern, name):
+                return trace_file
+        self.fail("No maching trace file found")
+
+    def find_and_check_event(
+        self, trace_file, event_type, attr_present, attr_missing, seqno=0
+    ):
+        self.assertTrue(trace_file in self.trace_file_events)
+        for event in self.trace_file_events[trace_file]:
+            if event["Type"] == event_type:
+                if seqno > 0:
+                    seqno -= 1
+                    continue
+                for attr in attr_present:
+                    self.assertTrue(attr in event)
+                for attr in attr_missing:
+                    self.assertFalse(attr in event)
+                return
+        self.fail("No matching event found")
 
 
 if __name__ == "__main__":
