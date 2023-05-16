@@ -2074,12 +2074,18 @@ ACTOR Future<Void> workerServer(Reference<IClusterConnectionRecord> connRecord,
 	state std::vector<Future<Void>> recoveries;
 
 	try {
-		std::vector<DiskStore> stores = getDiskStores(folder);
-		bool validateDataFiles = deleteFile(joinPath(folder, validationFilename));
-		for (int f = 0; f < stores.size(); f++) {
-			DiskStore s = stores[f];
+		state std::vector<DiskStore> stores = getDiskStores(folder);
+		state bool validateDataFiles = deleteFile(joinPath(folder, validationFilename));
+		state int index = 0;
+		for (; index < stores.size(); ++index) {
+			state DiskStore s = stores[index];
 			// FIXME: Error handling
 			if (s.storedComponent == DiskStore::Storage) {
+				// Opening multiple KVSs at the same time could make worker run out of mememory. Add delay to allow the
+				// extra storage process to be removed.
+				if (index >= 2 && SERVER_KNOBS->WORKER_START_STORAGE_DELAY > 0.0) {
+					wait(delay(SERVER_KNOBS->WORKER_START_STORAGE_DELAY));
+				}
 				LocalLineage _;
 				getCurrentLineage()->modify(&RoleLineage::role) = ProcessClass::ClusterRole::Storage;
 
@@ -3146,30 +3152,35 @@ ACTOR Future<Void> workerServer(Reference<IClusterConnectionRecord> connRecord,
 					    .detail("Role", snapReq.role);
 					ASSERT(snapReq.role == snapReqMap[snapReqKey].role);
 					ASSERT(snapReq.snapPayload == snapReqMap[snapReqKey].snapPayload);
+					// Discard the old request if a duplicate new request is received
+					// In theory, the old request should be discarded when we send this error since DD won't resend a
+					// request unless for a network error, where the old request is discarded before sending the
+					// duplicate request.
+					snapReqMap[snapReqKey].reply.sendError(duplicate_snapshot_request());
 					snapReqMap[snapReqKey] = snapReq;
 				} else {
 					snapReqMap[snapReqKey] = snapReq; // set map point to the request
 					if (g_network->isSimulated() && (now() - lastSnapTime) < SERVER_KNOBS->SNAP_MINIMUM_TIME_GAP) {
-						// only allow duplicate snapshots on same process in a short time for different roles
-						auto okay = (lastSnapReq.snapUID == snapReq.snapUID) && lastSnapReq.role != snapReq.role;
+						// duplicate snapshots on the same process for the same role is not allowed
+						auto okay = lastSnapReq.snapUID != snapReq.snapUID || lastSnapReq.role != snapReq.role;
 						TraceEvent(okay ? SevInfo : SevError, "RapidSnapRequestsOnSameProcess")
-						    .detail("CurrSnapUID", snapReqKey)
+						    .detail("CurrSnapUID", snapReq.snapUID)
 						    .detail("PrevSnapUID", lastSnapReq.snapUID)
 						    .detail("CurrRole", snapReq.role)
 						    .detail("PrevRole", lastSnapReq.role)
 						    .detail("GapTime", now() - lastSnapTime);
 					}
-					errorForwarders.add(workerSnapCreate(snapReq,
-					                                     snapReq.role.toString() == "coord" ? coordFolder : folder,
-					                                     &snapReqMap,
-					                                     &snapReqResultMap));
 					auto* snapReqResultMapPtr = &snapReqResultMap;
 					errorForwarders.add(fmap(
 					    [snapReqResultMapPtr, snapReqKey](Void _) {
 						    snapReqResultMapPtr->erase(snapReqKey);
 						    return Void();
 					    },
-					    delay(SERVER_KNOBS->SNAP_MINIMUM_TIME_GAP)));
+					    delayed(workerSnapCreate(snapReq,
+					                             snapReq.role.toString() == "coord" ? coordFolder : folder,
+					                             &snapReqMap,
+					                             &snapReqResultMap),
+					            SERVER_KNOBS->SNAP_MINIMUM_TIME_GAP)));
 					if (g_network->isSimulated()) {
 						lastSnapReq = snapReq;
 						lastSnapTime = now();

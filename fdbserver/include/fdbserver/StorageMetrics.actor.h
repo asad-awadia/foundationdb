@@ -36,6 +36,7 @@ const StringRef STORAGESERVER_HISTOGRAM_GROUP = "StorageServer"_sr;
 const StringRef FETCH_KEYS_LATENCY_HISTOGRAM = "FetchKeysLatency"_sr;
 const StringRef FETCH_KEYS_BYTES_HISTOGRAM = "FetchKeysSize"_sr;
 const StringRef FETCH_KEYS_BYTES_PER_SECOND_HISTOGRAM = "FetchKeysBandwidth"_sr;
+const StringRef FETCH_KEYS_BYTES_PER_COMMIT_HISTOGRAM = "FetchKeysBytesPerCommit"_sr;
 const StringRef TLOG_CURSOR_READS_LATENCY_HISTOGRAM = "TLogCursorReadsLatency"_sr;
 const StringRef SS_VERSION_LOCK_LATENCY_HISTOGRAM = "SSVersionLockLatency"_sr;
 const StringRef EAGER_READS_LATENCY_HISTOGRAM = "EagerReadsLatency"_sr;
@@ -179,6 +180,30 @@ ByteSampleInfo isKeyValueInSample(KeyRef key, int64_t totalKvSize);
 inline ByteSampleInfo isKeyValueInSample(KeyValueRef keyValue) {
 	return isKeyValueInSample(keyValue.key, keyValue.key.size() + keyValue.value.size());
 }
+
+struct CommonStorageCounters {
+	CounterCollection cc;
+	// read ops
+	Counter finishedQueries, bytesQueried;
+
+	// write ops
+	// Like bytesInput but without MVCC accounting. The size is counted as how much it takes when serialized. It
+	// is basically the size of both parameters of the mutation and a 12 bytes overhead that keeps mutation type
+	// and the lengths of both parameters.
+	Counter mutationBytes;
+	Counter mutations, setMutations, clearRangeMutations;
+
+	// Bytes fetched by fetchKeys() for data movements. The size is counted as a collection of KeyValueRef.
+	Counter bytesFetched;
+	// The number of key-value pairs fetched by fetchKeys()
+	Counter kvFetched;
+
+	// name and id are the inputs to CounterCollection initialization. If metrics provided, the caller should guarantee
+	// the lifetime of metrics is longer than this counter
+	CommonStorageCounters(const std::string& name,
+	                      const std::string& id,
+	                      const StorageServerMetrics* metrics = nullptr);
+};
 
 class IStorageMetricsService {
 public:
