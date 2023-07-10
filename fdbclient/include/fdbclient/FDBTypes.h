@@ -22,9 +22,11 @@
 #define FDBCLIENT_FDBTYPES_H
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <set>
 #include <string>
+#include <variant>
 #include <vector>
 #include <unordered_set>
 #include <boost/functional/hash.hpp>
@@ -829,7 +831,7 @@ struct RangeResultRef : VectorRef<KeyValueRef> {
 		serializer(ar, ((VectorRef<KeyValueRef>&)*this), more, readThrough, readToBegin, readThroughEnd);
 	}
 
-	int logicalSize() const {
+	int64_t logicalSize() const {
 		return VectorRef<KeyValueRef>::expectedSize() - VectorRef<KeyValueRef>::size() * sizeof(KeyValueRef);
 	}
 
@@ -1759,6 +1761,16 @@ struct Versionstamp {
 	bool operator<=(const Versionstamp& r) const { return !(*this > r); }
 	bool operator>=(const Versionstamp& r) const { return !(*this < r); }
 
+	Versionstamp() {}
+	Versionstamp(Version version, uint16_t batchNumber) : version(version), batchNumber(batchNumber) {}
+	Versionstamp(Standalone<StringRef> str) {
+		ASSERT(str.size() == sizeof(Version) + sizeof(batchNumber));
+		version = bigEndian64(*reinterpret_cast<const Version*>(str.begin()));
+		batchNumber = bigEndian16(*reinterpret_cast<const uint16_t*>(str.begin() + sizeof(Version)));
+	}
+
+	std::string toString() const { return fmt::format("{}.{}", version, batchNumber); }
+
 	template <class Ar>
 	void serialize(Ar& ar) {
 		int64_t beVersion;
@@ -1787,5 +1799,10 @@ template <class Ar>
 inline void load(Ar& ar, Versionstamp& value) {
 	value.serialize(ar);
 }
+
+template <>
+struct Traceable<Versionstamp> : std::true_type {
+	static std::string toString(const Versionstamp& v) { return v.toString(); }
+};
 
 #endif

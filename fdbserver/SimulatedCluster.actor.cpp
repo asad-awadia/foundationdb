@@ -56,6 +56,7 @@
 #include "flow/CodeProbeUtils.h"
 #include "fdbserver/SimulatedCluster.h"
 #include "flow/IConnection.h"
+#include "fdbserver/MockGlobalState.h"
 #include "flow/actorcompiler.h" // This must be the last #include.
 
 #undef max
@@ -66,7 +67,7 @@ extern const char* getSourceVersion();
 
 using namespace std::literals;
 
-bool isSimulatorProcessReliable() {
+bool isSimulatorProcessUnreliable() {
 	return g_network->isSimulated() && !g_simulator->getCurrentProcess()->isReliable();
 }
 
@@ -1707,6 +1708,10 @@ void SimulationConfig::setStorageEngine(const TestConfig& testConfig) {
 		}
 	}
 
+	if (storage_engine_type == 5) {
+		set_config("encryption_at_rest_mode=disabled");
+	}
+
 	switch (storage_engine_type) {
 	case 0: {
 		CODE_PROBE(true, "Simulated cluster using ssd storage engine");
@@ -2159,7 +2164,8 @@ void SimulationConfig::generateNormalConfig(const TestConfig& testConfig) {
 	setEncryptionAtRestMode(testConfig);
 	setStorageEngine(testConfig);
 	setReplicationType(testConfig);
-	if (generateFearless || (datacenters == 2 && deterministicRandom()->random01() < 0.5)) {
+	if (!testConfig.singleRegion &&
+	    (generateFearless || (datacenters == 2 && deterministicRandom()->random01() < 0.5))) {
 		setRegions(testConfig);
 	}
 	setMachineCount(testConfig);
@@ -2192,6 +2198,10 @@ void setupSimulatedSystem(std::vector<Future<Void>>* systemActors,
 	// SOMEDAY: this does not test multi-interface configurations
 	SimulationConfig simconfig(testConfig);
 	*tenantMode = simconfig.db.tenantMode;
+
+	if (testConfig.testClass == MOCK_DD_TEST_CLASS) {
+		MockGlobalState::g_mockState()->initializeClusterLayout(simconfig);
+	}
 
 	if (testConfig.logAntiQuorum != -1) {
 		simconfig.db.tLogWriteAntiQuorum = testConfig.logAntiQuorum;
@@ -2723,6 +2733,18 @@ ACTOR void setupAndRun(std::string dataFolder,
 		testConfig.storageEngineExcludeTypes.push_back(5);
 	}
 
+	if (std::string_view(testFile).find("Encrypt") != std::string_view::npos) {
+		testConfig.storageEngineExcludeTypes.push_back(5);
+	}
+
+	if (std::string_view(testFile).find("BlobGranule") != std::string_view::npos) {
+		testConfig.storageEngineExcludeTypes.push_back(5);
+	}
+
+	if (std::string_view(testFile).find("ChangeFeed") != std::string_view::npos) {
+		testConfig.storageEngineExcludeTypes.push_back(5);
+	}
+
 	state ProtocolVersion protocolVersion = currentProtocolVersion();
 	if (testConfig.startIncompatibleProcess) {
 		// isolates right most 1 bit of compatibleProtocolVersionMask to make this protocolVersion incompatible
@@ -2874,10 +2896,6 @@ ACTOR void setupAndRun(std::string dataFolder,
 	destructed = true;
 	wait(Never());
 	ASSERT(false);
-}
-
-DatabaseConfiguration generateNormalDatabaseConfiguration(const BasicTestConfig& testConfig) {
-	return generateBasicSimulationConfig(testConfig).db;
 }
 
 BasicSimulationConfig generateBasicSimulationConfig(const BasicTestConfig& testConfig) {

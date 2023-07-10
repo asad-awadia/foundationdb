@@ -1194,7 +1194,6 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 	}
 
 	state bool is_error = false;
-
 	state Future<Void> warn;
 	loop {
 		if (warn.isValid())
@@ -1452,13 +1451,6 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 					continue;
 				}
 
-				if (tokencmp(tokens[0], "blobrestore")) {
-					bool _result = wait(makeInterruptable(blobRestoreCommandActor(localDb, tokens)));
-					if (!_result)
-						is_error = true;
-					continue;
-				}
-
 				if (tokencmp(tokens[0], "unlock")) {
 					if ((tokens.size() != 2) || (tokens[1].size() != 32) ||
 					    !std::all_of(tokens[1].begin(), tokens[1].end(), &isxdigit)) {
@@ -1625,6 +1617,24 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 					continue;
 				}
 
+				if (tokencmp(tokens[0], "getlocation")) {
+					Version _v = wait(makeInterruptable(
+					    safeThreadFutureToFuture(getTransaction(db, tenant, tr, options, intrans)->getReadVersion())));
+					bool _result = wait(makeInterruptable(getLocationCommandActor(localDb, tokens, _v)));
+					if (!_result)
+						is_error = true;
+					continue;
+				}
+
+				if (tokencmp(tokens[0], "getall")) {
+					Version _v = wait(makeInterruptable(
+					    safeThreadFutureToFuture(getTransaction(db, tenant, tr, options, intrans)->getReadVersion())));
+					bool _result = wait(makeInterruptable(getallCommandActor(localDb, tokens, _v)));
+					if (!_result)
+						is_error = true;
+					continue;
+				}
+
 				if (tokencmp(tokens[0], "getversion")) {
 					if (tokens.size() != 1) {
 						printUsage(tokens[0]);
@@ -1672,13 +1682,23 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 					if (!auditId.isValid()) {
 						is_error = true;
 					} else {
-						printf("Started audit: %s\n", auditId.toString().c_str());
+						printf("%s audit: %s\n",
+						       tokencmp(tokens[1], "cancel") ? "Cancelled" : "Started",
+						       auditId.toString().c_str());
 					}
 					continue;
 				}
 
 				if (tokencmp(tokens[0], "get_audit_status")) {
 					bool _result = wait(makeInterruptable(getAuditStatusCommandActor(localDb, tokens)));
+					if (!_result) {
+						is_error = true;
+					}
+					continue;
+				}
+
+				if (tokencmp(tokens[0], "location_metadata")) {
+					bool _result = wait(makeInterruptable(locationMetadataCommandActor(localDb, tokens)));
 					if (!_result) {
 						is_error = true;
 					}

@@ -27,6 +27,7 @@
 #include "fdbserver/DeltaTree.h"
 #include "fdbserver/IKeyValueStore.h"
 #include "fdbserver/IPager.h"
+#include "fdbserver/IPageEncryptionKeyProvider.actor.h"
 #include "fdbserver/Knobs.h"
 #include "fdbserver/VersionedBTreeDebug.h"
 #include "fdbserver/WorkerInterface.actor.h"
@@ -7998,7 +7999,8 @@ public:
 	                     Reference<AsyncVar<ServerDBInfo> const> db,
 	                     Optional<EncryptionAtRestMode> encryptionMode,
 	                     EncodingType encodingType = EncodingType::MAX_ENCODING_TYPE,
-	                     Reference<IPageEncryptionKeyProvider> keyProvider = {})
+	                     Reference<IPageEncryptionKeyProvider> keyProvider = {},
+	                     int64_t pageCacheBytes = 0)
 	  : m_filename(filename), prefetch(SERVER_KNOBS->REDWOOD_KVSTORE_RANGE_PREFETCH) {
 		if (!encryptionMode.present() || encryptionMode.get().isEncryptionEnabled()) {
 			ASSERT(keyProvider.isValid() || db.isValid());
@@ -8007,11 +8009,13 @@ public:
 		int pageSize =
 		    BUGGIFY ? deterministicRandom()->randomInt(1000, 4096 * 4) : SERVER_KNOBS->REDWOOD_DEFAULT_PAGE_SIZE;
 		int extentSize = SERVER_KNOBS->REDWOOD_DEFAULT_EXTENT_SIZE;
-		int64_t pageCacheBytes =
-		    g_network->isSimulated()
-		        ? (BUGGIFY ? deterministicRandom()->randomInt(pageSize, FLOW_KNOBS->BUGGIFY_SIM_PAGE_CACHE_4K)
-		                   : FLOW_KNOBS->SIM_PAGE_CACHE_4K)
-		        : FLOW_KNOBS->PAGE_CACHE_4K;
+		if (pageCacheBytes <= 0) {
+			pageCacheBytes =
+			    g_network->isSimulated()
+			        ? (BUGGIFY ? deterministicRandom()->randomInt(pageSize, FLOW_KNOBS->BUGGIFY_SIM_PAGE_CACHE_4K)
+			                   : FLOW_KNOBS->SIM_PAGE_CACHE_4K)
+			        : FLOW_KNOBS->PAGE_CACHE_4K;
+		}
 		// Rough size of pages to keep in remap cleanup queue before being cleanup.
 		int64_t remapCleanupWindowBytes =
 		    g_network->isSimulated()
@@ -8322,8 +8326,15 @@ private:
 IKeyValueStore* keyValueStoreRedwoodV1(std::string const& filename,
                                        UID logID,
                                        Reference<AsyncVar<ServerDBInfo> const> db,
-                                       Optional<EncryptionAtRestMode> encryptionMode) {
-	return new KeyValueStoreRedwood(filename, logID, db, encryptionMode);
+                                       Optional<EncryptionAtRestMode> encryptionMode,
+                                       int64_t pageCacheBytes) {
+	return new KeyValueStoreRedwood(filename,
+	                                logID,
+	                                db,
+	                                encryptionMode,
+	                                EncodingType::MAX_ENCODING_TYPE,
+	                                Reference<IPageEncryptionKeyProvider>(),
+	                                pageCacheBytes);
 }
 
 int randomSize(int max) {
@@ -10092,6 +10103,19 @@ RandomKeyGenerator getDefaultKeyGenerator(int maxKeySize) {
 	return keyGen;
 }
 
+double getExternalTimeoutThreshold(const UnitTestParameters& params) {
+#if defined(USE_SANITIZER)
+	double ret = params.getDouble("maxRunTimeSanitizerModeWallTime").orDefault(800);
+#else
+	double ret = params.getDouble("maxRunTimeWallTime").orDefault(250);
+#endif
+
+#if VALGRIND
+	ret *= 20;
+#endif
+	return ret;
+}
+
 } // namespace
 
 TEST_CASE("Lredwood/correctness/btree") {
@@ -10153,6 +10177,9 @@ TEST_CASE("Lredwood/correctness/btree") {
 	state int maxColdStarts = params.getInt("maxColdStarts").orDefault(300);
 	// Max number of records in the BTree or the versioned written map to visit
 	state int64_t maxRecordsRead = params.getInt("maxRecordsRead").orDefault(300e6);
+	// Max test runtime (in seconds). After the test runs for this amount of time, the next iteration of the test
+	// loop will terminate.
+	state double maxRunTimeWallTime = getExternalTimeoutThreshold(params);
 
 	state Optional<std::string> keyGenerator = params.get("keyGenerator");
 	state RandomKeyGenerator keyGen;
@@ -10270,10 +10297,17 @@ TEST_CASE("Lredwood/correctness/btree") {
 	state Future<Void> commit = Void();
 	state int64_t totalPageOps = 0;
 
-	// Check test op limits
+	state double testStartWallTime = timer();
+	state int64_t commitOps = 0;
+
+	// Check test op limits and wall time and commitOps
 	state std::function<bool()> testFinished = [=]() {
+		if (timer() - testStartWallTime >= maxRunTimeWallTime) {
+			noUnseed = true;
+		}
 		return !(totalPageOps < maxPageOps && written.size() < maxVerificationMapEntries &&
-		         totalRecordsRead < maxRecordsRead && coldStarts < maxColdStarts);
+		         totalRecordsRead < maxRecordsRead && coldStarts < maxColdStarts && !noUnseed) &&
+		       commitOps > 0;
 	};
 
 	while (!testFinished()) {
@@ -10438,6 +10472,7 @@ TEST_CASE("Lredwood/correctness/btree") {
 				committedVersions.send(v);
 				return Void();
 			});
+			++commitOps;
 
 			if (serialTest) {
 				// Wait for commit, wait for verification, then start new verification

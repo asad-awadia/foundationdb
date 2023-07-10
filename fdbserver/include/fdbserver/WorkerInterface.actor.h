@@ -158,7 +158,7 @@ struct WorkerDetails {
 
 // This interface and its serialization depend on slicing, since the client will deserialize only the first part of this
 // structure
-struct ClusterControllerFullInterface {
+struct SWIFT_CXX_IMPORT_OWNED ClusterControllerFullInterface {
 	constexpr static FileIdentifier file_identifier = ClusterControllerClientInterface::file_identifier;
 	ClusterInterface clientInterface;
 	RequestStream<struct RecruitFromConfigurationRequest> recruitFromConfiguration;
@@ -232,6 +232,8 @@ struct ClusterControllerFullInterface {
 		           getEncryptionAtRestMode);
 	}
 };
+
+using AsyncVar_Optional_ClusterControllerFullInterface = AsyncVar<Optional<ClusterControllerFullInterface>>;
 
 struct RegisterWorkerReply {
 	constexpr static FileIdentifier file_identifier = 16475696;
@@ -526,13 +528,14 @@ struct UpdateWorkerHealthRequest {
 	NetworkAddress address;
 	std::vector<NetworkAddress> degradedPeers;
 	std::vector<NetworkAddress> disconnectedPeers;
+	std::vector<NetworkAddress> recoveredPeers;
 
 	template <class Ar>
 	void serialize(Ar& ar) {
 		if constexpr (!is_fb_function<Ar>) {
 			ASSERT(ar.protocolVersion().isValid());
 		}
-		serializer(ar, address, degradedPeers, disconnectedPeers);
+		serializer(ar, address, degradedPeers, disconnectedPeers, recoveredPeers);
 	}
 };
 
@@ -625,7 +628,7 @@ struct InitializeTLogRequest {
 	int logRouterTags;
 	int txsTags;
 	Version recoveryTransactionVersion;
-	std::vector<Version> oldGenerationStartVersions;
+	std::vector<Version> oldGenerationRecoverAtVersions;
 
 	ReplyPromise<struct TLogInterface> reply;
 
@@ -652,7 +655,7 @@ struct InitializeTLogRequest {
 		           spillType,
 		           txsTags,
 		           recoveryTransactionVersion,
-		           oldGenerationStartVersions);
+		           oldGenerationRecoverAtVersions);
 	}
 };
 
@@ -888,6 +891,20 @@ struct InitializeBlobWorkerReply {
 };
 
 struct InitializeBlobWorkerRequest {
+	constexpr static FileIdentifier file_identifier = 5838547;
+	UID reqId;
+	UID interfaceId;
+	KeyValueStoreType storeType;
+	ReplyPromise<InitializeBlobWorkerReply> reply;
+	EncryptionAtRestMode encryptMode;
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, reqId, interfaceId, storeType, reply, encryptMode);
+	}
+};
+
+struct InitializeBlobWorkerRequestOld {
 	constexpr static FileIdentifier file_identifier = 5838547;
 	UID reqId;
 	UID interfaceId;
@@ -1150,6 +1167,7 @@ void startRole(const Role& role,
                const std::map<std::string, std::string>& details = std::map<std::string, std::string>(),
                const std::string& origination = "Recruited");
 void endRole(const Role& role, UID id, std::string reason, bool ok = true, Error e = Error());
+
 ACTOR Future<Void> traceRole(Role role, UID roleId);
 
 struct ServerDBInfo;
@@ -1248,7 +1266,7 @@ ACTOR Future<Void> resolver(ResolverInterface resolver,
 ACTOR Future<Void> logRouter(TLogInterface interf,
                              InitializeLogRouterRequest req,
                              Reference<AsyncVar<ServerDBInfo> const> db);
-ACTOR Future<Void> dataDistributor(DataDistributorInterface ddi, Reference<AsyncVar<ServerDBInfo> const> db);
+Future<Void> dataDistributor(DataDistributorInterface ddi, Reference<AsyncVar<ServerDBInfo> const> db);
 ACTOR Future<Void> ratekeeper(RatekeeperInterface rki, Reference<AsyncVar<ServerDBInfo> const> db);
 ACTOR Future<Void> consistencyScan(ConsistencyScanInterface csInterf, Reference<AsyncVar<ServerDBInfo> const> dbInfo);
 ACTOR Future<Void> blobManager(BlobManagerInterface bmi, Reference<AsyncVar<ServerDBInfo> const> db, int64_t epoch);
@@ -1312,7 +1330,7 @@ ACTOR Future<Void> tLog(IKeyValueStore* persistentData,
 
 typedef decltype(&tLog) TLogFn;
 
-extern bool isSimulatorProcessReliable();
+extern bool isSimulatorProcessUnreliable();
 
 ACTOR template <class T>
 Future<T> ioTimeoutError(Future<T> what, double time, const char* context = nullptr) {
@@ -1330,7 +1348,7 @@ Future<T> ioTimeoutError(Future<T> what, double time, const char* context = null
 		}
 		when(wait(end)) {
 			Error err = io_timeout();
-			if (!isSimulatorProcessReliable()) {
+			if (isSimulatorProcessUnreliable()) {
 				err = err.asInjectedFault();
 			}
 			TraceEvent e(SevError, "IoTimeoutError");
@@ -1379,7 +1397,7 @@ Future<T> ioDegradedOrTimeoutError(Future<T> what,
 		}
 		when(wait(end)) {
 			Error err = io_timeout();
-			if (!isSimulatorProcessReliable()) {
+			if (isSimulatorProcessUnreliable()) {
 				err = err.asInjectedFault();
 			}
 			TraceEvent e(SevError, "IoTimeoutError");

@@ -92,6 +92,7 @@ public:
 	ProcessInfo* getProcess(Endpoint const& endpoint) { return getProcessByAddress(endpoint.getPrimaryAddress()); }
 	ProcessInfo* getCurrentProcess() { return currentProcess; }
 	ProcessInfo const* getCurrentProcess() const { return currentProcess; }
+
 	// onProcess: wait for the process to be scheduled by the runloop; a task will be created for the process.
 	virtual Future<Void> onProcess(ISimulator::ProcessInfo* process, TaskPriority taskID = TaskPriority::Zero) = 0;
 	virtual Future<Void> onMachine(ISimulator::ProcessInfo* process, TaskPriority taskID = TaskPriority::Zero) = 0;
@@ -209,6 +210,17 @@ public:
 		return roleText;
 	}
 
+	bool hasRole(NetworkAddress const& address, std::string const& role) const {
+		auto addressIt = roleAddresses.find(address);
+		if (addressIt != roleAddresses.end()) {
+			auto rolesIt = addressIt->second.find(role);
+			if (rolesIt != addressIt->second.end()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	void clearAddress(NetworkAddress const& address) {
 		clearedAddresses[address]++;
 		TraceEvent("ClearAddress").detail("Address", address).detail("Value", clearedAddresses[address]);
@@ -274,6 +286,8 @@ public:
 	virtual void clogInterface(const IPAddress& ip, double seconds, ClogMode mode = ClogDefault) = 0;
 	virtual void clogPair(const IPAddress& from, const IPAddress& to, double seconds) = 0;
 	virtual void unclogPair(const IPAddress& from, const IPAddress& to) = 0;
+	virtual void disconnectPair(const IPAddress& from, const IPAddress& to, double seconds) = 0;
+	virtual void reconnectPair(const IPAddress& from, const IPAddress& to) = 0;
 	virtual std::vector<ProcessInfo*> getAllProcesses() const = 0;
 	virtual ProcessInfo* getProcessByAddress(NetworkAddress const& address) = 0;
 	virtual MachineInfo* getMachineByNetworkAddress(NetworkAddress const& address) = 0;
@@ -340,6 +354,7 @@ public:
 	BackupAgentType drAgents;
 	bool willRestart = false;
 	bool restarted = false;
+	bool isConsistencyChecked = false;
 	ValidationData validationData;
 
 	bool hasDiffProtocolProcess; // true if simulator is testing a process with a different version
@@ -350,6 +365,42 @@ public:
 	double injectSSDelayTime = std::numeric_limits<double>::max();
 	double injectTargetedBMRestartTime = std::numeric_limits<double>::max();
 	double injectTargetedBWRestartTime = std::numeric_limits<double>::max();
+
+	enum SimConsistencyScanState {
+		DisabledStart = 0,
+		Enabling = 1,
+		Enabled = 2,
+		Enabled_InjectCorruption = 3,
+		Enabled_FoundCorruption = 4,
+		Complete = 5,
+		DisabledEnd = 6
+	};
+	SimConsistencyScanState consistencyScanState = SimConsistencyScanState::DisabledStart;
+
+	// check that validates that the state transition is valid
+	bool updateConsistencyScanState(SimConsistencyScanState expectedCurrent, SimConsistencyScanState desired) {
+		if (consistencyScanState == expectedCurrent && desired > consistencyScanState) {
+			consistencyScanState = desired;
+
+			if (desired == SimConsistencyScanState::Enabled_FoundCorruption) {
+				// reset other metadata
+				consistencyScanInjectedCorruptionType = {};
+				consistencyScanCorruptRequestKey = {};
+				consistencyScanCorruptor = {};
+			}
+
+			return true;
+		}
+		return false;
+	}
+
+	// Inject corruption only in consistency scan reads to ensure scan finds it.
+	enum SimConsistencyScanCorruptionType { FlipMoreFlag = 0, AddToEmpty = 1, RemoveLastRow = 2, ChangeFirstValue = 3 };
+	Optional<SimConsistencyScanCorruptionType> consistencyScanInjectedCorruptionType;
+	Optional<UID> consistencyScanInjectedCorruptionDestination;
+	Optional<bool> doInjectConsistencyScanCorruption;
+	Optional<Standalone<StringRef>> consistencyScanCorruptRequestKey;
+	Optional<std::pair<UID, NetworkAddress>> consistencyScanCorruptor;
 
 	std::unordered_map<Standalone<StringRef>, PrivateKey> authKeys;
 
