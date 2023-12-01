@@ -23,10 +23,10 @@
 #pragma once
 
 #include "flow/BooleanParam.h"
+#include "flow/Error.h"
 #include "flow/FastAlloc.h"
 #include "flow/FastRef.h"
-#include "flow/Error.h"
-#include "flow/Trace.h"
+#include "flow/IRandom.h"
 #include "flow/ObjectSerializerTraits.h"
 #include "flow/FileIdentifier.h"
 #include "flow/swift_support.h"
@@ -720,6 +720,40 @@ inline static StringRef makeAlignedString(int alignment, int length, Arena& aren
 // is only legitimate if you know where the StringRef's memory came from and that it is not shared!
 inline static uint8_t* mutateString(StringRef& s) {
 	return const_cast<uint8_t*>(s.begin());
+}
+
+template <class... StringRefType>
+static Standalone<StringRef> concatenateStrings(StringRefType... strs) {
+	int totalSize = 0;
+	for (auto const& s : { strs... }) {
+		totalSize += s.size();
+	}
+
+	Standalone<StringRef> str = makeString(totalSize);
+	uint8_t* buf = mutateString(str);
+
+	for (auto const& s : { strs... }) {
+		buf = s.copyTo(buf);
+	}
+
+	return str;
+}
+
+template <class... StringRefType>
+static StringRef concatenateStrings(Arena& arena, StringRefType... strs) {
+	int totalSize = 0;
+	for (auto const& s : { strs... }) {
+		totalSize += s.size();
+	}
+
+	StringRef str = makeString(totalSize, arena);
+	uint8_t* buf = mutateString(str);
+
+	for (auto const& s : { strs... }) {
+		buf = s.copyTo(buf);
+	}
+
+	return str;
 }
 
 template <class Archive>

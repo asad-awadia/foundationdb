@@ -23,6 +23,7 @@
 #include "fdbclient/ManagementAPI.actor.h"
 #include "fdbclient/NativeAPI.actor.h"
 #include "fdbserver/Knobs.h"
+#include "fdbserver/QuietDatabase.h"
 #include "fdbrpc/simulator.h"
 #include "fdbserver/workloads/workloads.actor.h"
 #include "flow/Error.h"
@@ -71,7 +72,17 @@ struct ValidateStorage : TestWorkload {
 	// We disable failure injection because there is an irrelevant issue:
 	// Remote tLog is failed to rejoin to CC
 	// Once this issue is fixed, we should be able to enable the failure injection
-	void disableFailureInjectionWorkloads(std::set<std::string>& out) const override { out.emplace("Attrition"); }
+	// This workload is not compatible with following workload because they will race in changing the DD mode
+	void disableFailureInjectionWorkloads(std::set<std::string>& out) const override {
+		out.insert({ "RandomMoveKeys",
+		             "DataLossRecovery",
+		             "IDDTxnProcessorApiCorrectness",
+		             "PerpetualWiggleStatsWorkload",
+		             "PhysicalShardMove",
+		             "StorageCorruption",
+		             "StorageServerCheckpointRestoreTest",
+		             "Attrition" });
+	}
 
 	void validationFailed(ErrorOr<Optional<Value>> expectedValue, ErrorOr<Optional<Value>> actualValue) {
 		TraceEvent(SevError, "TestFailed")
@@ -97,17 +108,24 @@ struct ValidateStorage : TestWorkload {
 	                                             KeyRange auditRange = allKeys) {
 		// Send audit request until the cluster accepts the request
 		state UID auditId;
+		std::vector<KeyValueStoreType> storageEngineCollection = { KeyValueStoreType::SSD_ROCKSDB_V1,
+			                                                       KeyValueStoreType::SSD_SHARDED_ROCKSDB,
+			                                                       KeyValueStoreType::SSD_BTREE_V2,
+			                                                       KeyValueStoreType::END };
+		state KeyValueStoreType storageEngine = deterministicRandom()->randomChoice(storageEngineCollection);
 		loop {
 			try {
 				UID auditId_ = wait(auditStorage(cx->getConnectionRecord(),
 				                                 auditRange,
 				                                 type,
+				                                 storageEngine,
 				                                 /*timeoutSecond=*/300));
 				auditId = auditId_;
 				TraceEvent("TestAuditStorageTriggered")
 				    .detail("Context", context)
 				    .detail("AuditID", auditId)
 				    .detail("AuditType", type)
+				    .detail("AuditStorageEngine", storageEngine)
 				    .detail("AuditRange", auditRange);
 				break;
 			} catch (Error& e) {
@@ -115,6 +133,7 @@ struct ValidateStorage : TestWorkload {
 				    .errorUnsuppressed(e)
 				    .detail("Context", context)
 				    .detail("AuditType", type)
+				    .detail("AuditStorageEngine", storageEngine)
 				    .detail("AuditRange", auditRange);
 				if (auditRange.empty() && e.code() == error_code_audit_storage_failed) {
 					break;
@@ -173,7 +192,6 @@ struct ValidateStorage : TestWorkload {
 	}
 
 	ACTOR Future<Void> checkAuditStorageInternalState(Database cx, AuditType type, UID auditId, std::string context) {
-		// Check no audit is in Running or Error phase
 		// Check the number of existing persisted audits is no more than PERSIST_FINISH_AUDIT_COUNT
 		state Transaction tr(cx);
 		loop {
@@ -206,7 +224,11 @@ struct ValidateStorage : TestWorkload {
 						}
 					}
 				}
-				if (res.size() > SERVER_KNOBS->PERSIST_FINISH_AUDIT_COUNT + 1) {
+				if (res.size() > SERVER_KNOBS->PERSIST_FINISH_AUDIT_COUNT + 5) {
+					// Note that 5 is the sum of 4 + 1
+					// In the test, we issue at most 4 concurrent audits at the same time
+					// The 4 concurrent audits may not be complete in time
+					// So, the cleanup does not precisely guarantee PERSIST_FINISH_AUDIT_COUNT
 					TraceEvent("TestAuditStorageCheckPersistStateWaitClean")
 					    .detail("ExistCount", res.size())
 					    .detail("Context", context)
@@ -293,6 +315,12 @@ struct ValidateStorage : TestWorkload {
 
 		wait(self->testAuditStorageProgress(self, cx));
 		TraceEvent("TestAuditStorageProgressDone");
+
+		wait(self->testAuditStorageWhenDDSecurityMode(self, cx));
+		TraceEvent("TestAuditStorageWhenDDSecurityModeDone");
+
+		wait(self->testAuditStorageWhenDDBackToNormalMode(self, cx));
+		TraceEvent("TestAuditStorageWhenDDBackToNormalModeDone");
 
 		return Void();
 	}
@@ -707,6 +735,44 @@ struct ValidateStorage : TestWorkload {
 			}
 		}
 		TraceEvent("TestAuditStorageProgressEnd");
+		return Void();
+	}
+
+	ACTOR Future<Void> testAuditStorageWhenDDSecurityMode(ValidateStorage* self, Database cx) {
+		TraceEvent("TestAuditStorageWhenDDSecurityModeBegin");
+		int _ = wait(setDDMode(cx, 2));
+		UID auditIdA =
+		    wait(self->auditStorageForType(self, cx, AuditType::ValidateHA, "TestAuditStorageWhenDDSecurityMode"));
+		TraceEvent("TestFunctionalityHADoneWhenDDSecurityMode", auditIdA);
+		UID auditIdB =
+		    wait(self->auditStorageForType(self, cx, AuditType::ValidateReplica, "TestAuditStorageWhenDDSecurityMode"));
+		TraceEvent("TestFunctionalityReplicaDoneWhenDDSecurityMode", auditIdB);
+		UID auditIdC = wait(self->auditStorageForType(
+		    self, cx, AuditType::ValidateLocationMetadata, "TestAuditStorageWhenDDSecurityMode"));
+		TraceEvent("TestFunctionalityShardLocationMetadataDoneWhenDDSecurityMode", auditIdC);
+		UID auditIdD = wait(self->auditStorageForType(
+		    self, cx, AuditType::ValidateStorageServerShard, "TestAuditStorageWhenDDSecurityMode"));
+		TraceEvent("TestFunctionalitySSShardInfoDoneWhenDDSecurityMode", auditIdD);
+		TraceEvent("TestAuditStorageWhenDDSecurityModeEnd");
+		return Void();
+	}
+
+	ACTOR Future<Void> testAuditStorageWhenDDBackToNormalMode(ValidateStorage* self, Database cx) {
+		TraceEvent("TestAuditStorageWhenDDBackToNormalModeBegin");
+		int _ = wait(setDDMode(cx, 1));
+		UID auditIdA =
+		    wait(self->auditStorageForType(self, cx, AuditType::ValidateHA, "TestAuditStorageWhenDDBackToNormalMode"));
+		TraceEvent("TestFunctionalityHADoneWhenDDBackToNormalMode", auditIdA);
+		UID auditIdB = wait(
+		    self->auditStorageForType(self, cx, AuditType::ValidateReplica, "TestAuditStorageWhenDDBackToNormalMode"));
+		TraceEvent("TestFunctionalityReplicaDoneWhenDDBackToNormalMode", auditIdB);
+		UID auditIdC = wait(self->auditStorageForType(
+		    self, cx, AuditType::ValidateLocationMetadata, "TestAuditStorageWhenDDBackToNormalMode"));
+		TraceEvent("TestFunctionalityShardLocationMetadataDoneWhenDDBackToNormalMode", auditIdC);
+		UID auditIdD = wait(self->auditStorageForType(
+		    self, cx, AuditType::ValidateStorageServerShard, "TestAuditStorageWhenDDBackToNormalMode"));
+		TraceEvent("TestFunctionalitySSShardInfoDoneWhenDDBackToNormalMode", auditIdD);
+		TraceEvent("TestAuditStorageWhenDDBackToNormalModeEnd");
 		return Void();
 	}
 

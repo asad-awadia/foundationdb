@@ -913,7 +913,7 @@ ACTOR Future<Void> clearData(Database cx, Optional<TenantName> defaultTenant) {
 
 			std::vector<Future<Void>> deleteFutures;
 			for (auto const& [id, entry] : tenants.results) {
-				if (entry.tenantName != defaultTenant) {
+				if (!defaultTenant.present() || entry.tenantName != defaultTenant.get()) {
 					deleteFutures.push_back(TenantAPI::deleteTenantTransaction(&tr, id));
 				}
 			}
@@ -1202,7 +1202,7 @@ ACTOR Future<Void> auditStorageCorrectness(Reference<AsyncVar<ServerDBInfo>> dbI
 			       !dbInfo->get().distributor.present()) {
 				wait(dbInfo->onChange());
 			}
-			TriggerAuditRequest req(auditType, allKeys);
+			TriggerAuditRequest req(auditType, allKeys, KeyValueStoreType::END); // do not specify engine type to check
 			UID auditId_ = wait(timeoutError(dbInfo->get().distributor.get().triggerAudit.getReply(req), 300));
 			auditId = auditId_;
 			TraceEvent(SevDebug, "AuditStorageCorrectnessTriggered")
@@ -1947,12 +1947,14 @@ void encryptionAtRestPlaintextMarkerCheck() {
 				while (std::getline(f, buf)) {
 					// SOMEDAY: using 'std::boyer_moore_horspool_searcher' would significantly improve search
 					// time
-					if (buf.find(g_simulator->dataAtRestPlaintextMarker.get()) != std::string::npos) {
-						TraceEvent(SevError, "EncryptionAtRestPlaintextMarkerCheckPanic")
-						    .detail("Filename", itr->path().string())
-						    .detail("LineBuf", buf)
-						    .detail("Marker", g_simulator->dataAtRestPlaintextMarker.get());
-						success = false;
+					if (!g_network->isSimulated() || !ENABLE_MUTATION_TRACKING_WITH_BLOB_CIPHER) {
+						if (buf.find(g_simulator->dataAtRestPlaintextMarker.get()) != std::string::npos) {
+							TraceEvent(SevError, "EncryptionAtRestPlaintextMarkerCheckPanic")
+							    .detail("Filename", itr->path().string())
+							    .detail("LineBuf", buf)
+							    .detail("Marker", g_simulator->dataAtRestPlaintextMarker.get());
+							success = false;
+						}
 					}
 					count++;
 				}
@@ -2032,6 +2034,7 @@ ACTOR Future<Void> runTests(Reference<AsyncVar<Optional<struct ClusterController
 	state ISimulator::BackupAgentType simDrAgents = ISimulator::BackupAgentType::NoBackupAgents;
 	state bool enableDD = false;
 	state TesterConsistencyScanState consistencyScanState;
+
 	if (tests.empty())
 		useDB = true;
 	for (auto iter = tests.begin(); iter != tests.end(); ++iter) {

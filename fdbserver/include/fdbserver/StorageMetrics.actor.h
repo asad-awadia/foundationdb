@@ -93,7 +93,7 @@ struct StorageServerMetrics {
 	  : byteSample(0), iopsSample(SERVER_KNOBS->IOPS_UNITS_PER_SAMPLE),
 	    bytesWriteSample(SERVER_KNOBS->BYTES_WRITTEN_UNITS_PER_SAMPLE),
 	    bytesReadSample(SERVER_KNOBS->BYTES_READ_UNITS_PER_SAMPLE),
-	    opsReadSample(SERVER_KNOBS->OPS_READ_UNITES_PER_SAMPLE) {}
+	    opsReadSample(SERVER_KNOBS->OPS_READ_UNITS_PER_SAMPLE) {}
 
 	StorageMetrics getMetrics(KeyRangeRef const& keys) const;
 
@@ -137,6 +137,8 @@ struct StorageServerMetrics {
 	std::vector<ReadHotRangeWithMetrics> getReadHotRanges(KeyRangeRef shard, int chunkCount, uint8_t splitType) const;
 
 	void getReadHotRanges(ReadHotSubRangeRequest req) const;
+
+	int64_t getHotShards(const KeyRange& range) const;
 
 	std::vector<KeyRef> getSplitPoints(KeyRangeRef range, int64_t chunkSize, Optional<KeyRef> prefixToRemove) const;
 
@@ -228,6 +230,8 @@ public:
 	virtual void getSplitMetrics(const SplitMetricsRequest& req) = 0;
 
 	virtual void getHotRangeMetrics(const ReadHotSubRangeRequest& req) = 0;
+
+	virtual int64_t getHotShardsMetrics(const KeyRange& range) = 0;
 
 	// NOTE: also need to have this function but template can't be a virtual so...
 	// template <class Reply>

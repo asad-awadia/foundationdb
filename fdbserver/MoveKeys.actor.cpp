@@ -51,6 +51,14 @@ struct Shard {
 	UID id;
 };
 
+bool shouldCreateCheckpoint(const UID& dataMoveId) {
+	bool assigned, emptyRange;
+	DataMoveType type;
+	DataMovementReason reason;
+	decodeDataMoveId(dataMoveId, assigned, emptyRange, type, reason);
+	return type == DataMoveType::PHYSICAL || type == DataMoveType::PHYSICAL_EXP;
+}
+
 // Unassigns keyrange `range` from server `ssId`, except ranges in `shards`.
 // Note: krmSetRangeCoalescing() doesn't work in this case since each shard is assigned an ID.
 ACTOR Future<Void> unassignServerKeys(Transaction* tr, UID ssId, KeyRange range, std::vector<Shard> shards, UID logId) {
@@ -164,7 +172,7 @@ ACTOR Future<Void> unassignServerKeys(Transaction* tr, UID ssId, KeyRange range,
 }
 
 ACTOR Future<Void> deleteCheckpoints(Transaction* tr, std::set<UID> checkpointIds, UID dataMoveId) {
-	if (!physicalShardMoveEnabled(dataMoveId)) {
+	if (!shouldCreateCheckpoint(dataMoveId)) {
 		return Void();
 	}
 	TraceEvent(SevDebug, "DataMoveDeleteCheckpoints", dataMoveId).detail("Checkpoints", describe(checkpointIds));
@@ -306,7 +314,7 @@ ACTOR static Future<Void> checkPersistentMoveKeysLock(Transaction* tr, MoveKeysL
 	tr->setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
 
 	Optional<Value> readVal = wait(tr->get(moveKeysLockOwnerKey));
-	UID currentOwner = readVal.present() ? BinaryReader::fromStringRef<UID>(readVal.get(), Unversioned()) : UID();
+	state UID currentOwner = readVal.present() ? BinaryReader::fromStringRef<UID>(readVal.get(), Unversioned()) : UID();
 
 	if (currentOwner == lock.prevOwner) {
 		// Check that the previous owner hasn't touched the lock since we took it
@@ -314,6 +322,13 @@ ACTOR static Future<Void> checkPersistentMoveKeysLock(Transaction* tr, MoveKeysL
 		UID lastWrite = readVal.present() ? BinaryReader::fromStringRef<UID>(readVal.get(), Unversioned()) : UID();
 		if (lastWrite != lock.prevWrite) {
 			CODE_PROBE(true, "checkMoveKeysLock: Conflict with previous owner");
+			TraceEvent(SevDebug, "CheckPersistentMoveKeysWritterConflict")
+			    .errorUnsuppressed(movekeys_conflict())
+			    .detail("PrevOwner", lock.prevOwner.toString())
+			    .detail("PrevWrite", lock.prevWrite.toString())
+			    .detail("MyOwner", lock.myOwner.toString())
+			    .detail("CurrentOwner", currentOwner.toString())
+			    .detail("Writer", lastWrite.toString());
 			throw movekeys_conflict();
 		}
 
@@ -347,6 +362,12 @@ ACTOR static Future<Void> checkPersistentMoveKeysLock(Transaction* tr, MoveKeysL
 		return Void();
 	} else {
 		CODE_PROBE(true, "checkMoveKeysLock: Conflict with new owner");
+		TraceEvent(SevDebug, "CheckPersistentMoveKeysLockOwnerConflict")
+		    .errorUnsuppressed(movekeys_conflict())
+		    .detail("PrevOwner", lock.prevOwner.toString())
+		    .detail("PrevWrite", lock.prevWrite.toString())
+		    .detail("MyOwner", lock.myOwner.toString())
+		    .detail("CurrentOwner", currentOwner.toString());
 		throw movekeys_conflict();
 	}
 }
@@ -395,8 +416,9 @@ ACTOR Future<bool> validateRangeAssignment(Database occ,
 		for (int i = 0; i < readResult.size() - 1; i++) {
 			UID shardId;
 			bool assigned, emptyRange;
-			EnablePhysicalShardMove enablePSM = EnablePhysicalShardMove::False;
-			decodeServerKeysValue(readResult[i].value, assigned, emptyRange, enablePSM, shardId);
+			DataMoveType dataMoveType = DataMoveType::LOGICAL;
+			DataMovementReason dataMoveReason = DataMovementReason::INVALID;
+			decodeServerKeysValue(readResult[i].value, assigned, emptyRange, dataMoveType, shardId, dataMoveReason);
 			if (!assigned) {
 				TraceEvent(SevError, "ValidateRangeAssignmentCorruptionDetected")
 				    .detail("DataMoveID", dataMoveId)
@@ -405,7 +427,7 @@ ACTOR Future<bool> validateRangeAssignment(Database occ,
 				    .detail("ErrorMessage", "KeyServers has range but ServerKeys does not have")
 				    .detail("CurrentEmptyRange", emptyRange)
 				    .detail("CurrentAssignment", assigned)
-				    .detail("EnablePSM", enablePSM)
+				    .detail("DataMoveType", static_cast<uint8_t>(dataMoveType))
 				    .detail("ServerID", ssid)
 				    .detail("ShardID", shardId);
 				allCorrect = false;
@@ -426,8 +448,10 @@ ACTOR Future<bool> validateRangeAssignment(Database occ,
 		}
 	}
 	if (!allCorrect) {
-		try { // If corruption detected, stop using DD
-			int _ = wait(setDDMode(occ, 0));
+		try {
+			// If corruption detected, enter security mode which
+			// stops using data moves and only allow auditStorage
+			int _ = wait(setDDMode(occ, 2));
 			TraceEvent(SevInfo, "ValidateRangeAssignmentCorruptionDetectedAndDDStopped")
 			    .detail("DataMoveID", dataMoveId)
 			    .detail("Range", range)
@@ -450,19 +474,17 @@ ACTOR Future<Void> auditLocationMetadataPreCheck(Database occ,
                                                  std::string context,
                                                  UID dataMoveId) {
 	if (range.empty()) {
-		TraceEvent(SevWarn, "AuditLocationMetadataEmptyInputRange")
-		    .detail("By", "PreCheck")
-		    .detail("AuditRange", range);
+		TraceEvent(SevWarn, "CheckLocationMetadataEmptyInputRange").detail("By", "PreCheck").detail("Range", range);
 		return Void();
 	}
 	state std::vector<Future<Void>> actors;
 	state std::unordered_map<UID, Optional<bool>> results;
-	TraceEvent(SevDebug, "AuditLocationMetadataStart")
+	TraceEvent(SevVerbose, "CheckLocationMetadataStart")
 	    .detail("By", "PreCheck")
 	    .detail("DataMoveID", dataMoveId)
 	    .detail("Servers", describe(servers))
 	    .detail("Context", context)
-	    .detail("AuditRange", range);
+	    .detail("Range", range);
 	try {
 		actors.clear();
 		results.clear();
@@ -473,40 +495,40 @@ ACTOR Future<Void> auditLocationMetadataPreCheck(Database occ,
 		for (const auto& [ssid, res] : results) {
 			ASSERT(res.present());
 			if (!res.get()) { // Stop check if corruption detected
-				TraceEvent(SevError, "AuditLocationMetadataCorruptionDetected")
+				TraceEvent(SevError, "CheckLocationMetadataCorruptionDetected")
 				    .detail("By", "PreCheck")
 				    .detail("DataMoveID", dataMoveId)
 				    .detail("Servers", describe(servers))
 				    .detail("Context", context)
-				    .detail("AuditRange", range);
+				    .detail("Range", range);
 				throw location_metadata_corruption();
 			}
 		}
-		TraceEvent(SevDebug, "AuditLocationMetadataComplete")
+		TraceEvent(SevVerbose, "CheckLocationMetadataComplete")
 		    .detail("By", "PreCheck")
 		    .detail("DataMoveID", dataMoveId)
 		    .detail("Servers", describe(servers))
 		    .detail("Context", context)
-		    .detail("AuditRange", range);
+		    .detail("Range", range);
 	} catch (Error& e) {
 		if (e.code() == error_code_actor_cancelled || e.code() == error_code_location_metadata_corruption) {
 			throw e;
 		} else {
-			TraceEvent(SevInfo, "AuditLocationMetadataFailed")
+			TraceEvent(SevInfo, "CheckLocationMetadataFailed")
 			    .errorUnsuppressed(e)
 			    .detail("By", "PreCheck")
 			    .detail("DataMoveID", dataMoveId)
 			    .detail("Context", context)
-			    .detail("AuditRange", range);
+			    .detail("Range", range);
 			// Check any existing result when failure presents
 			for (const auto& [ssid, res] : results) {
 				if (res.present() && !res.get()) {
-					TraceEvent(SevError, "AuditLocationMetadataCorruptionDetectedWhenFailed")
+					TraceEvent(SevError, "CheckLocationMetadataCorruptionDetectedWhenFailed")
 					    .detail("By", "PreCheck")
 					    .detail("DataMoveID", dataMoveId)
 					    .detail("Servers", describe(servers))
 					    .detail("Context", context)
-					    .detail("AuditRange", range);
+					    .detail("Range", range);
 					throw location_metadata_corruption();
 				}
 			}
@@ -518,9 +540,7 @@ ACTOR Future<Void> auditLocationMetadataPreCheck(Database occ,
 
 ACTOR Future<Void> auditLocationMetadataPostCheck(Database occ, KeyRange range, std::string context, UID dataMoveId) {
 	if (range.empty()) {
-		TraceEvent(SevWarn, "AuditLocationMetadataEmptyInputRange")
-		    .detail("By", "PostCheck")
-		    .detail("AuditRange", range);
+		TraceEvent(SevWarn, "CheckLocationMetadataEmptyInputRange").detail("By", "PostCheck").detail("Range", range);
 		return Void();
 	}
 	state std::vector<Future<Void>> actors;
@@ -530,10 +550,10 @@ ACTOR Future<Void> auditLocationMetadataPostCheck(Database occ, KeyRange range, 
 	state RangeResult UIDtoTagMap;
 	state Transaction tr(occ);
 	state int retryCount = 0;
-	TraceEvent(SevDebug, "AuditLocationMetadataStart")
+	TraceEvent(SevVerbose, "CheckLocationMetadataStart")
 	    .detail("By", "PostCheck")
 	    .detail("Context", context)
-	    .detail("AuditRange", range);
+	    .detail("Range", range);
 	loop {
 		try {
 			loop {
@@ -554,7 +574,7 @@ ACTOR Future<Void> auditLocationMetadataPostCheck(Database occ, KeyRange range, 
 					actors.push_back(store(UIDtoTagMap, tr.getRange(serverTagKeys, CLIENT_KNOBS->TOO_MANY)));
 					wait(waitForAll(actors));
 					ASSERT(!UIDtoTagMap.more && UIDtoTagMap.size() < CLIENT_KNOBS->TOO_MANY);
-					TraceEvent(SevVerbose, "AuditLocationMetadataReadDone")
+					TraceEvent(SevVerbose, "CheckLocationMetadataReadDone")
 					    .detail("By", "PostCheck")
 					    .detail("ResultSize", readResultKS.size());
 					// Read serverKeys
@@ -591,11 +611,11 @@ ACTOR Future<Void> auditLocationMetadataPostCheck(Database occ, KeyRange range, 
 						rangeToReadBegin = readResultKS.back().key;
 						continue;
 					} else {
-						TraceEvent(SevDebug, "AuditLocationMetadataComplete")
+						TraceEvent(SevVerbose, "CheckLocationMetadataComplete")
 						    .detail("By", "PostCheck")
 						    .detail("DataMoveID", dataMoveId)
 						    .detail("Context", context)
-						    .detail("AuditRange", range);
+						    .detail("Range", range);
 						break;
 					}
 				} catch (Error& e) {
@@ -611,21 +631,21 @@ ACTOR Future<Void> auditLocationMetadataPostCheck(Database occ, KeyRange range, 
 				// Check corruptions for the current (failed) round
 				for (const auto& [idx, res] : results) {
 					if (res.present() && !res.get()) {
-						TraceEvent(SevError, "AuditLocationMetadataCorruptionDetectedWhenFailed")
+						TraceEvent(SevError, "CheckLocationMetadataCorruptionDetectedWhenFailed")
 						    .detail("By", "PostCheck")
 						    .detail("DataMoveID", dataMoveId)
 						    .detail("Context", context)
-						    .detail("AuditRange", range);
+						    .detail("Range", range);
 						throw location_metadata_corruption();
 					}
 				}
 				if (retryCount > SERVER_KNOBS->AUDIT_DATAMOVE_POST_CHECK_RETRY_COUNT_MAX) {
-					TraceEvent(SevInfo, "AuditLocationMetadataFailed")
+					TraceEvent(SevInfo, "CheckLocationMetadataFailed")
 					    .errorUnsuppressed(e)
 					    .detail("By", "PostCheck")
 					    .detail("DataMoveID", dataMoveId)
 					    .detail("Context", context)
-					    .detail("AuditRange", range);
+					    .detail("Range", range);
 					// If no corruption detected, exit silently
 				} else {
 					wait(delay(0.5));
@@ -1148,10 +1168,6 @@ ACTOR Future<Void> waitForShardReady(StorageServerInterface server,
 		try {
 			GetShardStateReply rep =
 			    wait(server.getShardState.getReply(GetShardStateRequest(keys, mode), TaskPriority::MoveKeys));
-			TraceEvent("GetShardStateReadyDD", server.id())
-			    .detail("RepVersion", rep.first)
-			    .detail("MinVersion", rep.second)
-			    .log();
 			if (rep.first >= minVersion) {
 				return Void();
 			}
@@ -1790,7 +1806,7 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 
 						dataMove.src.insert(src.begin(), src.end());
 
-						if (physicalShardMoveEnabled(dataMoveId)) {
+						if (shouldCreateCheckpoint(dataMoveId)) {
 							const UID checkpointId = UID(deterministicRandom()->randomUInt64(), srcId.first());
 							CheckpointMetaData checkpoint(std::vector<KeyRange>{ rangeIntersectKeys },
 							                              DataMoveRocksCF,
@@ -2472,6 +2488,7 @@ ACTOR Future<std::pair<Version, Tag>> addStorageServer(Database cx, StorageServe
 
 			StorageMetadataType metadata(StorageMetadataType::currentTime());
 			metadataMap.set(tr, server.id(), metadata);
+			tr->set(serverMetadataChangeKey, deterministicRandom()->randomUniqueID().toString());
 
 			tr->set(serverListKeyFor(server.id()), serverListValue(server));
 			wait(tr->commit());
@@ -2511,8 +2528,9 @@ ACTOR Future<bool> canRemoveStorageServer(Reference<ReadYourWritesTransaction> t
 	// than one result
 	UID shardId;
 	bool assigned, emptyRange;
-	EnablePhysicalShardMove enablePSM = EnablePhysicalShardMove::False;
-	decodeServerKeysValue(keys[0].value, assigned, emptyRange, enablePSM, shardId);
+	DataMoveType dataMoveType = DataMoveType::LOGICAL;
+	DataMovementReason dataMoveReason = DataMovementReason::INVALID;
+	decodeServerKeysValue(keys[0].value, assigned, emptyRange, dataMoveType, shardId, dataMoveReason);
 	TraceEvent(SevVerbose, "CanRemoveStorageServer")
 	    .detail("ServerID", serverID)
 	    .detail("Key1", keys[0].key)
@@ -2628,6 +2646,7 @@ ACTOR Future<Void> removeStorageServer(Database cx,
 				}
 
 				metadataMap.erase(tr, serverID);
+				tr->set(serverMetadataChangeKey, deterministicRandom()->randomUniqueID().toString());
 
 				retry = true;
 				wait(tr->commit());
@@ -2748,8 +2767,10 @@ ACTOR Future<Void> removeKeysFromFailedServer(Database cx,
 							}
 						}
 
-						const UID shardId =
-						    newDataMoveId(deterministicRandom()->randomUInt64(), AssignEmptyRange::True);
+						const UID shardId = newDataMoveId(deterministicRandom()->randomUInt64(),
+						                                  AssignEmptyRange::True,
+						                                  DataMoveType::LOGICAL,
+						                                  DataMovementReason::ASSIGN_EMPTY_RANGE);
 
 						// Assign the shard to teamForDroppedRange in keyServer space.
 						if (SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA) {
@@ -3251,6 +3272,7 @@ void seedShardServers(Arena& arena, CommitTransactionRef& tr, std::vector<Storag
 			tr.set(arena, uidRef.withPrefix(tssMappingKeys.begin), uidRef);
 		}
 	}
+	tr.set(arena, serverMetadataChangeKey, deterministicRandom()->randomUniqueID().toString());
 
 	std::vector<Tag> serverTags;
 	std::vector<UID> serverSrcUID;
@@ -3266,7 +3288,11 @@ void seedShardServers(Arena& arena, CommitTransactionRef& tr, std::vector<Storag
 	// to a specific
 	//   key (keyServersKeyServersKey)
 	if (SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA) {
-		const UID shardId = deterministicRandom()->randomUniqueID();
+		const UID shardId = newDataMoveId(deterministicRandom()->randomUInt64(),
+		                                  AssignEmptyRange(false),
+		                                  DataMoveType::PHYSICAL,
+		                                  DataMovementReason::SEED_SHARD_SERVER,
+		                                  UnassignShard(false));
 		ksValue = keyServersValue(serverSrcUID, /*dest=*/std::vector<UID>(), shardId, UID());
 		krmSetPreviouslyEmptyRange(tr, arena, keyServersPrefix, KeyRangeRef(KeyRef(), allKeys.end), ksValue, Value());
 

@@ -172,7 +172,7 @@
                      "memory",
                      "memory-1",
                      "memory-2",
-                     "memory-radixtree-beta",
+                     "memory-radixtree",
                      "unknown"
                      ]}
                   },
@@ -513,6 +513,14 @@
          "seconds":1.0,
          "versions":1000000
       },
+      "logserver_lag":{
+         "seconds":1.0,
+         "versions":1000000
+      },
+      "storageserver_lag":{
+         "seconds":1.0,
+         "versions":1000000
+      },
       "active_tss_count":0,
       "degraded_processes":0,
       "database_available":true,
@@ -810,7 +818,7 @@
              "memory",
              "memory-1",
              "memory-2",
-             "memory-radixtree-beta"
+             "memory-radixtree"
          ]},
          "log_spill":1,
          "storage_engine":{
@@ -824,7 +832,7 @@
              "memory",
              "memory-1",
              "memory-2",
-             "memory-radixtree-beta"
+             "memory-radixtree"
          ]},
          "tss_count":1,
          "tss_storage_engine":{
@@ -838,7 +846,7 @@
              "memory",
              "memory-1",
              "memory-2",
-             "memory-radixtree-beta"
+             "memory-radixtree"
          ]},
          "coordinators_count":1,
          "excluded_servers":[
@@ -857,6 +865,20 @@
          "backup_worker_enabled":1,
          "perpetual_storage_wiggle": 0,
          "perpetual_storage_wiggle_locality":"0",
+         "perpetual_storage_wiggle_engine":{
+         "$enum":[
+             "ssd",
+             "ssd-1",
+             "ssd-2",
+             "ssd-redwood-1",
+             "ssd-rocksdb-v1",
+             "ssd-sharded-rocksdb",
+             "memory",
+             "memory-1",
+             "memory-2",
+             "memory-radixtree-beta",
+             "none"
+         ]},
          "storage_migration_type":{
          "$enum":[
              "disabled",

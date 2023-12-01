@@ -114,12 +114,9 @@ extern const char* limitReasonDesc[];
 
 typedef std::map<std::string, TraceEventFields> EventMap;
 
-struct StorageServerStatusInfo : public StorageServerInterface {
-	Optional<StorageMetadataType> metadata;
+struct StorageServerStatusInfo : public StorageServerMetaInfo {
 	EventMap eventMap;
-	StorageServerStatusInfo(const StorageServerInterface& interface,
-	                        Optional<StorageMetadataType> metadata = Optional<StorageMetadataType>())
-	  : StorageServerInterface(interface), metadata(metadata) {}
+	StorageServerStatusInfo(const StorageServerMetaInfo& info) : StorageServerMetaInfo(info, info.metadata) {}
 };
 
 ACTOR static Future<Optional<TraceEventFields>> latestEventOnWorker(WorkerInterface worker, std::string eventName) {
@@ -388,19 +385,24 @@ JsonBuilderObject machineStatusFetcher(WorkerEvents mMetrics,
 				machineJsonMap[machineId] = statusObj;
 			}
 
-			NetworkAddressList tempList;
-			tempList.address = it->first;
 			bool excludedServer = true;
-			bool excludedLocality = true;
-			if (configuration.present() && !configuration.get().isExcludedServer(tempList))
-				excludedServer = false;
-			if (locality.count(it->first) && configuration.present() &&
-			    !configuration.get().isMachineExcluded(locality[it->first]))
-				excludedLocality = false;
+			// If the machine is already marked as not excluded, because at least one process was found to not be
+			// excluded, we can stop checking further servers on this machine.
+			if (configuration.present() && excludedMap[machineId]) {
+				NetworkAddressList tempList;
+				tempList.address = it->first;
+				// Check if the locality data is present and if so, make use of it.
+				auto localityData = LocalityData();
+				if (locality.count(it->first)) {
+					localityData = locality[it->first];
+				}
 
-			// If any server is not excluded, set the overall exclusion status
-			// of the machine to false.
-			if (!excludedServer && !excludedLocality) {
+				// The isExcludedServer method already contains a check for the excluded localities.
+				excludedServer = configuration.get().isExcludedServer(tempList, localityData);
+			}
+
+			// If any server is not excluded, set the overall exclusion status of the machine to false.
+			if (!excludedServer) {
 				excludedMap[machineId] = false;
 			}
 			workerContribMap[machineId]++;
@@ -1086,8 +1088,8 @@ ACTOR static Future<JsonBuilderObject> processStatusFetcher(
 			statusObj["roles"] = roles.getStatusForAddress(address);
 
 			if (configuration.present()) {
-				statusObj["excluded"] = configuration.get().isExcludedServer(workerItr->interf.addresses()) ||
-				                        configuration.get().isExcludedLocality(workerItr->interf.locality);
+				statusObj["excluded"] =
+				    configuration.get().isExcludedServer(workerItr->interf.addresses(), workerItr->interf.locality);
 			}
 
 			statusObj["class_type"] = workerItr->processClass.toString();
@@ -1979,43 +1981,6 @@ static Future<std::vector<std::pair<iface, EventMap>>> getServerMetrics(
 	return results;
 }
 
-ACTOR
-static Future<std::vector<StorageServerStatusInfo>> readStorageInterfaceAndMetadata(Database cx,
-                                                                                    bool use_system_priority) {
-	state KeyBackedObjectMap<UID, StorageMetadataType, decltype(IncludeVersion())> metadataMap(serverMetadataKeys.begin,
-	                                                                                           IncludeVersion());
-	state Reference<ReadYourWritesTransaction> tr = makeReference<ReadYourWritesTransaction>(cx);
-	state std::vector<StorageServerStatusInfo> servers;
-	loop {
-		try {
-			servers.clear();
-			tr->setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
-			tr->setOption(FDBTransactionOptions::LOCK_AWARE);
-			if (use_system_priority) {
-				tr->setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
-			}
-			state RangeResult serverList = wait(tr->getRange(serverListKeys, CLIENT_KNOBS->TOO_MANY));
-			ASSERT(!serverList.more && serverList.size() < CLIENT_KNOBS->TOO_MANY);
-
-			servers.reserve(serverList.size());
-			for (int i = 0; i < serverList.size(); i++) {
-				servers.push_back(StorageServerStatusInfo(decodeServerListValue(serverList[i].value)));
-			}
-			state std::vector<Future<Void>> futures(servers.size());
-			for (int i = 0; i < servers.size(); ++i) {
-				futures[i] = store(servers[i].metadata, metadataMap.get(tr, servers[i].id()));
-				// TraceEvent(SevDebug, "MetadataAppear", servers[i].id()).detail("Present", metadata.present());
-			}
-			wait(waitForAll(futures));
-			wait(tr->commit());
-			break;
-		} catch (Error& e) {
-			wait(tr->onError(e));
-		}
-	}
-	return servers;
-}
-
 namespace {
 
 const std::vector<std::string> STORAGE_SERVER_METRICS_LIST{ "StorageMetrics",
@@ -2027,11 +1992,14 @@ const std::vector<std::string> STORAGE_SERVER_METRICS_LIST{ "StorageMetrics",
 } // namespace
 
 ACTOR static Future<std::vector<StorageServerStatusInfo>> getStorageServerStatusInfos(
-    Database cx,
+    std::vector<StorageServerMetaInfo> storageMetadatas,
     std::unordered_map<NetworkAddress, WorkerInterface> address_workers,
     WorkerDetails rkWorker) {
-	state std::vector<StorageServerStatusInfo> servers =
-	    wait(timeoutError(readStorageInterfaceAndMetadata(cx, true), 5.0));
+	state std::vector<StorageServerStatusInfo> servers;
+	servers.reserve(storageMetadatas.size());
+	for (const auto& meta : storageMetadatas) {
+		servers.push_back(StorageServerStatusInfo(meta));
+	}
 	state std::vector<std::pair<StorageServerStatusInfo, EventMap>> results;
 	wait(store(results, getServerMetrics(servers, address_workers, STORAGE_SERVER_METRICS_LIST)));
 	for (int i = 0; i < results.size(); ++i) {
@@ -2080,7 +2048,7 @@ static int getExtraTLogEligibleZones(const std::vector<WorkerDetails>& workers,
 	std::map<Key, std::set<StringRef>> dcId_zone;
 	for (auto const& worker : workers) {
 		if (worker.processClass.machineClassFitness(ProcessClass::TLog) < ProcessClass::NeverAssign &&
-		    !configuration.isExcludedServer(worker.interf.addresses())) {
+		    !configuration.isExcludedServer(worker.interf.addresses(), worker.interf.locality)) {
 			allZones.insert(worker.interf.locality.zoneId().get());
 			if (worker.interf.locality.dcId().present()) {
 				dcId_zone[worker.interf.locality.dcId().get()].insert(worker.interf.locality.zoneId().get());
@@ -2882,14 +2850,11 @@ ACTOR Future<JsonBuilderObject> layerStatusFetcher(Database cx,
 	return statusObj;
 }
 
-ACTOR Future<JsonBuilderObject> lockedStatusFetcher(Reference<AsyncVar<ServerDBInfo>> db,
+ACTOR Future<JsonBuilderObject> lockedStatusFetcher(Database cx,
                                                     JsonBuilderArray* messages,
                                                     std::set<std::string>* incomplete_reasons) {
 	state JsonBuilderObject statusObj;
 
-	state Database cx =
-	    openDBOnServer(db,
-	                   TaskPriority::DefaultEndpoint); // Open a new database connection that isn't lock-aware
 	state Transaction tr(cx);
 	state int timeoutSeconds = 5;
 	state Future<Void> getTimeout = delay(timeoutSeconds);
@@ -3065,13 +3030,17 @@ ACTOR Future<StatusReply> clusterGetStatus(
     Database cx,
     std::vector<WorkerDetails> workers,
     std::vector<ProcessIssues> workerIssues,
+    std::vector<StorageServerMetaInfo> storageMetadatas,
     std::map<NetworkAddress, std::pair<double, OpenDatabaseRequest>>* clientStatus,
     ServerCoordinators coordinators,
     std::vector<NetworkAddress> incompatibleConnections,
     Version datacenterVersionDifference,
+    Version dcLogServerVersionDifference,
+    Version dcStorageServerVersionDifference,
     ConfigBroadcaster const* configBroadcaster,
     Optional<UnversionedMetaclusterRegistrationEntry> metaclusterRegistration,
     metacluster::MetaclusterMetrics metaclusterMetrics) {
+
 	state double tStart = timer();
 
 	state JsonBuilderArray messages;
@@ -3329,7 +3298,7 @@ ACTOR Future<StatusReply> clusterGetStatus(
 			}
 
 			state Future<ErrorOr<std::vector<StorageServerStatusInfo>>> storageServerFuture =
-			    errorOr(getStorageServerStatusInfos(cx, address_workers, rkWorker));
+			    errorOr(getStorageServerStatusInfos(storageMetadatas, address_workers, rkWorker));
 			state Future<ErrorOr<std::vector<std::pair<TLogInterface, EventMap>>>> tLogFuture =
 			    errorOr(getTLogsAndMetrics(db, address_workers));
 			state Future<ErrorOr<std::vector<std::pair<CommitProxyInterface, EventMap>>>> commitProxyFuture =
@@ -3358,7 +3327,7 @@ ACTOR Future<StatusReply> clusterGetStatus(
 			                                         &status_incomplete_reasons,
 			                                         storageServerFuture));
 			futures2.push_back(layerStatusFetcher(cx, &messages, &status_incomplete_reasons));
-			futures2.push_back(lockedStatusFetcher(db, &messages, &status_incomplete_reasons));
+			futures2.push_back(lockedStatusFetcher(cx, &messages, &status_incomplete_reasons));
 			futures2.push_back(
 			    clusterSummaryStatisticsFetcher(pMetrics, storageServerFuture, tLogFuture, &status_incomplete_reasons));
 
@@ -3393,9 +3362,14 @@ ACTOR Future<StatusReply> clusterGetStatus(
 			state std::vector<JsonBuilderObject> workerStatuses = wait(getAll(futures2));
 			wait(success(primaryDCFO));
 
-			std::vector<NetworkAddress> addresses =
-			    wait(timeoutError(coordinators.ccr->getConnectionString().tryResolveHostnames(), 5.0));
-			coordinatorAddresses = std::move(addresses);
+			ErrorOr<std::vector<NetworkAddress>> addresses =
+			    wait(errorOr(timeoutError(coordinators.ccr->getConnectionString().tryResolveHostnames(), 5.0)));
+			if (addresses.present()) {
+				coordinatorAddresses = std::move(addresses.get());
+			} else {
+				messages.push_back(
+				    JsonString::makeMessage("fetch_coordinator_addresses", "Fetching coordinator addresses timed out"));
+			}
 
 			int logFaultTolerance = 100;
 			if (db->get().recoveryState >= RecoveryState::ACCEPTING_COMMITS) {
@@ -3573,14 +3547,25 @@ ACTOR Future<StatusReply> clusterGetStatus(
 		statusObj["clients"] = clientStatusFetcher(clientStatus);
 
 		if (configuration.present() && configuration.get().blobGranulesEnabled) {
-			JsonBuilderObject blobGranuelsStatus = wait(
+			ErrorOr<JsonBuilderObject> blobGranulesStatus = wait(errorOr(
 			    timeoutError(blobGranulesStatusFetcher(
 			                     cx, db->get().blobManager, blobWorkers, address_workers, &status_incomplete_reasons),
-			                 2.0));
-			statusObj["blob_granules"] = blobGranuelsStatus;
-			JsonBuilderObject blobRestoreStatus =
-			    wait(timeoutError(blobRestoreStatusFetcher(cx, &status_incomplete_reasons), 2.0));
-			statusObj["blob_restore"] = blobRestoreStatus;
+			                 2.0)));
+			if (blobGranulesStatus.present()) {
+				statusObj["blob_granules"] = blobGranulesStatus.get();
+			} else {
+				messages.push_back(JsonString::makeMessage("fetch_blob_granule_status_timed_out",
+				                                           "Fetch BlobGranule status timed out."));
+			}
+
+			ErrorOr<JsonBuilderObject> blobRestoreStatus =
+			    wait(errorOr(timeoutError(blobRestoreStatusFetcher(cx, &status_incomplete_reasons), 2.0)));
+			if (blobRestoreStatus.present()) {
+				statusObj["blob_restore"] = blobRestoreStatus.get();
+			} else {
+				messages.push_back(JsonString::makeMessage("fetch_blob_restore_status_timed_out",
+				                                           "Fetch BlobRestore status timed out."));
+			}
 		}
 
 		JsonBuilderArray incompatibleConnectionsArray;
@@ -3589,6 +3574,8 @@ ACTOR Future<StatusReply> clusterGetStatus(
 		}
 		statusObj["incompatible_connections"] = incompatibleConnectionsArray;
 		statusObj["datacenter_lag"] = getLagObject(datacenterVersionDifference);
+		statusObj["logserver_lag"] = getLagObject(dcLogServerVersionDifference);
+		statusObj["storageserver_lag"] = getLagObject(dcStorageServerVersionDifference);
 
 		int activeTSSCount = 0;
 		JsonBuilderArray wiggleServerAddress;
@@ -3689,6 +3676,37 @@ ACTOR Future<StatusReply> clusterGetStatus(
 		}
 
 		TraceEvent("ClusterGetStatus")
+		    .detail("Duration", timer() - tStart)
+		    .detail("StatusSize", statusObj.getFinalLength());
+
+		return StatusReply(statusObj.getJson());
+
+	} catch (Error& e) {
+		TraceEvent(SevError, "StatusError").error(e);
+		throw;
+	}
+}
+
+StatusReply clusterGetFaultToleranceStatus(const std::string& statusStr) {
+	double tStart = timer();
+
+	try {
+		json_spirit::mValue mv = readJSONStrictly(statusStr);
+		JSONDoc jsonDoc(mv);
+
+		std::string faultToleranceRelatedFields[] = {
+			"fault_tolerance", "data",    "logs", "maintenance_zone", "maintenance_seconds_remaining", "qos",
+			"recovery_state",  "messages"
+		};
+
+		JsonBuilderObject statusObj;
+		for (std::string& field : faultToleranceRelatedFields) {
+			if (jsonDoc.has(field)) {
+				statusObj[field] = jsonDoc.last();
+			}
+		}
+
+		TraceEvent("ClusterGetFaultToleranceStatus")
 		    .detail("Duration", timer() - tStart)
 		    .detail("StatusSize", statusObj.getFinalLength());
 

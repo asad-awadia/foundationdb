@@ -18,15 +18,19 @@
  * limitations under the License.
  */
 
-#include "fdbserver/DDTeamCollection.h"
+#include <climits>
+
+#include "fdbclient/SystemData.h"
 #include "fdbrpc/simulator.h"
+#include "fdbserver/BlobMigratorInterface.h"
+#include "fdbserver/DDTeamCollection.h"
 #include "fdbserver/ExclusionTracker.actor.h"
 #include "fdbserver/DataDistributionTeam.h"
-#include "fdbserver/BlobMigratorInterface.h"
+#include "flow/IRandom.h"
 #include "flow/Trace.h"
-#include "flow/actorcompiler.h" // This must be the last #include.
 #include "flow/network.h"
-#include <climits>
+
+#include "flow/actorcompiler.h" // This must be the last #include.
 
 namespace {
 
@@ -1664,13 +1668,13 @@ public:
 						self->unhealthyServers--;
 					}
 					if (!unhealthy && status->isUnhealthy()) {
-						TraceEvent(SevWarn, "StorangeServerUnhealthy", self->distributorId)
+						TraceEvent(SevWarn, "StorageServerUnhealthy", self->distributorId)
 						    .detail("ServerID", interf.id())
 						    .detail("ServerIpAddress", interf.address());
 						self->unhealthyServers++;
 					}
 				} else if (status->isUnhealthy()) {
-					TraceEvent(SevWarn, "StorangeServerUnhealthy", self->distributorId)
+					TraceEvent(SevWarn, "StorageServerUnhealthy", self->distributorId)
 					    .detail("ServerID", interf.id())
 					    .detail("ServerIpAddress", interf.address());
 					self->unhealthyServers++;
@@ -2036,8 +2040,25 @@ public:
 			avgShardBytes.reset();
 			self->getAverageShardBytes.send(avgShardBytes);
 			int64_t avgBytes = wait(avgShardBytes.getFuture());
-			double ratio = self->loadBytesBalanceRatio(avgBytes * SERVER_KNOBS->PERPETUAL_WIGGLE_SMALL_LOAD_RATIO);
-			bool imbalance = ratio < SERVER_KNOBS->PERPETUAL_WIGGLE_MIN_BYTES_BALANCE_RATIO;
+			double ratio;
+			bool imbalance;
+			int numSSToBeLoadBytesBalanced;
+
+			if (SERVER_KNOBS->PW_MAX_SS_LESSTHAN_MIN_BYTES_BALANCE_RATIO) {
+				// PW_MAX_SS_LESSTHAN_MIN_BYTES_BALANCE_RATIO: Maximum number of storage servers that can
+				// have the load bytes less than PERPETUAL_WIGGLE_MIN_BYTES_BALANCE_RATIO before perpetual
+				// wiggle will start the next wiggle.
+				// The wiggle waits until the numSSToBeLoadBytesBalanced to be less than
+				// PW_MAX_SS_LESSTHAN_MIN_BYTES_BALANCE_RATIO before starting the next wiggle. With this we can have
+				// mutiple SS that are in balancing state. Used to speed up wiggling rather than waiting for every SS to
+				// get balanced/filledup before starting the next wiggle.
+				numSSToBeLoadBytesBalanced =
+				    self->numSSToBeLoadBytesBalanced(avgBytes * SERVER_KNOBS->PERPETUAL_WIGGLE_SMALL_LOAD_RATIO);
+				imbalance = numSSToBeLoadBytesBalanced > SERVER_KNOBS->PW_MAX_SS_LESSTHAN_MIN_BYTES_BALANCE_RATIO;
+			} else {
+				ratio = self->loadBytesBalanceRatio(avgBytes * SERVER_KNOBS->PERPETUAL_WIGGLE_SMALL_LOAD_RATIO);
+				imbalance = ratio < SERVER_KNOBS->PERPETUAL_WIGGLE_MIN_BYTES_BALANCE_RATIO;
+			}
 			CODE_PROBE(imbalance, "Perpetual Wiggle pause because cluster is imbalance.");
 
 			// there must not have other teams to place wiggled data
@@ -2050,7 +2071,9 @@ public:
 				if (self->configuration.storageMigrationType == StorageMigrationType::GRADUAL) {
 					TraceEvent(SevWarn, "PerpetualStorageWiggleSleep", self->distributorId)
 					    .suppressFor(SERVER_KNOBS->PERPETUAL_WIGGLE_DELAY * 4)
-					    .detail("BytesBalanceRatio", ratio)
+					    .detail("ImbalanceFactor",
+					            SERVER_KNOBS->PW_MAX_SS_LESSTHAN_MIN_BYTES_BALANCE_RATIO ? numSSToBeLoadBytesBalanced
+					                                                                     : ratio)
 					    .detail("ServerSize", self->server_info.size())
 					    .detail("MachineSize", self->machine_info.size())
 					    .detail("StorageTeamSize", self->configuration.storageTeamSize);
@@ -2102,6 +2125,12 @@ public:
 					pausePenalty = std::min(pausePenalty * 2, (int)self->teams.size());
 				}
 				self->pauseWiggle->set(true);
+				TraceEvent("PerpetualWigglePausedDueToClusterHealth")
+				    .detail("UnhealthyRelocation", count)
+				    .detail("HealthyTeamCount", self->healthyTeamCount)
+				    .detail("BestTeamStuckCount", self->bestTeamKeepStuckCount)
+				    .detail("PausePenalty", pausePenalty)
+				    .detail("Primary", self->primary);
 			} else {
 				self->pauseWiggle->set(false);
 			}
@@ -2320,6 +2349,7 @@ public:
 		state bool lastIsTss = false;
 		TraceEvent("StorageServerRecruitment", self->distributorId)
 		    .detail("State", "Idle")
+		    .detail("Primary", self->primary)
 		    .trackLatest(self->storageServerRecruitmentEventHolder->trackingKey);
 		loop {
 			if (!recruiting) {
@@ -2329,6 +2359,7 @@ public:
 				TraceEvent("StorageServerRecruitment", self->distributorId)
 				    .detail("State", "Recruiting")
 				    .detail("IsTSS", self->isTssRecruiting ? "True" : "False")
+				    .detail("Primary", self->primary)
 				    .trackLatest(self->storageServerRecruitmentEventHolder->trackingKey);
 				recruiting = true;
 				lastIsTss = self->isTssRecruiting;
@@ -2339,6 +2370,7 @@ public:
 							if (lastIsTss != self->isTssRecruiting) {
 								TraceEvent("StorageServerRecruitment", self->distributorId)
 								    .detail("State", "Recruiting")
+								    .detail("Primary", self->primary)
 								    .detail("IsTSS", self->isTssRecruiting ? "True" : "False")
 								    .trackLatest(self->storageServerRecruitmentEventHolder->trackingKey);
 								lastIsTss = self->isTssRecruiting;
@@ -2353,6 +2385,7 @@ public:
 				}
 				TraceEvent("StorageServerRecruitment", self->distributorId)
 				    .detail("State", "Idle")
+				    .detail("Primary", self->primary)
 				    .trackLatest(self->storageServerRecruitmentEventHolder->trackingKey);
 				recruiting = false;
 			}
@@ -2385,6 +2418,22 @@ public:
 			state InitializeStorageRequest isr;
 			isr.storeType = recruitTss ? self->configuration.testingStorageServerStoreType
 			                           : self->configuration.storageServerStoreType;
+
+			// Check if perpetual storage wiggle is enabled and perpetualStoreType is set. If so, we use
+			// perpetualStoreType for all new SSes that match perpetualStorageWiggleLocality.
+			// Note that this only applies to regular storage servers, not TSS.
+			if (!recruitTss && self->configuration.storageMigrationType == StorageMigrationType::GRADUAL &&
+			    self->configuration.perpetualStoreType.isValid()) {
+				if (self->configuration.perpetualStorageWiggleLocality == "0") {
+					isr.storeType = self->configuration.perpetualStoreType;
+				} else {
+					std::vector<std::pair<Optional<Value>, Optional<Value>>> localityKeyValues =
+					    ParsePerpetualStorageWiggleLocality(self->configuration.perpetualStorageWiggleLocality);
+					if (localityMatchInList(localityKeyValues, candidateWorker.worker.locality)) {
+						isr.storeType = self->configuration.perpetualStoreType;
+					}
+				}
+			}
 			isr.seedTag = invalidTag;
 			isr.reqId = deterministicRandom()->randomUniqueID();
 			isr.interfaceId = interfaceId;
@@ -2394,34 +2443,41 @@ public:
 			state bool doRecruit = true;
 			if (recruitTss) {
 				TraceEvent("TSS_Recruit", self->distributorId)
+				    .detail("ReqID", isr.reqId)
 				    .detail("TSSID", interfaceId)
 				    .detail("Stage", "TSSWaitingPair")
-				    .detail("Addr", candidateWorker.worker.address())
-				    .detail("Locality", candidateWorker.worker.locality.toString());
+				    .detail("TSSAddr", candidateWorker.worker.address())
+				    .detail("TSSLocality", candidateWorker.worker.locality.toString())
+				    .detail("Primary", self->primary);
 
 				Optional<std::pair<UID, Version>> ssPairInfoResult = wait(tssState->waitOnSS());
 				if (ssPairInfoResult.present()) {
 					isr.tssPairIDAndVersion = ssPairInfoResult.get();
 
 					TraceEvent("TSS_Recruit", self->distributorId)
+					    .detail("ReqID", isr.reqId)
 					    .detail("SSID", ssPairInfoResult.get().first)
 					    .detail("TSSID", interfaceId)
-					    .detail("Stage", "TSSWaitingPair")
-					    .detail("Addr", candidateWorker.worker.address())
-					    .detail("Version", ssPairInfoResult.get().second)
-					    .detail("Locality", candidateWorker.worker.locality.toString());
+					    .detail("Stage", "TSSGotPair")
+					    .detail("TSSAddr", candidateWorker.worker.address())
+					    .detail("SSVersion", ssPairInfoResult.get().second)
+					    .detail("TSSLocality", candidateWorker.worker.locality.toString())
+					    .detail("Primary", self->primary);
 				} else {
 					doRecruit = false;
 
 					TraceEvent(SevWarnAlways, "TSS_RecruitError", self->distributorId)
+					    .detail("ReqID", isr.reqId)
 					    .detail("TSSID", interfaceId)
-					    .detail("Reason", "SS recruitment failed for some reason")
-					    .detail("Addr", candidateWorker.worker.address())
-					    .detail("Locality", candidateWorker.worker.locality.toString());
+					    .detail("Reason", "TSS failed to get SS pair for some reason")
+					    .detail("TSSAddr", candidateWorker.worker.address())
+					    .detail("TSSLocality", candidateWorker.worker.locality.toString())
+					    .detail("Primary", self->primary);
 				}
 			}
 
 			TraceEvent("DDRecruiting")
+			    .detail("ReqID", isr.reqId)
 			    .detail("Primary", self->primary)
 			    .detail("State", "Sending request to worker")
 			    .detail("WorkerID", candidateWorker.worker.id())
@@ -2429,7 +2485,8 @@ public:
 			    .detail("Interf", interfaceId)
 			    .detail("Addr", candidateWorker.worker.address())
 			    .detail("TSS", recruitTss ? "true" : "false")
-			    .detail("RecruitingStream", self->recruitingStream.get());
+			    .detail("RecruitingStream", self->recruitingStream.get())
+			    .detail("StoreType", isr.storeType);
 
 			Future<ErrorOr<InitializeStorageReply>> fRecruit =
 			    doRecruit
@@ -2453,10 +2510,12 @@ public:
 				// SS has a tss pair. send it this id, but try to wait for add server until tss is recruited
 
 				TraceEvent("TSS_Recruit", self->distributorId)
+				    .detail("ReqID", isr.reqId)
 				    .detail("SSID", interfaceId)
 				    .detail("Stage", "SSSignaling")
-				    .detail("Addr", candidateWorker.worker.address())
-				    .detail("Locality", candidateWorker.worker.locality.toString());
+				    .detail("SSAddr", candidateWorker.worker.address())
+				    .detail("SSLocality", candidateWorker.worker.locality.toString())
+				    .detail("Primary", self->primary);
 
 				// wait for timeout, but eventually move on if no TSS pair recruited
 				Optional<bool> tssSuccessful =
@@ -2464,18 +2523,22 @@ public:
 
 				if (tssSuccessful.present() && tssSuccessful.get()) {
 					TraceEvent("TSS_Recruit", self->distributorId)
+					    .detail("ReqID", isr.reqId)
 					    .detail("SSID", interfaceId)
 					    .detail("Stage", "SSGotPair")
-					    .detail("Addr", candidateWorker.worker.address())
-					    .detail("Locality", candidateWorker.worker.locality.toString());
+					    .detail("SSAddr", candidateWorker.worker.address())
+					    .detail("SSLocality", candidateWorker.worker.locality.toString())
+					    .detail("Primary", self->primary);
 				} else {
 					TraceEvent(SevWarn, "TSS_RecruitError", self->distributorId)
+					    .detail("ReqID", isr.reqId)
 					    .detail("SSID", interfaceId)
 					    .detail("Reason",
 					            tssSuccessful.present() ? "TSS recruitment failed for some reason"
 					                                    : "TSS recruitment timed out")
-					    .detail("Addr", candidateWorker.worker.address())
-					    .detail("Locality", candidateWorker.worker.locality.toString());
+					    .detail("SSAddr", candidateWorker.worker.address())
+					    .detail("SSLocality", candidateWorker.worker.locality.toString())
+					    .detail("Primary", self->primary);
 				}
 			}
 
@@ -2483,13 +2546,16 @@ public:
 			self->recruitingLocalities.erase(candidateWorker.worker.stableAddress());
 
 			TraceEvent("DDRecruiting")
+			    .detail("ReqID", isr.reqId)
 			    .detail("Primary", self->primary)
 			    .detail("State", "Finished request")
 			    .detail("WorkerID", candidateWorker.worker.id())
 			    .detail("WorkerLocality", candidateWorker.worker.locality.toString())
 			    .detail("Interf", interfaceId)
 			    .detail("Addr", candidateWorker.worker.address())
-			    .detail("RecruitingStream", self->recruitingStream.get());
+			    .detail("RecruitingStream", self->recruitingStream.get())
+			    .detail("TSS", recruitTss ? "true" : "false")
+			    .detail("StoreType", isr.storeType);
 
 			if (newServer.present()) {
 				UID id = newServer.get().interf.id();
@@ -2500,14 +2566,27 @@ public:
 						                self->serverTrackerErrorOut,
 						                newServer.get().addedVersion,
 						                *ddEnabledState);
+						TraceEvent("DDRecruiting")
+						    .detail("ReqID", isr.reqId)
+						    .detail("Primary", self->primary)
+						    .detail("State", "Add new SS to DD")
+						    .detail("WorkerID", candidateWorker.worker.id())
+						    .detail("WorkerLocality", candidateWorker.worker.locality.toString())
+						    .detail("Interf", interfaceId)
+						    .detail("Addr", candidateWorker.worker.address())
+						    .detail("RecruitingStream", self->recruitingStream.get())
+						    .detail("TSS", recruitTss ? "true" : "false")
+						    .detail("StoreType", isr.storeType);
 						self->waitUntilRecruited.set(false);
 						// signal all done after adding tss to tracking info
 						tssState->markComplete();
 					}
 				} else {
 					TraceEvent(SevWarn, "DDRecruitmentError")
+					    .detail("ReqID", isr.reqId)
 					    .detail("Reason", "Server ID already recruited")
-					    .detail("ServerID", id);
+					    .detail("ServerID", id)
+					    .detail("Primary", self->primary);
 				}
 			}
 		}
@@ -2560,7 +2639,8 @@ public:
 					    .detail("Desired", targetTSSInDC)
 					    .detail("Existing", self->tss_info_by_pair.size())
 					    .detail("InProgress", inProgressTSSCount)
-					    .detail("NotStarted", newTssToRecruit);
+					    .detail("NotStarted", newTssToRecruit)
+					    .detail("Primary", self->primary);
 					tssToRecruit = newTssToRecruit;
 
 					// if we need to get rid of some TSS processes, signal to either cancel recruitment or kill existing
@@ -2671,7 +2751,8 @@ public:
 							TraceEvent("TSS_Recruit", self->distributorId)
 							    .detail("Stage", "HoldTSS")
 							    .detail("Addr", candidateSSAddr.toString())
-							    .detail("Locality", candidateWorker.worker.locality.toString());
+							    .detail("Locality", candidateWorker.worker.locality.toString())
+							    .detail("Primary", self->primary);
 
 							CODE_PROBE(true, "Starting TSS recruitment");
 							self->isTssRecruiting = true;
@@ -2688,7 +2769,8 @@ public:
 								TraceEvent("TSS_Recruit", self->distributorId)
 								    .detail("Stage", "PairSS")
 								    .detail("Addr", candidateSSAddr.toString())
-								    .detail("Locality", candidateWorker.worker.locality.toString());
+								    .detail("Locality", candidateWorker.worker.locality.toString())
+								    .detail("Primary", self->primary);
 								self->addActor.send(
 								    initializeStorage(self, candidateWorker, ddEnabledState, false, tssState));
 								// successfully started recruitment of pair, reset tss recruitment state
@@ -2764,7 +2846,11 @@ public:
 							// FIXME: better way to do this than timer?
 						} else {
 							pendingTSSCheck = false;
-							checkTss = Never();
+							if (!self->zeroHealthyTeams->get()) {
+								checkTss = Never();
+							} else {
+								checkTss = delay(SERVER_KNOBS->TSS_DD_CHECK_INTERVAL);
+							}
 						}
 					}
 					when(wait(self->restartRecruiting.onTrigger())) {}
@@ -2891,10 +2977,11 @@ public:
 		}
 	}
 
-	ACTOR static Future<UID> getNextWigglingServerID(Reference<StorageWiggler> wiggler,
-	                                                 Optional<Value> localityKey = Optional<Value>(),
-	                                                 Optional<Value> localityValue = Optional<Value>(),
-	                                                 DDTeamCollection* teamCollection = nullptr) {
+	ACTOR static Future<UID> getNextWigglingServerID(
+	    Reference<StorageWiggler> wiggler,
+	    std::vector<std::pair<Optional<Value>, Optional<Value>>> localityKeyValues =
+	        std::vector<std::pair<Optional<Value>, Optional<Value>>>(),
+	    DDTeamCollection* teamCollection = nullptr) {
 		ASSERT(wiggler->teamCollection == teamCollection);
 		loop {
 			// when the DC need more
@@ -2906,12 +2993,11 @@ public:
 			}
 
 			// if perpetual_storage_wiggle_locality has value and not 0(disabled).
-			if (localityKey.present()) {
+			if (!localityKeyValues.empty()) {
 				// Whether the selected server matches the locality
 				auto server = teamCollection->server_info.at(id.get());
-
 				// TraceEvent("PerpetualLocality").detail("Server", server->getLastKnownInterface().locality.get(localityKey)).detail("Desire", localityValue);
-				if (server->getLastKnownInterface().locality.get(localityKey.get()) == localityValue) {
+				if (localityMatchInList(localityKeyValues, server->getLastKnownInterface().locality)) {
 					return id.get();
 				}
 
@@ -2930,12 +3016,41 @@ public:
 
 	// read the current map of `perpetualStorageWiggleIDPrefix`, then restore wigglingId.
 	ACTOR static Future<Void> readStorageWiggleMap(DDTeamCollection* self) {
+		state StorageWiggleData wiggleState;
+		state KeyBackedObjectMap<UID, StorageWiggleValue, decltype(IncludeVersion())> metadataMap =
+		    wiggleState.wigglingStorageServer(PrimaryRegion(self->primary));
 		state std::vector<std::pair<UID, StorageWiggleValue>> res =
 		    wait(readStorageWiggleValues(self->dbContext(), self->primary, false));
+
 		if (res.size() > 0) {
 			// SOMEDAY: support wiggle multiple SS at once
 			ASSERT(!self->wigglingId.present()); // only single process wiggle is allowed
-			self->wigglingId = res.begin()->first;
+
+			std::vector<std::pair<Optional<Value>, Optional<Value>>> localityKeyValues;
+			if (self->configuration.perpetualStorageWiggleLocality != "0") {
+				localityKeyValues =
+				    ParsePerpetualStorageWiggleLocality(self->configuration.perpetualStorageWiggleLocality);
+			}
+
+			// if perpetual_storage_wiggle_locality has value and not 0(disabled).
+			if (!localityKeyValues.empty()) {
+				if (self->server_info.count(res.begin()->first)) {
+					auto server = self->server_info.at(res.begin()->first);
+					for (const auto& [localityKey, localityValue] : localityKeyValues) {
+						// Update the wigglingId only if it matches the locality.
+						if (server->getLastKnownInterface().locality.get(localityKey.get()) == localityValue) {
+							self->wigglingId = res.begin()->first;
+							break;
+						}
+					}
+
+					if (!self->wigglingId.present()) {
+						wait(self->eraseStorageWiggleMap(&metadataMap, res.begin()->first));
+					}
+				}
+			} else {
+				self->wigglingId = res.begin()->first;
+			}
 		}
 		return Void();
 	}
@@ -2980,6 +3095,7 @@ public:
 					data.createdTime = metadata.get().createdTime;
 				}
 				metadataMap.set(tr, server->getId(), data);
+				tr->set(serverMetadataChangeKey, deterministicRandom()->randomUniqueID().toString());
 				wait(tr->commit());
 				break;
 			} catch (Error& e) {
@@ -3190,12 +3306,25 @@ public:
 			state int i;
 			state std::map<UID, Reference<TCServerInfo>>::iterator server = server_info.begin();
 			for (i = 0; i < server_info.size(); i++) {
+				auto serverStats = server->second->getStorageStats();
 				TraceEvent("ServerInfo", self->getDistributorId())
 				    .detail("ServerInfoIndex", i)
 				    .detail("ServerID", server->first.toString())
 				    .detail("ServerTeamOwned", server->second->getTeams().size())
 				    .detail("MachineID", server->second->machine->machineID.contents().toString())
-				    .detail("Primary", self->isPrimary());
+				    .detail("Primary", self->isPrimary())
+				    .detail("IsInDesiredDC", server->second->isInDesiredDC())
+				    .detail("DataInFlightToServer", server->second->getDataInFlightToServer())
+				    .detail("ReadInFlightToServer", server->second->getReadInFlightToServer())
+				    .detail("IsWigglePausedServer", server->second->isWigglePausedServer())
+				    .detail("SpaceBytesAvailable",
+				            server->second->metricsPresent() ? server->second->spaceBytes().first : -1)
+				    .detail("SpaceBytesCapacity",
+				            server->second->metricsPresent() ? server->second->spaceBytes().second : -1)
+				    .detail("LoadBytes", server->second->metricsPresent() ? server->second->loadBytes() : -1)
+				    .detail("CpuUsage", serverStats.present() ? serverStats.get().cpuUsage : 100.0);
+				// If storage server hasn't gotten the health metrics updated, we assume it's too busy to respond so
+				// return 100.0;
 				server++;
 				if (++traceEventsPrinted % SERVER_KNOBS->DD_TEAMS_INFO_PRINT_YIELD_COUNT == 0) {
 					wait(yield());
@@ -3220,6 +3349,14 @@ public:
 				auto it = server_status.find(uid);
 				if (it != server_status.end()) {
 					e.detail("Healthy", !it->second.isUnhealthy());
+					e.detail("IsWiggling", it->second.isWiggling);
+					e.detail("IsFailed", it->second.isFailed);
+					e.detail("IsUndesired", it->second.isUndesired);
+					e.detail("IsWrongConfiguration", it->second.isWrongConfiguration);
+					e.detail("Initialized", it->second.initialized);
+					e.detail("ExcludeOnRecruit", it->second.excludeOnRecruit());
+					e.detail("IsUnhealthy", it->second.isUnhealthy());
+					e.detail("Locality", it->second.locality.toString());
 				}
 
 				server++;
@@ -3242,6 +3379,18 @@ public:
 				    .detail("MemberIDs", team->getServerIDsStr())
 				    .detail("Primary", self->isPrimary())
 				    .detail("TeamID", team->getTeamID())
+				    .detail("InflightDataToTeam", team->getDataInFlightToTeam())
+				    .detail("LoadBytes", team->getLoadBytes())
+				    .detail("ReadLoad", team->getReadLoad())
+				    .detail("AverageCPU", team->getAverageCPU())
+				    .detail("ReadInFlightToTeam", team->getReadInFlightToTeam())
+				    .detail("MinAvailableSpace", team->getMinAvailableSpace())
+				    .detail("MinAvailableSpaceRatio", team->getMinAvailableSpaceRatio())
+				    .detail("IsOptimal", team->isOptimal())
+				    .detail("IsWrongConfiguration", team->isWrongConfiguration())
+				    .detail("IsHealthy", team->isHealthy())
+				    .detail("Priority", team->getPriority())
+				    .detail("HasWigglePausedServer", team->hasWigglePausedServer())
 				    .detail("Shards",
 				            self->shardsAffectedByTeamFailure
 				                ->getShardsFor(ShardsAffectedByTeamFailure::Team(team->getServerIDs(), self->primary))
@@ -3708,6 +3857,53 @@ double DDTeamCollection::loadBytesBalanceRatio(int64_t smallLoadThreshold) const
 	return minLoadBytes / avgLoad;
 }
 
+int DDTeamCollection::numSSToBeLoadBytesBalanced(int64_t smallLoadThreshold) const {
+	double totalLoadBytes = 0;
+	int count = 0;
+	for (auto& [id, s] : server_info) {
+		// If a healthy SS don't have storage metrics, skip this round
+		if (server_status.get(s->getId()).isUnhealthy() || !s->metricsPresent()) {
+			TraceEvent(SevDebug, "NumSSToBeLoadBytesBalancedNoMetrics").detail("Server", id);
+			return INT_MAX; // return all are imbalanced
+		}
+
+		totalLoadBytes += s->loadBytes();
+		++count;
+	}
+
+	if (!count)
+		return INT_MAX;
+
+	double avgLoad = totalLoadBytes / count;
+	if (totalLoadBytes == 0 || avgLoad < smallLoadThreshold) {
+		return 0;
+	}
+
+	int numSSToBeLoadBytesBalanced = 0;
+	double balanceRatio;
+	for (auto& [id, s] : server_info) {
+		// If a healthy SS don't have storage metrics, skip this round
+		if (server_status.get(s->getId()).isUnhealthy() || !s->metricsPresent()) {
+			TraceEvent(SevDebug, "NumSSToBeLoadBytesBalancedNoMetrics").detail("Server", id);
+			return INT_MAX;
+		}
+
+		balanceRatio = s->loadBytes() / avgLoad;
+		if (balanceRatio < SERVER_KNOBS->PERPETUAL_WIGGLE_MIN_BYTES_BALANCE_RATIO) {
+			numSSToBeLoadBytesBalanced++;
+		}
+	}
+
+	TraceEvent(SevDebug, "NumSSToBeLoadBytesBalancedMetrics")
+	    .detail("NumSSToBeLoadBytesBalanced", numSSToBeLoadBytesBalanced)
+	    .detail("TotalLoad", totalLoadBytes)
+	    .detail("AvgLoad", avgLoad)
+	    .detail("SmallLoadThreshold", smallLoadThreshold)
+	    .detail("Count", count);
+
+	return numSSToBeLoadBytesBalanced;
+}
+
 Future<Void> DDTeamCollection::storageServerFailureTracker(TCServerInfo* server,
                                                            ServerStatus* status,
                                                            Version addedVersion) {
@@ -3853,23 +4049,14 @@ Future<Void> DDTeamCollection::monitorHealthyTeams() {
 }
 
 Future<UID> DDTeamCollection::getNextWigglingServerID() {
-	Optional<Value> localityKey;
-	Optional<Value> localityValue;
+	std::vector<std::pair<Optional<Value>, Optional<Value>>> localityKeyValues;
 
 	// NOTE: because normal \xff/conf change through `changeConfig` now will cause DD throw `movekeys_conflict()`
 	// then recruit a new DD, we only need to read current configuration once
 	if (configuration.perpetualStorageWiggleLocality != "0") {
-		// parsing format is like "datahall:0"
-		std::string& localityKeyValue = configuration.perpetualStorageWiggleLocality;
-		ASSERT(isValidPerpetualStorageWiggleLocality(localityKeyValue));
-		// get key and value from perpetual_storage_wiggle_locality.
-		int split = localityKeyValue.find(':');
-		localityKey = Optional<Value>(ValueRef((uint8_t*)localityKeyValue.c_str(), split));
-		localityValue = Optional<Value>(
-		    ValueRef((uint8_t*)localityKeyValue.c_str() + split + 1, localityKeyValue.size() - split - 1));
+		localityKeyValues = ParsePerpetualStorageWiggleLocality(configuration.perpetualStorageWiggleLocality);
 	}
-
-	return DDTeamCollectionImpl::getNextWigglingServerID(storageWiggler, localityKey, localityValue, this);
+	return DDTeamCollectionImpl::getNextWigglingServerID(storageWiggler, localityKeyValues, this);
 }
 
 Future<Void> DDTeamCollection::readStorageWiggleMap() {
@@ -6644,8 +6831,7 @@ TEST_CASE("/DataDistribution/StorageWiggler/NextIdWithTSS") {
 	                                       KeyValueStoreType::SSD_BTREE_V2));
 	ASSERT(!wiggler->getNextServerId(true).present());
 	ASSERT(wiggler->getNextServerId(collection->reachTSSPairTarget()) == UID(1, 0));
-	UID id = wait(
-	    DDTeamCollectionImpl::getNextWigglingServerID(wiggler, Optional<Value>(), Optional<Value>(), collection.get()));
+	UID id = wait(DDTeamCollectionImpl::getNextWigglingServerID(wiggler, {}, collection.get()));
 	ASSERT(now() - startTime < SERVER_KNOBS->DD_STORAGE_WIGGLE_MIN_SS_AGE_SEC + 150.0);
 	ASSERT(id == UID(2, 0));
 	return Void();
