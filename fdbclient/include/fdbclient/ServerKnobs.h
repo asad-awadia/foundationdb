@@ -120,6 +120,7 @@ public:
 	double BEST_TEAM_STUCK_DELAY;
 	double DEST_OVERLOADED_DELAY;
 	double BG_REBALANCE_POLLING_INTERVAL;
+	double BG_REBALANCE_MAX_POLLING_INTERVAL;
 	double BG_REBALANCE_SWITCH_CHECK_INTERVAL;
 	double DD_QUEUE_LOGGING_INTERVAL;
 	double DD_QUEUE_COUNTER_REFRESH_INTERVAL;
@@ -131,6 +132,7 @@ public:
 	                                                          // than healthy priority
 	double RELOCATION_PARALLELISM_PER_SOURCE_SERVER;
 	double RELOCATION_PARALLELISM_PER_DEST_SERVER;
+	double MERGE_RELOCATION_PARALLELISM_PER_TEAM;
 	int DD_QUEUE_MAX_KEY_SERVERS;
 	int DD_REBALANCE_PARALLELISM;
 	int DD_REBALANCE_RESET_AMOUNT;
@@ -158,10 +160,12 @@ public:
 	int PRIORITY_REBALANCE_READ_OVERUTIL_TEAM;
 	// A load-balance priority read mountain chopper
 	int PRIORITY_REBALANCE_READ_UNDERUTIL_TEAM;
+	// A load-balance priority storage queue too long
+	int PRIORITY_REBALANCE_STORAGE_QUEUE;
 	// A team healthy priority for wiggle a storage server
 	int PRIORITY_PERPETUAL_STORAGE_WIGGLE;
 	// A team healthy priority when all servers in a team are healthy. When a team changes from any unhealthy states to
-	// healthy, the unfinished relocations will be overriden to healthy priority
+	// healthy, the unfinished relocations will be overridden to healthy priority
 	int PRIORITY_TEAM_HEALTHY;
 	// A team healthy priority when there's undesired servers in the team. (ex. same ip
 	// address as other SS process, or SS is lagging too far ...)
@@ -189,6 +193,13 @@ public:
 	// Priority when a physical shard is oversize or anonymous. When DD enable physical shard, the shard created before
 	// it are default to be 'anonymous' for compatibility.
 	int PRIORITY_ENFORCE_MOVE_OUT_OF_PHYSICAL_SHARD;
+
+	// Data fetching rate is throttled if its priority is STRICTLY LOWER than this value. The rate limit is set as
+	// STORAGE_FETCH_KEYS_RATE_LIMIT.
+	int FETCH_KEYS_THROTTLE_PRIORITY_THRESHOLD;
+
+	bool ENABLE_REPLICA_CONSISTENCY_CHECK_ON_DATA_MOVEMENT;
+	int CONSISTENCY_CHECK_REQUIRED_REPLICAS;
 
 	// Data distribution
 	// DD use AVAILABLE_SPACE_PIVOT_RATIO to calculate pivotAvailableSpaceRatio. Given an array that's descend
@@ -237,7 +248,7 @@ public:
 	// When the sampled read operations changes more than this threshold, the
 	// shard metrics will update immediately
 	int64_t SHARD_READ_OPS_CHANGE_THRESHOLD;
-	bool ENABLE_WRITE_BASED_SHARD_SPLIT; // experimental
+	bool ENABLE_WRITE_BASED_SHARD_SPLIT; // Experimental. Enable to enforce shard split when write traffic is high
 
 	double SHARD_MAX_READ_DENSITY_RATIO;
 	int64_t SHARD_READ_HOT_BANDWIDTH_MIN_PER_KSECONDS;
@@ -320,6 +331,19 @@ public:
 	                                               // storage bytes used by a tenant group
 	int CP_FETCH_TENANTS_OVER_STORAGE_QUOTA_INTERVAL; // How often the commit proxies send requests to the data
 	                                                  // distributor to fetch the list of tenants over storage quota
+	bool ENABLE_STORAGE_QUEUE_AWARE_TEAM_SELECTION; // Experimental! Enable to avoid moving data to a team which has a
+	                                                // long storage queue
+	double DD_LONG_STORAGE_QUEUE_TEAM_MAJORITY_PERCENTILE; // p% amount teams which have longer queues (team queue size
+	                                                       // = max SSes queue size)
+	bool ENABLE_REBALANCE_STORAGE_QUEUE; // Experimental! Enable to trigger data moves to rebalance storage queues when
+	                                     // a queue is significantly longer than others
+	int64_t REBALANCE_STORAGE_QUEUE_LONG_BYTES; // Lower bound of length indicating the storage queue is too long
+	int64_t REBALANCE_STORAGE_QUEUE_SHORT_BYTES; // Upper bound of length indicating the storage queue is back to short
+	double DD_LONG_STORAGE_QUEUE_TIMESPAN;
+	double DD_REBALANCE_STORAGE_QUEUE_TIME_INTERVAL;
+	int64_t REBALANCE_STORAGE_QUEUE_SHARD_PER_KSEC_MIN;
+	bool DD_ENABLE_REBALANCE_STORAGE_QUEUE_WITH_LIGHT_WRITE_SHARD; // Enable to allow storage queue rebalancer to move
+	                                                               // light-traffic shards out of the overloading server
 
 	// TeamRemover to remove redundant teams
 	bool TR_FLAG_DISABLE_MACHINE_TEAM_REMOVER; // disable the machineTeamRemover actor
@@ -330,6 +354,8 @@ public:
 	double TR_REMOVE_SERVER_TEAM_DELAY; // wait for the specified time before try to remove next server team
 	double TR_REMOVE_SERVER_TEAM_EXTRA_DELAY; // serverTeamRemover waits for the delay and check DD healthyness again to
 	                                          // ensure it runs after machineTeamRemover
+	double TR_REDUNDANT_TEAM_PERCENTAGE_THRESHOLD; // serverTeamRemover will only remove teams if existing team number
+	                                               // is p% more than the desired team number.
 
 	// Remove wrong storage engines
 	double DD_REMOVE_STORE_ENGINE_DELAY; // wait for the specified time before remove the next batch
@@ -337,6 +363,8 @@ public:
 	double DD_FAILURE_TIME;
 	double DD_ZERO_HEALTHY_TEAM_DELAY;
 	int DD_BUILD_EXTRA_TEAMS_OVERRIDE; // build extra teams to allow data movement to progress. must be larger than 0
+	bool DD_REMOVE_MAINTENANCE_ON_FAILURE; // If set to true DD will remove the maintenance mode if another SS fails
+	                                       // outside of the maintenance zone.
 	int DD_SHARD_TRACKING_LOG_SEVERITY;
 	bool ENFORCE_SHARD_COUNT_PER_TEAM; // Whether data movement selects dst team not exceeding
 	                                   // DESIRED_MAX_SHARDS_PER_TEAM.
@@ -351,7 +379,7 @@ public:
 	double DD_FIX_WRONG_REPLICAS_DELAY; // the amount of time between attempts to increase the replication factor of
 	                                    // under replicated shards
 
-	// Run storage enginee on a child process on the same machine with storage process
+	// Run storage engine on a child process on the same machine with storage process
 	bool REMOTE_KV_STORE;
 	// A delay to avoid race on file resources after seeing lock_file_failure
 	double REBOOT_KV_STORE_DELAY;
@@ -420,6 +448,8 @@ public:
 	bool ROCKSDB_BLOOM_WHOLE_KEY_FILTERING;
 	int ROCKSDB_MAX_AUTO_READAHEAD_SIZE;
 	int64_t ROCKSDB_BLOCK_CACHE_SIZE;
+	double ROCKSDB_CACHE_HIGH_PRI_POOL_RATIO;
+	bool ROCKSDB_CACHE_INDEX_AND_FILTER_BLOCKS;
 	double ROCKSDB_METRICS_DELAY;
 	double ROCKSDB_READ_VALUE_TIMEOUT;
 	double ROCKSDB_READ_VALUE_PREFIX_TIMEOUT;
@@ -453,10 +483,10 @@ public:
 	int64_t SHARD_SOFT_PENDING_COMPACT_BYTES_LIMIT;
 	int64_t SHARD_HARD_PENDING_COMPACT_BYTES_LIMIT;
 	int64_t ROCKSDB_CAN_COMMIT_COMPACT_BYTES_LIMIT;
+	int ROCKSDB_CAN_COMMIT_IMMUTABLE_MEMTABLES_LIMIT;
 	bool ROCKSDB_PARANOID_FILE_CHECKS;
 	double ROCKSDB_CAN_COMMIT_DELAY_ON_OVERLOAD;
 	int ROCKSDB_CAN_COMMIT_DELAY_TIMES_ON_OVERLOAD;
-	bool ROCKSDB_DISABLE_WAL_EXPERIMENTAL;
 	int64_t ROCKSDB_WAL_TTL_SECONDS;
 	int64_t ROCKSDB_WAL_SIZE_LIMIT_MB;
 	bool ROCKSDB_LOG_LEVEL_DEBUG;
@@ -487,13 +517,15 @@ public:
 	bool ROCKSDB_ATOMIC_FLUSH;
 	bool ROCKSDB_IMPORT_MOVE_FILES;
 	bool ROCKSDB_CHECKPOINT_REPLAY_MARKER;
-	bool ROCKSDB_VERIFY_CHECKSUM_BEFORE_RESTORE;
+	bool ROCKSDB_VERIFY_CHECKSUM_BEFORE_RESTORE; // Conduct block-level checksum when rocksdb injecting data
 	bool ROCKSDB_ENABLE_CHECKPOINT_VALIDATION;
 	bool ROCKSDB_RETURN_OVERLOADED_ON_TIMEOUT;
 	int ROCKSDB_COMPACTION_PRI;
 	int ROCKSDB_WAL_RECOVERY_MODE;
 	int ROCKSDB_TARGET_FILE_SIZE_BASE;
 	int ROCKSDB_TARGET_FILE_SIZE_MULTIPLIER;
+	bool ROCKSDB_USE_DIRECT_READS;
+	bool ROCKSDB_USE_DIRECT_IO_FLUSH_COMPACTION;
 	int ROCKSDB_MAX_OPEN_FILES;
 	bool ROCKSDB_USE_POINT_DELETE_FOR_SYSTEM_KEYS;
 	int ROCKSDB_CF_RANGE_DELETION_LIMIT;
@@ -505,6 +537,15 @@ public:
 	int ROCKSDB_KEEP_LOG_FILE_NUM;
 	bool ROCKSDB_SKIP_STATS_UPDATE_ON_OPEN;
 	bool ROCKSDB_SKIP_FILE_SIZE_CHECK_ON_OPEN;
+	bool ROCKSDB_FULLFILE_CHECKSUM; // For validate sst files when compaction and producing backup files. TODO: set
+	                                // verify_file_checksum when ingesting (for physical shard move).
+	                                // This is different from ROCKSDB_VERIFY_CHECKSUM_BEFORE_RESTORE (block-level
+	                                // checksum). The block-level checksum does not cover the corruption such as wrong
+	                                // sst file or file move/copy.
+	int ROCKSDB_WRITEBATCH_PROTECTION_BYTES_PER_KEY;
+	int ROCKSDB_MEMTABLE_PROTECTION_BYTES_PER_KEY;
+	int ROCKSDB_BLOCK_PROTECTION_BYTES_PER_KEY;
+	int SHARDED_ROCKSDB_MEMTABLE_MAX_RANGE_DELETIONS;
 	double SHARDED_ROCKSDB_VALIDATE_MAPPING_RATIO;
 	int SHARD_METADATA_SCAN_BYTES_LIMIT;
 	int ROCKSDB_MAX_MANIFEST_FILE_SIZE;
@@ -520,6 +561,18 @@ public:
 	int SHARDED_ROCKSDB_TARGET_FILE_SIZE_MULTIPLIER;
 	bool SHARDED_ROCKSDB_SUGGEST_COMPACT_CLEAR_RANGE;
 	int SHARDED_ROCKSDB_MAX_BACKGROUND_JOBS;
+	int64_t SHARDED_ROCKSDB_BLOCK_CACHE_SIZE;
+	int64_t SHARDED_ROCKSDB_WRITE_RATE_LIMITER_BYTES_PER_SEC;
+	int64_t SHARDED_ROCKSDB_RATE_LIMITER_MODE;
+	int SHARDED_ROCKSDB_BACKGROUND_PARALLELISM;
+	int SHARDED_ROCKSDB_MAX_SUBCOMPACTIONS;
+	int SHARDED_ROCKSDB_LEVEL0_FILENUM_COMPACTION_TRIGGER;
+	int SHARDED_ROCKSDB_LEVEL0_SLOWDOWN_WRITES_TRIGGER;
+	int SHARDED_ROCKSDB_LEVEL0_STOP_WRITES_TRIGGER;
+	bool SHARDED_ROCKSDB_DELAY_COMPACTION_FOR_DATA_MOVE;
+	int SHARDED_ROCKSDB_MAX_OPEN_FILES;
+	bool SHARDED_ROCKSDB_READ_ASYNC_IO;
+	int SHARDED_ROCKSDB_PREFIX_LEN;
 
 	// Leader election
 	int MAX_NOTIFICATIONS;
@@ -650,7 +703,7 @@ public:
 	double INCOMPATIBLE_PEERS_LOGGING_INTERVAL;
 	double VERSION_LAG_METRIC_INTERVAL;
 	int64_t MAX_VERSION_DIFFERENCE;
-	double INITIAL_UPDATE_CROSS_DC_INFO_DELAY; // The intial delay in a new Cluster Controller just started to refresh
+	double INITIAL_UPDATE_CROSS_DC_INFO_DELAY; // The initial delay in a new Cluster Controller just started to refresh
 	                                           // the info of remote DC, such as remote DC health, and whether we need
 	                                           // to take remote DC health info when making failover decision.
 	double CHECK_REMOTE_HEALTH_INTERVAL; // Remote DC health refresh interval.
@@ -771,6 +824,8 @@ public:
 	double STORAGE_FETCH_KEYS_DELAY;
 	bool STORAGE_FETCH_KEYS_USE_COMMIT_BUDGET;
 	int64_t STORAGE_FETCH_KEYS_RATE_LIMIT; // Unit: MB/s
+	double STORAGE_ROCKSDB_LOG_CLEAN_UP_DELAY;
+	double STORAGE_ROCKSDB_LOG_TTL;
 
 	int64_t LOW_PRIORITY_STORAGE_QUEUE_BYTES;
 	int64_t LOW_PRIORITY_DURABILITY_LAG;
@@ -843,6 +898,11 @@ public:
 	int64_t HOT_SHARD_THROTTLING_TRACKED;
 	double HOT_SHARD_MONITOR_FREQUENCY;
 
+	// allow generating synthetic data for test clusters
+	bool GENERATE_DATA_ENABLED;
+	// maximum number of synthetic mutations per transaction
+	int GENERATE_DATA_PER_VERSION_MAX;
+
 	double MAX_TRANSACTIONS_PER_BYTE;
 
 	int64_t MIN_AVAILABLE_SPACE;
@@ -908,6 +968,7 @@ public:
 	int64_t EMPTY_READ_PENALTY;
 	int DD_SHARD_COMPARE_LIMIT; // when read-aware DD is enabled, at most how many shards are compared together
 	bool READ_SAMPLING_ENABLED;
+	bool DD_PREFER_LOW_READ_UTIL_TEAM;
 	// Rolling window duration over which the average bytes moved by DD is calculated for the 'MovingData' trace event.
 	double DD_TRACE_MOVE_BYTES_AVERAGE_INTERVAL;
 	int64_t MOVING_WINDOW_SAMPLE_SIZE;

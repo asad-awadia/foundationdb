@@ -62,7 +62,7 @@ const KeyRangeRef keyServersKeyServersKeys("\xff/keyServers/\xff/keyServers/"_sr
 const KeyRef keyServersKeyServersKey = keyServersKeyServersKeys.begin;
 
 // These constants are selected to be easily recognized during debugging.
-// Note that the last bit of the follwing constants is 0, indicating that physical shard move is disabled.
+// Note that the last bit of the following constants is 0, indicating that physical shard move is disabled.
 const UID anonymousShardId = UID(0x666666, 0x88888888);
 const uint64_t emptyShardId = 0x2222222;
 
@@ -302,6 +302,19 @@ const KeyRangeRef readConflictRangeKeysRange =
 
 const KeyRangeRef writeConflictRangeKeysRange = KeyRangeRef("\xff\xff/transaction/write_conflict_range/"_sr,
                                                             "\xff\xff/transaction/write_conflict_range/\xff\xff"_sr);
+
+const KeyRef accumulativeChecksumKey = "\xff\xff/accumulativeChecksum"_sr;
+
+const Value accumulativeChecksumValue(const AccumulativeChecksumState& acsState) {
+	return ObjectWriter::toValue(acsState, IncludeVersion());
+}
+
+AccumulativeChecksumState decodeAccumulativeChecksum(const ValueRef& value) {
+	AccumulativeChecksumState acsState;
+	ObjectReader reader(value.begin(), IncludeVersion());
+	reader.deserialize(acsState);
+	return acsState;
+}
 
 const KeyRangeRef auditKeys = KeyRangeRef("\xff/audits/"_sr, "\xff/audits0"_sr);
 const KeyRef auditPrefix = auditKeys.begin;
@@ -594,8 +607,8 @@ const Value serverKeysValue(const UID& id) {
 
 void validateDataMoveIdDecode(const DataMoveType& dataMoveType,
                               const DataMovementReason& dataMoveReason,
-                              const bool& emptyRange,
                               const bool& assigned,
+                              const bool& emptyRange,
                               const UID& dataMoveId) {
 	if (dataMoveType >= DataMoveType::NUMBER_OF_TYPES || dataMoveType < DataMoveType::LOGICAL) {
 		TraceEvent(g_network->isSimulated() ? SevError : SevWarnAlways, "DecodeDataMoveIdError")
@@ -604,36 +617,14 @@ void validateDataMoveIdDecode(const DataMoveType& dataMoveType,
 		    .detail("DataMoveID", dataMoveId)
 		    .detail("SplitIDToDecode", dataMoveId.second());
 	}
-	if (dataMoveReason >= DataMovementReason::NUMBER_OF_REASONS || dataMoveReason <= DataMovementReason::INVALID) {
+	if (dataMoveReason >= DataMovementReason::NUMBER_OF_REASONS || dataMoveReason < DataMovementReason::INVALID) {
 		TraceEvent(g_network->isSimulated() ? SevError : SevWarnAlways, "DecodeDataMoveIdError")
 		    .detail("Reason", "WrongDataMoveReasonOutScope")
 		    .detail("Value", dataMoveReason)
 		    .detail("DataMoveID", dataMoveId)
 		    .detail("SplitIDToDecode", dataMoveId.second());
 	}
-	if (!emptyRange && assigned) {
-		if (dataMoveReason != DataMovementReason::INVALID) {
-			TraceEvent(g_network->isSimulated() ? SevError : SevWarnAlways, "DecodeDataMoveIdError")
-			    .detail("Reason", "WrongDataMoveReason")
-			    .detail("Value", dataMoveReason)
-			    .detail("ExpectedValue", DataMovementReason::INVALID)
-			    .detail("DataMoveID", dataMoveId)
-			    .detail("EmptyRange", emptyRange)
-			    .detail("Assigned", assigned)
-			    .detail("SplitIDToDecode", dataMoveId.second());
-		}
-	} else {
-		if (dataMoveReason == DataMovementReason::INVALID) {
-			TraceEvent(g_network->isSimulated() ? SevError : SevWarnAlways, "DecodeDataMoveIdError")
-			    .detail("Reason", "WrongDataMoveReason")
-			    .detail("Value", dataMoveReason)
-			    .detail("ExpectedValue", "Should not be invalid value")
-			    .detail("DataMoveID", dataMoveId)
-			    .detail("EmptyRange", emptyRange)
-			    .detail("Assigned", assigned)
-			    .detail("SplitIDToDecode", dataMoveId.second());
-		}
-	}
+
 	return;
 }
 
@@ -1212,6 +1203,7 @@ const KeyRef primaryLocalityKey = "\xff/globals/primaryLocality"_sr;
 const KeyRef primaryLocalityPrivateKey = "\xff\xff/globals/primaryLocality"_sr;
 const KeyRef fastLoggingEnabled = "\xff/globals/fastLoggingEnabled"_sr;
 const KeyRef fastLoggingEnabledPrivateKey = "\xff\xff/globals/fastLoggingEnabled"_sr;
+const KeyRef constructDataKey = "\xff/globals/constructData"_sr;
 
 // Whenever configuration changes or DD related system keyspace is changed(e.g.., serverList),
 // actor must grab the moveKeysLockOwnerKey and update moveKeysLockWriteKey.
@@ -1259,6 +1251,9 @@ const KeyRangeRef applyLogKeys("\xff\x02/alog/"_sr, "\xff\x02/alog0"_sr);
 bool isBackupLogMutation(const MutationRef& m) {
 	return isSingleKeyMutation((MutationRef::Type)m.type) &&
 	       (backupLogKeys.contains(m.param1) || applyLogKeys.contains(m.param1));
+}
+bool isAccumulativeChecksumMutation(const MutationRef& m) {
+	return m.type == MutationRef::SetValue && m.param1 == accumulativeChecksumKey;
 }
 // static_assert( backupLogKeys.begin.size() == backupLogPrefixBytes, "backupLogPrefixBytes incorrect" );
 const KeyRef backupVersionKey = "\xff/backupDataFormat"_sr;
@@ -1338,6 +1333,26 @@ Key uidPrefixKey(KeyRef keyPrefix, UID logUid) {
 	bw.serializeBytes(keyPrefix);
 	bw << logUid;
 	return bw.toValue();
+}
+
+std::tuple<Standalone<StringRef>, uint64_t, uint64_t, uint64_t> decodeConstructKeys(ValueRef value) {
+	StringRef keyStart;
+	uint64_t valSize, keyCount, seed;
+	BinaryReader rd(value, Unversioned());
+	rd >> keyStart;
+	rd >> valSize;
+	rd >> keyCount;
+	rd >> seed;
+	return std::make_tuple(keyStart, valSize, keyCount, seed);
+}
+
+Value encodeConstructValue(StringRef keyStart, uint64_t valSize, uint64_t keyCount, uint64_t seed) {
+	BinaryWriter wr(Unversioned());
+	wr << keyStart;
+	wr << valSize;
+	wr << keyCount;
+	wr << seed;
+	return wr.toValue();
 }
 
 // Apply mutations constant variables

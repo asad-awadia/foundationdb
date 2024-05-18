@@ -328,7 +328,7 @@ JsonBuilderObject machineStatusFetcher(WorkerEvents mMetrics,
 
 		try {
 			std::string address = it->first.ip.toString();
-			// We will use the "physical" caluculated machine ID here to limit exposure to machineID repurposing
+			// We will use the "physical" calculated machine ID here to limit exposure to machineID repurposing
 			std::string machineId = event.getValue("MachineID");
 
 			// If this machine ID does not already exist in the machineMap, add it
@@ -613,6 +613,24 @@ struct RolesInfo {
 
 					obj["busiest_write_tag"] = busiestWriteTagObj;
 				}
+			}
+
+			TraceEventFields const& rocksdbMetrics = metrics.at("RocksDBMetrics");
+			if (rocksdbMetrics.size()) {
+				JsonBuilderObject rocksdbMetricsObj;
+				rocksdbMetricsObj.setKeyRawNumber("block_cache_hits", rocksdbMetrics.getValue("BlockCacheHits"));
+				rocksdbMetricsObj.setKeyRawNumber("block_cache_misses", rocksdbMetrics.getValue("BlockCacheMisses"));
+				rocksdbMetricsObj.setKeyRawNumber("pending_compaction_bytes",
+				                                  rocksdbMetrics.getValue("EstPendCompactBytes"));
+				rocksdbMetricsObj.setKeyRawNumber("memtable_bytes", rocksdbMetrics.getValue("AllMemtablesBytes"));
+				rocksdbMetricsObj.setKeyRawNumber("sst_reader_bytes",
+				                                  rocksdbMetrics.getValue("EstimateSstReaderBytes"));
+				rocksdbMetricsObj.setKeyRawNumber("block_cache_usage", rocksdbMetrics.getValue("BlockCacheUsage"));
+				rocksdbMetricsObj.setKey("block_cache_limit", SERVER_KNOBS->ROCKSDB_BLOCK_CACHE_SIZE);
+				rocksdbMetricsObj.setKeyRawNumber("throttled_commits", rocksdbMetrics.getValue("CommitDelayed"));
+				rocksdbMetricsObj.setKeyRawNumber("write_stall_microseconds", rocksdbMetrics.getValue("StallMicros"));
+
+				obj["rocksdb_metrics"] = std::move(rocksdbMetricsObj);
 			}
 
 		} catch (AttributeNotFoundError& e) {
@@ -1572,13 +1590,6 @@ ACTOR static Future<Void> logRangeWarningFetcher(Database cx,
 							break;
 						}
 						existingRanges.insert(rangePair);
-					} else {
-						// This cleanup is done during status, because it should only be required once after upgrading
-						// to 6.2.7 or later. There is no other good location to detect that the metadata is mismatched.
-						TraceEvent(SevWarnAlways, "CleaningDestUidLookup")
-						    .detail("K", it.key.printable())
-						    .detail("V", it.value.printable());
-						tr.clear(it.key);
 					}
 				}
 				wait(tr.commit() || timeoutFuture);
@@ -1983,11 +1994,8 @@ static Future<std::vector<std::pair<iface, EventMap>>> getServerMetrics(
 
 namespace {
 
-const std::vector<std::string> STORAGE_SERVER_METRICS_LIST{ "StorageMetrics",
-	                                                        "ReadLatencyMetrics",
-	                                                        "ReadLatencyBands",
-	                                                        "BusiestReadTag",
-	                                                        "BusiestWriteTag" };
+const std::vector<std::string> STORAGE_SERVER_METRICS_LIST{ "StorageMetrics", "ReadLatencyMetrics", "ReadLatencyBands",
+	                                                        "BusiestReadTag", "BusiestWriteTag",    "RocksDBMetrics" };
 
 } // namespace
 

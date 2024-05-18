@@ -195,11 +195,40 @@ public:
 		req.reply.send(std::make_pair(res, false));
 	}
 
+	// Return a threshold of team queue size which guarantees at least DD_LONG_STORAGE_QUEUE_TEAM_MAJORITY_PERCENTILE
+	// portion of teams that have longer storage queues
+	// A team storage queue size is defined as the longest storage queue size among all SSes of the team
+	static int64_t calculateTeamStorageQueueThreshold(const std::vector<Reference<TCTeamInfo>>& teams) {
+		if (teams.size() == 0) {
+			return std::numeric_limits<int64_t>::max(); // disable this funcationality
+		}
+		std::vector<int64_t> queueLengthList;
+		for (const auto& team : teams) {
+			Optional<int64_t> storageQueueSize = team->getLongestStorageQueueSize();
+			if (!storageQueueSize.present()) {
+				// This team may have an unhealthy SS, so avoid selecting it
+				queueLengthList.push_back(std::numeric_limits<int64_t>::max());
+			} else {
+				queueLengthList.push_back(storageQueueSize.get());
+			}
+		}
+		double percentile = std::max(0.0, std::min(SERVER_KNOBS->DD_LONG_STORAGE_QUEUE_TEAM_MAJORITY_PERCENTILE, 1.0));
+		int position = (queueLengthList.size() - 1) * (1 - percentile);
+		std::nth_element(queueLengthList.begin(), queueLengthList.begin() + position, queueLengthList.end());
+		int64_t threshold = queueLengthList[position];
+		TraceEvent(SevInfo, "StorageQueueAwareGotThreshold").suppressFor(5.0).detail("Threshold", threshold);
+		return threshold;
+	}
+
 	// Returns the overall best team that matches the requirement from `req`. When preferWithinShardLimit is true, it
 	// also tries to select a team whose existing shard is less than SERVER_KNOBS->DESIRED_MAX_SHARDS_PER_TEAM.
 	static Optional<Reference<IDataDistributionTeam>> getBestTeam(DDTeamCollection* self,
 	                                                              const GetTeamRequest& req,
-	                                                              bool preferWithinShardLimit) {
+	                                                              bool preferWithinShardLimit,
+	                                                              int& numSkippedSSFailedGetQueueLength,
+	                                                              int& numSkippedSSQueueTooLong,
+	                                                              Optional<int64_t> storageQueueThreshold) {
+		ASSERT(!req.storageQueueAware || storageQueueThreshold.present());
 		auto& startIndex = req.preferLowerDiskUtil ? self->lowestUtilizationTeam : self->highestUtilizationTeam;
 		if (startIndex >= self->teams.size()) {
 			startIndex = 0;
@@ -218,6 +247,17 @@ public:
 				}
 
 				int64_t loadBytes = self->teams[currentIndex]->getLoadBytes(true, req.inflightPenalty);
+				if (req.storageQueueAware) {
+					Optional<int64_t> storageQueueSize = self->teams[currentIndex]->getLongestStorageQueueSize();
+					if (!storageQueueSize.present()) {
+						numSkippedSSFailedGetQueueLength++;
+						continue; // this team may have an unhealthy SS, skip
+					} else if (storageQueueSize.get() > storageQueueThreshold.get()) {
+						numSkippedSSQueueTooLong++;
+						continue; // this team has a SS with a too long storage queue, skip
+					}
+				}
+
 				auto team = ShardsAffectedByTeamFailure::Team(self->teams[currentIndex]->getServerIDs(), self->primary);
 				if ((!req.teamMustHaveShards || self->shardsAffectedByTeamFailure->hasShards(team)) &&
 				    // sort conditions
@@ -250,11 +290,14 @@ public:
 
 	// Returns the best team from `candidates` that matches the requirement from `req`. When preferWithinShardLimit is
 	// true, it also tries to select a team whose existing team is less than SERVER_KNOBS->DESIRED_MAX_SHARDS_PER_TEAM.
+	// Do not check storage queue size since getTeam has checked the size when selecting the input candidates
 	static Optional<Reference<IDataDistributionTeam>> getBestTeamFromCandidates(
 	    DDTeamCollection* self,
 	    const GetTeamRequest& req,
 	    const std::vector<Reference<TCTeamInfo>>& candidates,
-	    bool preferWithinShardLimit) {
+	    bool preferWithinShardLimit,
+	    int& numSkippedSSFailedGetQueueLength,
+	    int& numSkippedSSQueueTooLong) {
 		Optional<Reference<IDataDistributionTeam>> bestOption;
 		int64_t bestLoadBytes = 0;
 		bool wigglingBestOption = false; // best option contains server in paused wiggle state
@@ -327,6 +370,8 @@ public:
 			}
 
 			Optional<Reference<IDataDistributionTeam>> bestOption;
+			state int numSkippedSSFailedGetQueueLength = 0;
+			state int numSkippedSSQueueTooLong = 0;
 
 			if (ddLargeTeamEnabled() && req.keys.present()) {
 				int customReplicas = self->configuration.storageTeamSize;
@@ -383,17 +428,31 @@ public:
 				}
 			}
 
+			Optional<int64_t> storageQueueThreshold;
+			if (req.storageQueueAware) {
+				storageQueueThreshold = calculateTeamStorageQueueThreshold(self->teams);
+			}
 			if (req.teamSelect == TeamSelect::WANT_TRUE_BEST) {
 				ASSERT(!bestOption.present());
 				if (SERVER_KNOBS->ENFORCE_SHARD_COUNT_PER_TEAM && req.preferWithinShardLimit) {
-					bestOption = getBestTeam(self, req, /*preferWithinShardLimit=*/true);
+					bestOption = getBestTeam(self,
+					                         req,
+					                         /*preferWithinShardLimit=*/true,
+					                         numSkippedSSFailedGetQueueLength,
+					                         numSkippedSSQueueTooLong,
+					                         storageQueueThreshold);
 					if (!bestOption.present()) {
 						// In case, we may return a team whose shard count is more than DESIRED_MAX_SHARDS_PER_TEAM.
 						TraceEvent("GetBestTeamPreferWithinShardLimitFailed").log();
 					}
 				}
 				if (!bestOption.present()) {
-					bestOption = getBestTeam(self, req, /*preferWithinShardLimit=*/false);
+					bestOption = getBestTeam(self,
+					                         req,
+					                         /*preferWithinShardLimit=*/false,
+					                         numSkippedSSFailedGetQueueLength,
+					                         numSkippedSSQueueTooLong,
+					                         storageQueueThreshold);
 				}
 			} else {
 				ASSERT(!bestOption.present());
@@ -423,6 +482,17 @@ public:
 					            self->shardsAffectedByTeamFailure->hasShards(
 					                ShardsAffectedByTeamFailure::Team(dest->getServerIDs(), self->primary)));
 
+					if (req.storageQueueAware) {
+						Optional<int64_t> storageQueueSize = dest->getLongestStorageQueueSize();
+						if (!storageQueueSize.present()) {
+							numSkippedSSFailedGetQueueLength++;
+							ok = false; // this team may have an unhealthy SS, skip
+						} else if (storageQueueSize.get() > storageQueueThreshold.get()) {
+							numSkippedSSQueueTooLong++;
+							ok = false; // this team has a SS with a too long storage queue, skip
+						}
+					}
+
 					if (ok)
 						randomTeams.push_back(dest);
 					else
@@ -438,7 +508,12 @@ public:
 
 				if (!randomTeams.empty()) {
 					if (SERVER_KNOBS->ENFORCE_SHARD_COUNT_PER_TEAM && req.preferWithinShardLimit) {
-						bestOption = getBestTeamFromCandidates(self, req, randomTeams, /*preferWithinShardLimit=*/true);
+						bestOption = getBestTeamFromCandidates(self,
+						                                       req,
+						                                       randomTeams,
+						                                       /*preferWithinShardLimit=*/true,
+						                                       numSkippedSSFailedGetQueueLength,
+						                                       numSkippedSSQueueTooLong);
 						if (!bestOption.present()) {
 							// In case, we may return a team whose shard count is more than DESIRED_MAX_SHARDS_PER_TEAM.
 							TraceEvent("GetBestTeamFromCandidatesPreferWithinShardLimitFailed").log();
@@ -446,8 +521,12 @@ public:
 					}
 
 					if (!bestOption.present()) {
-						bestOption =
-						    getBestTeamFromCandidates(self, req, randomTeams, /*preferWithinShardLimit=*/false);
+						bestOption = getBestTeamFromCandidates(self,
+						                                       req,
+						                                       randomTeams,
+						                                       /*preferWithinShardLimit=*/false,
+						                                       numSkippedSSFailedGetQueueLength,
+						                                       numSkippedSSQueueTooLong);
 					}
 				}
 			}
@@ -468,14 +547,25 @@ public:
 				    .detail("Request", req.getDesc())
 				    .detail("HealthyTeams", self->healthyTeamCount)
 				    .detail("PivotCPU", self->teamPivots.pivotCPU)
-				    .detail("PivotDiskSpace", self->teamPivots.pivotAvailableSpaceRatio);
+				    .detail("PivotDiskSpace", self->teamPivots.pivotAvailableSpaceRatio)
+				    .detail("StorageQueueAware", req.storageQueueAware)
+				    .detail("NumSkippedSSFailedGetQueueLength", numSkippedSSFailedGetQueueLength)
+				    .detail("NumSkippedSSQueueTooLong", numSkippedSSQueueTooLong);
 				// self->traceAllInfo(true);
 			}
 
-			req.reply.send(std::make_pair(bestOption, foundSrc));
+			if (req.storageQueueAware && !bestOption.present()) {
+				req.storageQueueAware = false;
+				TraceEvent(SevWarn, "StorageQueueAwareGetTeamFailed", self->distributorId)
+				    .detail("Reason", "bestOption not present");
+				wait(getTeam(self, req)); // re-run getTeam without storageQueueAware
+			} else {
+				req.reply.send(std::make_pair(bestOption, foundSrc));
+			}
+
 			return Void();
 		} catch (Error& e) {
-			if (e.code() != error_code_actor_cancelled)
+			if (e.code() != error_code_actor_cancelled && req.reply.canBeSet())
 				req.reply.sendError(e);
 			throw;
 		}
@@ -642,8 +732,6 @@ public:
 		    .detail("Primary", self->primary)
 		    .detail("StorageTeamSize", self->configuration.storageTeamSize);
 
-		// If there are too few machines to even build teams or there are too few represented datacenters, can't build
-		// any team.
 		if (uniqueMachines >= self->configuration.storageTeamSize) {
 			desiredTeams = SERVER_KNOBS->DESIRED_TEAMS_PER_SERVER * serverCount;
 			int maxTeams = SERVER_KNOBS->MAX_TEAMS_PER_SERVER * serverCount;
@@ -742,6 +830,8 @@ public:
 				    .trackLatest(self->teamCollectionInfoEventHolder->trackingKey);
 			}
 		} else {
+			// If there are too few machines to even build teams or there are too few represented datacenters, can't
+			// build any team.
 			self->lastBuildTeamsFailed = true;
 			TraceEvent(SevWarnAlways, "BuildTeamsNotEnoughUniqueMachines", self->distributorId)
 			    .detail("Primary", self->primary)
@@ -801,12 +891,14 @@ public:
 				bool anyUndesired = false;
 				bool anyWrongConfiguration = false;
 				bool anyWigglingServer = false;
+				const bool ignoreSSFailures = !badTeam && self->healthyZone.get().present() &&
+				                              (self->healthyZone.get().get() == ignoreSSFailuresZoneString);
 				int serversLeft = 0, serverUndesired = 0, serverWrongConf = 0, serverWiggling = 0;
 
 				for (const UID& uid : team->getServerIDs()) {
 					change.push_back(self->server_status.onChange(uid));
 					auto& status = self->server_status.get(uid);
-					if (!status.isFailed) {
+					if (!status.isFailed || ignoreSSFailures) {
 						serversLeft++;
 					}
 					if (status.isUndesired) {
@@ -828,8 +920,7 @@ public:
 				}
 
 				// Failed server should not trigger DD if SS failures are set to be ignored
-				if (!badTeam && self->healthyZone.get().present() &&
-				    (self->healthyZone.get().get() == ignoreSSFailuresZoneString)) {
+				if (ignoreSSFailures) {
 					ASSERT_WE_THINK(serversLeft == team->size());
 				}
 
@@ -1488,6 +1579,28 @@ public:
 					when(wait(storageMetadataTracker)) {}
 					when(wait(server->ssVersionTooFarBehind.onChange())) {}
 					when(wait(self->disableFailingLaggingServers.onChange())) {}
+					when(wait(server->longStorageQueue.onChange())) {
+						int64_t threshold = calculateTeamStorageQueueThreshold(self->teams);
+						// threshold represents the queue length of majority teams
+						// team queue length is defined as the max queue size among all SSes of the team
+						if (server->longStorageQueue.get() < threshold) {
+							TraceEvent(SevInfo, "TriggerStorageQueueRebalanceIgnored", self->distributorId)
+							    .detail("SSID", server->getId());
+						} else {
+							TraceEvent(SevInfo, "TriggerStorageQueueRebalance", self->distributorId)
+							    .detail("SSID", server->getId());
+							std::vector<ShardsAffectedByTeamFailure::Team> teams;
+							for (const auto& team : server->getTeams()) {
+								std::vector<UID> servers;
+								for (const auto& server : team->getServers()) {
+									servers.push_back(server->getId());
+								}
+								teams.push_back(ShardsAffectedByTeamFailure::Team(servers, self->primary));
+							}
+							self->triggerStorageQueueRebalance.send(
+							    RebalanceStorageQueueRequest(server->getId(), teams, self->primary));
+						}
+					}
 				}
 
 				if (recordTeamCollectionInfo) {
@@ -1527,7 +1640,8 @@ public:
 			for (auto& server : self->server_info) {
 				// If this server isn't the right storage type and its wrong-type trigger has not yet been set
 				// then set it if we're in aggressive mode and log its presence either way.
-				if (!server.second->isCorrectStoreType(self->configuration.storageServerStoreType) &&
+				if (!(server.second->isCorrectStoreType(self->configuration.storageServerStoreType) ||
+				      server.second->isCorrectStoreType(self->configuration.perpetualStoreType)) &&
 				    !server.second->wrongStoreTypeToRemove.get()) {
 					// Server may be removed due to failure while the wrongStoreTypeToRemove is sent to the
 					// storageServerTracker. This race may cause the server to be removed before react to
@@ -1710,16 +1824,17 @@ public:
 							    .detail("ServerID", interf.id())
 							    .detail("Status", status->toString());
 							status->isFailed = false;
-						} else if (self->clearHealthyZoneFuture.isReady()) {
+						} else if (SERVER_KNOBS->DD_REMOVE_MAINTENANCE_ON_FAILURE &&
+						           self->clearHealthyZoneFuture.isReady()) {
 							self->clearHealthyZoneFuture = clearHealthyZone(self->dbContext());
 							TraceEvent("MaintenanceZoneCleared", self->distributorId).log();
 							self->healthyZone.set(Optional<Key>());
 						}
 					}
 					if (!status->isUnhealthy()) {
-						// On server transistion from unhealthy -> healthy, trigger buildTeam check,
+						// On server transition from unhealthy -> healthy, trigger buildTeam check,
 						// handles scenario when team building failed due to insufficient healthy servers.
-						// Operaton cost is minimal if currentTeamCount == desiredTeamCount/maxTeamCount.
+						// Operation cost is minimal if currentTeamCount == desiredTeamCount/maxTeamCount.
 						self->doBuildTeams = true;
 					}
 
@@ -1892,7 +2007,8 @@ public:
 			// Pick the server team whose members are on the most number of server teams, and mark it undesired
 			std::pair<Reference<TCTeamInfo>, int> foundSTInfo = self->getServerTeamWithMostProcessTeams();
 
-			if (totalSTCount > desiredServerTeams && foundSTInfo.first.isValid()) {
+			if (totalSTCount > desiredServerTeams * (1 + SERVER_KNOBS->TR_REDUNDANT_TEAM_PERCENTAGE_THRESHOLD) &&
+			    foundSTInfo.first.isValid()) {
 				ASSERT(foundSTInfo.first.isValid());
 				Reference<TCTeamInfo> st = foundSTInfo.first;
 				int maxNumProcessTeams = foundSTInfo.second;
@@ -1914,8 +2030,9 @@ public:
 				    .detail("ServerTeamToRemove", st->getServerIDsStr())
 				    .detail("ServerTeamID", st->getTeamID())
 				    .detail("NumProcessTeamsOnTheServerTeam", maxNumProcessTeams)
-				    .detail("CurrentServerTeams", self->teams.size())
-				    .detail("DesiredServerTeams", desiredServerTeams);
+				    .detail("CurrentServerTeams", totalSTCount)
+				    .detail("DesiredServerTeams", desiredServerTeams)
+				    .detail("Primary", self->primary);
 
 				numServerTeamRemoved++;
 			} else {
@@ -1924,7 +2041,8 @@ public:
 					TraceEvent("ServerTeamRemoverDone", self->distributorId)
 					    .detail("CurrentServerTeams", self->teams.size())
 					    .detail("DesiredServerTeams", desiredServerTeams)
-					    .detail("NumServerTeamRemoved", numServerTeamRemoved);
+					    .detail("NumServerTeamRemoved", numServerTeamRemoved)
+					    .detail("Primary", self->primary);
 					self->traceTeamCollectionInfo();
 					numServerTeamRemoved = 0; // Reset the counter to avoid keep printing the message
 				}
@@ -2050,8 +2168,8 @@ public:
 				// wiggle will start the next wiggle.
 				// The wiggle waits until the numSSToBeLoadBytesBalanced to be less than
 				// PW_MAX_SS_LESSTHAN_MIN_BYTES_BALANCE_RATIO before starting the next wiggle. With this we can have
-				// mutiple SS that are in balancing state. Used to speed up wiggling rather than waiting for every SS to
-				// get balanced/filledup before starting the next wiggle.
+				// multiple SS that are in balancing state. Used to speed up wiggling rather than waiting for every
+				// SS to get balanced/filledup before starting the next wiggle.
 				numSSToBeLoadBytesBalanced =
 				    self->numSSToBeLoadBytesBalanced(avgBytes * SERVER_KNOBS->PERPETUAL_WIGGLE_SMALL_LOAD_RATIO);
 				imbalance = numSSToBeLoadBytesBalanced > SERVER_KNOBS->PW_MAX_SS_LESSTHAN_MIN_BYTES_BALANCE_RATIO;
@@ -2071,6 +2189,7 @@ public:
 				if (self->configuration.storageMigrationType == StorageMigrationType::GRADUAL) {
 					TraceEvent(SevWarn, "PerpetualStorageWiggleSleep", self->distributorId)
 					    .suppressFor(SERVER_KNOBS->PERPETUAL_WIGGLE_DELAY * 4)
+					    .detail("Primary", self->primary)
 					    .detail("ImbalanceFactor",
 					            SERVER_KNOBS->PW_MAX_SS_LESSTHAN_MIN_BYTES_BALANCE_RATIO ? numSSToBeLoadBytesBalanced
 					                                                                     : ratio)
@@ -2305,9 +2424,10 @@ public:
 				if (val.present()) {
 					auto p = decodeHealthyZoneValue(val.get());
 					if (p.first == ignoreSSFailuresZoneString) {
-						// healthyZone is now overloaded for DD diabling purpose, which does not timeout
+						// healthyZone is now overloaded for DD disabling purpose, which does not timeout
 						TraceEvent("DataDistributionDisabledForStorageServerFailuresStart", self->distributorId).log();
 						healthyZoneTimeout = Never();
+						self->healthyZone.set(p.first);
 					} else if (p.second > tr.getReadVersion().get()) {
 						double timeoutSeconds =
 						    (p.second - tr.getReadVersion().get()) / (double)SERVER_KNOBS->VERSIONS_PER_SECOND;
@@ -2805,6 +2925,7 @@ public:
 							           "tss recruitment cancelled due zero healthy teams");
 
 							TraceEvent(SevWarn, "TSS_RecruitCancelled", self->distributorId)
+							    .detail("Primary", self->primary)
 							    .detail("Reason", tssToRecruit <= 0 ? "TooMany" : "ZeroHealthyTeams");
 							tssState->cancel();
 							tssState = makeReference<TSSPairState>();
@@ -2824,6 +2945,7 @@ public:
 										CODE_PROBE(tssToRecruit < 0, "Killing TSS due to too many TSS");
 										CODE_PROBE(self->zeroHealthyTeams->get(), "Killing TSS due zero healthy teams");
 										TraceEvent(SevWarn, "TSS_DDKill", self->distributorId)
+										    .detail("Primary", self->primary)
 										    .detail("TSSID", tssId)
 										    .detail("Reason",
 										            self->zeroHealthyTeams->get() ? "ZeroHealthyTeams" : "TooMany");
@@ -3004,6 +3126,7 @@ public:
 				if (wiggler->empty()) {
 					// None of the entries in wiggle queue matches the given locality.
 					TraceEvent("PerpetualStorageWiggleEmptyQueue", teamCollection->distributorId)
+					    .detail("Primary", teamCollection->primary)
 					    .detail("WriteValue", "No process matched the given perpetualStorageWiggleLocality")
 					    .detail("PerpetualStorageWiggleLocality",
 					            teamCollection->configuration.perpetualStorageWiggleLocality);
@@ -3072,8 +3195,10 @@ public:
 		state StorageMetadataType data(
 		    StorageMetadataType::currentTime(),
 		    server->getStoreType(),
-		    !server->isCorrectStoreType(isTss ? self->configuration.testingStorageServerStoreType
-		                                      : self->configuration.storageServerStoreType));
+		    !(server->isCorrectStoreType(isTss ? self->configuration.testingStorageServerStoreType
+		                                       : self->configuration.storageServerStoreType) ||
+		      server->isCorrectStoreType(isTss ? self->configuration.testingStorageServerStoreType
+		                                       : self->configuration.perpetualStoreType)));
 
 		// read storage metadata
 		loop {
@@ -3109,7 +3234,8 @@ public:
 
 		// wrong store type handler
 		if (!isTss) {
-			if (!server->isCorrectStoreType(self->configuration.storageServerStoreType) &&
+			if (!(server->isCorrectStoreType(self->configuration.storageServerStoreType) ||
+			      server->isCorrectStoreType(self->configuration.perpetualStoreType)) &&
 			    self->wrongStoreTypeRemover.isReady()) {
 				self->wrongStoreTypeRemover = removeWrongStoreType(self);
 				self->addActor.send(self->wrongStoreTypeRemover);
@@ -4105,7 +4231,7 @@ DDTeamCollection::DDTeamCollection(DDTeamCollectionInitParams const& params)
     zeroHealthyTeams(params.zeroHealthyTeams), optimalTeamCount(0), zeroOptimalTeams(true), isTssRecruiting(false),
     includedDCs(params.includedDCs), otherTrackedDCs(params.otherTrackedDCs),
     processingUnhealthy(params.processingUnhealthy), getAverageShardBytes(params.getAverageShardBytes),
-    readyToStart(params.readyToStart),
+    triggerStorageQueueRebalance(params.triggerStorageQueueRebalance), readyToStart(params.readyToStart),
     checkTeamDelay(delay(SERVER_KNOBS->CHECK_TEAM_DELAY, TaskPriority::DataDistribution)), badTeamRemover(Void()),
     checkInvalidLocalities(Void()), wrongStoreTypeRemover(Void()), clearHealthyZoneFuture(true),
     lowestUtilizationTeam(0), highestUtilizationTeam(0), getShardMetrics(params.getShardMetrics),
@@ -4223,7 +4349,7 @@ std::vector<UID> DDTeamCollection::getRandomHealthyTeam(const UID& excludeServer
 		return teams[candidates[deterministicRandom()->randomInt(0, candidates.size())]]->getServerIDs();
 	} else if (backup.size() > 0) {
 		// The backup choice is a team with at least one server besides excludeServer, in this
-		// case, the team  will be possibily relocated to a healthy destination later by DD.
+		// case, the team will be possibly relocated to a healthy destination later by DD.
 		std::vector<UID> servers = teams[backup[deterministicRandom()->randomInt(0, backup.size())]]->getServerIDs();
 		std::vector<UID> res;
 		for (const UID& id : servers) {
@@ -4831,6 +4957,7 @@ int DDTeamCollection::addBestMachineTeams(int machineTeamsToBuild) {
 				LocalityEntry process = tcMachineInfo->localityEntry;
 				forcedAttributes.push_back(process);
 				TraceEvent("ChosenMachine")
+				    .suppressFor(30.0)
 				    .detail("MachineInfo", tcMachineInfo->machineID)
 				    .detail("LeaseUsedMachinesSize", leastUsedMachines.size())
 				    .detail("ForcedAttributesSize", forcedAttributes.size());
@@ -5881,7 +6008,8 @@ public:
 		                                                     PromiseStream<GetMetricsRequest>(),
 		                                                     Promise<UID>(),
 		                                                     PromiseStream<Promise<int>>(),
-		                                                     PromiseStream<Promise<int64_t>>() }));
+		                                                     PromiseStream<Promise<int64_t>>(),
+		                                                     PromiseStream<RebalanceStorageQueueRequest>() }));
 
 		for (int id = 1; id <= processCount; ++id) {
 			UID uid(id, 0);
@@ -5934,7 +6062,8 @@ public:
 		                                                     PromiseStream<GetMetricsRequest>(),
 		                                                     Promise<UID>(),
 		                                                     PromiseStream<Promise<int>>(),
-		                                                     PromiseStream<Promise<int64_t>>() }));
+		                                                     PromiseStream<Promise<int64_t>>(),
+		                                                     PromiseStream<RebalanceStorageQueueRequest>() }));
 
 		for (int id = 1; id <= processCount; id++) {
 			UID uid(id, 0);
@@ -6089,7 +6218,7 @@ public:
 
 		// NOTE: Due to the pure randomness in selecting a machine for a machine team,
 		// we cannot guarantee that all machine teams are created.
-		// When we chnage the selectReplicas function to achieve such guarantee, we can enable the following ASSERT
+		// When we change the selectReplicas function to achieve such guarantee, we can enable the following ASSERT
 		ASSERT(collection->machineTeams.size() == 10); // Should create all machine teams
 
 		// We need to guarantee a server always have at least a team so that the server can participate in data

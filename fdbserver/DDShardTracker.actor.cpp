@@ -127,6 +127,12 @@ int64_t getMaxShardSize(double dbSizeEstimate) {
 		size = std::max(size, static_cast<int64_t>(SERVER_KNOBS->MAX_LARGE_SHARD_BYTES));
 	}
 
+	TraceEvent("MaxShardSize")
+	    .suppressFor(60.0)
+	    .detail("Bytes", size)
+	    .detail("EstimatedDbSize", dbSizeEstimate)
+	    .detail("SqrtBytes", SERVER_KNOBS->SHARD_BYTES_PER_SQRT_BYTES)
+	    .detail("AllowLargeShard", SERVER_KNOBS->ALLOW_LARGE_SHARD);
 	return size;
 }
 
@@ -933,9 +939,6 @@ Future<Void> shardMerger(DataDistributionTracker* self,
 	const UID actionId = deterministicRandom()->randomUniqueID();
 	const Severity stSev = static_cast<Severity>(SERVER_KNOBS->DD_SHARD_TRACKING_LOG_SEVERITY);
 	int64_t maxShardSize = self->maxShardSize->get().get();
-	if (SERVER_KNOBS->ALLOW_LARGE_SHARD) {
-		maxShardSize = SERVER_KNOBS->MAX_LARGE_SHARD_BYTES;
-	}
 
 	auto prevIter = self->shards->rangeContaining(keys.begin);
 	auto nextIter = self->shards->rangeContaining(keys.begin);
@@ -1080,7 +1083,7 @@ Future<Void> shardMerger(DataDistributionTracker* self,
 		return brokenPromiseToReady(nextIter->value().stats->onChange());
 	}
 
-	// restarting shard tracker will derefenced values in the shard map, so make a copy
+	// restarting shard tracker will dereference values in the shard map, so make a copy
 	KeyRange mergeRange = merged;
 
 	// OldKeys: Shards in the key range are merged as one shard defined by NewKeys;
@@ -1119,15 +1122,11 @@ ACTOR Future<Void> shardEvaluator(DataDistributionTracker* self,
 	Future<Void> onChange = shardSize->onChange() || yieldedFuture(self->maxShardSize->onChange());
 
 	// There are the bounds inside of which we are happy with the shard size.
-	// getShardSizeBounds() will allways have shardBounds.min.bytes == 0 for shards that start at allKeys.begin,
+	// getShardSizeBounds() will always have shardBounds.min.bytes == 0 for shards that start at allKeys.begin,
 	//  so will will never attempt to merge that shard with the one previous.
 	ShardSizeBounds shardBounds = getShardSizeBounds(keys, self->maxShardSize->get().get());
 	StorageMetrics const& stats = shardSize->get().get().metrics;
 	auto bandwidthStatus = getBandwidthStatus(stats);
-
-	if (SERVER_KNOBS->ALLOW_LARGE_SHARD) {
-		shardBounds.max.bytes = SERVER_KNOBS->MAX_LARGE_SHARD_BYTES;
-	}
 
 	bool sizeSplit = stats.bytes > shardBounds.max.bytes,
 	     writeSplit = bandwidthStatus == BandwidthStatusHigh && keys.begin < keyServersKeys.begin;
@@ -1231,7 +1230,7 @@ void restartShardTrackers(DataDistributionTracker* self,
 	auto ranges = self->shards->getAffectedRangesAfterInsertion(keys, ShardTrackedData());
 	for (int i = 0; i < ranges.size(); i++) {
 		if (!ranges[i].value.trackShard.isValid() && ranges[i].begin != keys.begin) {
-			// When starting, key space will be full of "dummy" default contructed entries.
+			// When starting, key space will be full of "dummy" default constructed entries.
 			// This should happen when called from trackInitialShards()
 			ASSERT(!self->readyToStart.isSet());
 			continue;
@@ -1470,6 +1469,44 @@ ACTOR Future<Void> fetchShardMetricsList(DataDistributionTracker* self, GetMetri
 	return Void();
 }
 
+void triggerStorageQueueRebalance(DataDistributionTracker* self, RebalanceStorageQueueRequest req) {
+	TraceEvent e("TriggerDataMoveStorageQueueRebalance", self->distributorId);
+	e.detail("Server", req.serverId);
+	e.detail("Teams", req.teams.size());
+	int64_t maxShardWriteTraffic = 0;
+	KeyRange shardToMove;
+	ShardsAffectedByTeamFailure::Team selectedTeam;
+	for (const auto& team : req.teams) {
+		for (auto const& shard : self->shardsAffectedByTeamFailure->getShardsFor(team)) {
+			for (auto it : self->shards->intersectingRanges(shard)) {
+				if (it->value().stats->get().present()) {
+					int64_t shardWriteTraffic = it->value().stats->get().get().metrics.bytesWrittenPerKSecond;
+					if (shardWriteTraffic > maxShardWriteTraffic &&
+					    (SERVER_KNOBS->DD_ENABLE_REBALANCE_STORAGE_QUEUE_WITH_LIGHT_WRITE_SHARD ||
+					     shardWriteTraffic > SERVER_KNOBS->REBALANCE_STORAGE_QUEUE_SHARD_PER_KSEC_MIN)) {
+						shardToMove = it->range();
+						maxShardWriteTraffic = shardWriteTraffic;
+					}
+				}
+			}
+		}
+	}
+	if (!shardToMove.empty()) {
+		e.detail("TeamSelected", selectedTeam.servers);
+		e.detail("ShardSelected", shardToMove);
+		e.detail("ShardWriteBytesPerKSec", maxShardWriteTraffic);
+		RelocateShard rs(shardToMove, DataMovementReason::REBALANCE_STORAGE_QUEUE, RelocateReason::REBALANCE_WRITE);
+		self->output.send(rs);
+		TraceEvent("SendRelocateToDDQueue", self->distributorId)
+		    .detail("ServerPrimary", req.primary)
+		    .detail("ServerTeam", selectedTeam.servers)
+		    .detail("KeyBegin", rs.keys.begin)
+		    .detail("KeyEnd", rs.keys.end)
+		    .detail("Priority", rs.priority);
+	}
+	return;
+}
+
 DataDistributionTracker::DataDistributionTracker(DataDistributionTrackerInitParams const& params)
   : IDDShardTracker(), db(params.db), distributorId(params.distributorId), shards(params.shards), actors(false),
     systemSizeEstimate(0), dbSizeEstimate(new AsyncVar<int64_t>()), maxShardSize(new AsyncVar<Optional<int64_t>>()),
@@ -1524,6 +1561,9 @@ struct DataDistributionTrackerImpl {
 				when(GetMetricsListRequest req = waitNext(self->getShardMetricsList)) {
 					self->actors.add(fetchShardMetricsList(self, req));
 				}
+				when(RebalanceStorageQueueRequest req = waitNext(self->triggerStorageQueueRebalance)) {
+					triggerStorageQueueRebalance(self, req);
+				}
 				when(wait(self->actors.getResult())) {}
 				when(TenantCacheTenantCreated newTenant = waitNext(tenantCreationSignal.getFuture())) {
 					self->actors.add(tenantCreationHandling(self, newTenant));
@@ -1539,16 +1579,19 @@ struct DataDistributionTrackerImpl {
 	}
 };
 
-Future<Void> DataDistributionTracker::run(Reference<DataDistributionTracker> self,
-                                          const Reference<InitialDataDistribution>& initData,
-                                          const FutureStream<GetMetricsRequest>& getShardMetrics,
-                                          const FutureStream<GetTopKMetricsRequest>& getTopKMetrics,
-                                          const FutureStream<GetMetricsListRequest>& getShardMetricsList,
-                                          const FutureStream<Promise<int64_t>>& getAverageShardBytes) {
+Future<Void> DataDistributionTracker::run(
+    Reference<DataDistributionTracker> self,
+    const Reference<InitialDataDistribution>& initData,
+    const FutureStream<GetMetricsRequest>& getShardMetrics,
+    const FutureStream<GetTopKMetricsRequest>& getTopKMetrics,
+    const FutureStream<GetMetricsListRequest>& getShardMetricsList,
+    const FutureStream<Promise<int64_t>>& getAverageShardBytes,
+    const FutureStream<RebalanceStorageQueueRequest>& triggerStorageQueueRebalance) {
 	self->getShardMetrics = getShardMetrics;
 	self->getTopKMetrics = getTopKMetrics;
 	self->getShardMetricsList = getShardMetricsList;
 	self->averageShardBytes = getAverageShardBytes;
+	self->triggerStorageQueueRebalance = triggerStorageQueueRebalance;
 	self->userRangeConfig = initData->userRangeConfig;
 	return holdWhile(self, DataDistributionTrackerImpl::run(self.getPtr(), initData));
 }
@@ -1718,7 +1761,7 @@ void PhysicalShardCollection::updatekeyRangePhysicalShardIDMap(KeyRange keyRange
 	auto ranges = keyRangePhysicalShardIDMap.intersectingRanges(keyRange);
 	std::set<uint64_t> physicalShardIDSet;
 
-	// If there are any existing physical shards own `keyRange`, remove the overlaping ranges from existing physical
+	// If there are any existing physical shards own `keyRange`, remove the overlapping ranges from existing physical
 	// shards.
 	for (auto it = ranges.begin(); it != ranges.end(); ++it) {
 		uint64_t shardID = it->value();

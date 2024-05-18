@@ -24,8 +24,9 @@
 
 // Functions and constants documenting the organization of the reserved keyspace in the database beginning with "\xFF"
 
+#include "fdbclient/AccumulativeChecksum.h"
 #include "fdbclient/FDBTypes.h"
-#include "fdbclient/BlobWorkerInterface.h" // TODO move the functions that depend on this out of here and into BlobWorkerInterface.h to remove this depdendency
+#include "fdbclient/BlobWorkerInterface.h" // TODO move the functions that depend on this out of here and into BlobWorkerInterface.h to remove this dependency
 #include "fdbclient/StorageServerInterface.h"
 #include "fdbclient/Tenant.h"
 
@@ -65,9 +66,10 @@ enum class DataMovementReason : uint8_t {
 	TEAM_0_LEFT = 16,
 	SPLIT_SHARD = 17,
 	ENFORCE_MOVE_OUT_OF_PHYSICAL_SHARD = 18,
-	ASSIGN_EMPTY_RANGE = 19, // dummy reason, no corresponding data move priority
-	SEED_SHARD_SERVER = 20, // dummy reason, no corresponding data move priority
-	NUMBER_OF_REASONS = 21, // dummy reason, no corresponding data move priority
+	REBALANCE_STORAGE_QUEUE = 19,
+	ASSIGN_EMPTY_RANGE = 20, // dummy reason, no corresponding data move priority
+	SEED_SHARD_SERVER = 21, // dummy reason, no corresponding data move priority
+	NUMBER_OF_REASONS = 22, // dummy reason, no corresponding data move priority
 };
 
 // SystemKey is just a Key but with a special type so that instances of it can be found easily throughput the code base
@@ -131,6 +133,10 @@ void decodeKeyServersValue(RangeResult result,
                            UID& destID,
                            bool missingIsError = true);
 bool isSystemKey(KeyRef key);
+
+extern const KeyRef accumulativeChecksumKey;
+const Value accumulativeChecksumValue(const AccumulativeChecksumState& acsState);
+AccumulativeChecksumState decodeAccumulativeChecksum(const ValueRef& value);
 
 extern const KeyRangeRef auditKeys;
 extern const KeyRef auditPrefix;
@@ -505,6 +511,7 @@ extern const KeyRef primaryLocalityKey;
 extern const KeyRef primaryLocalityPrivateKey;
 extern const KeyRef fastLoggingEnabled;
 extern const KeyRef fastLoggingEnabledPrivateKey;
+extern const KeyRef constructDataKey;
 
 extern const KeyRef moveKeysLockOwnerKey, moveKeysLockWriteKey;
 
@@ -543,6 +550,9 @@ Key logRangesEncodeValue(KeyRef keyEnd, KeyRef destPath);
 // Returns a key prefixed with the specified key with
 // the given uid encoded at the end
 Key uidPrefixKey(KeyRef keyPrefix, UID logUid);
+
+extern std::tuple<Standalone<StringRef>, uint64_t, uint64_t, uint64_t> decodeConstructKeys(ValueRef value);
+extern Value encodeConstructValue(StringRef keyStart, uint64_t valSize, uint64_t keyCount, uint64_t seed);
 
 /// Apply mutations constant variables
 
@@ -607,6 +617,9 @@ extern const KeyRangeRef backupLogKeys;
 extern const KeyRangeRef applyLogKeys;
 // Returns true if m is a blog (backup log) or alog (apply log) mutation
 bool isBackupLogMutation(const MutationRef& m);
+
+// Returns true if m is an acs mutation: a mutation carrying accumulative checksum value
+bool isAccumulativeChecksumMutation(const MutationRef& m);
 
 extern const KeyRef backupVersionKey;
 extern const ValueRef backupVersionValue;
