@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2022 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -273,18 +273,18 @@ MasterData::MasterData(Reference<AsyncVar<ServerDBInfo> const> const& dbInfo,
 	locality = tagLocalityInvalid;
 
 	if (SERVER_KNOBS->ENABLE_VERSION_VECTOR) {
-		versionVectorTagUpdates = new LatencySample("VersionVectorTagUpdates",
-		                                            dbgid,
-		                                            SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                                            SERVER_KNOBS->LATENCY_SKETCH_ACCURACY);
-		versionVectorSizeOnCVReply = new LatencySample("VersionVectorSizeOnCVReply",
-		                                               dbgid,
-		                                               SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                                               SERVER_KNOBS->LATENCY_SKETCH_ACCURACY);
-		waitForPrevLatencies = new LatencySample("WaitForPrevLatencies",
-		                                         dbgid,
-		                                         SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                                         SERVER_KNOBS->LATENCY_SKETCH_ACCURACY);
+		versionVectorTagUpdates = std::make_unique<LatencySample>("VersionVectorTagUpdates",
+		                                                          dbgid,
+		                                                          SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                          SERVER_KNOBS->LATENCY_SKETCH_ACCURACY);
+		versionVectorSizeOnCVReply = std::make_unique<LatencySample>("VersionVectorSizeOnCVReply",
+		                                                             dbgid,
+		                                                             SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                             SERVER_KNOBS->LATENCY_SKETCH_ACCURACY);
+		waitForPrevLatencies = std::make_unique<LatencySample>("WaitForPrevLatencies",
+		                                                       dbgid,
+		                                                       SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                       SERVER_KNOBS->LATENCY_SKETCH_ACCURACY);
 	}
 
 #ifdef WITH_SWIFT
@@ -611,7 +611,7 @@ ACTOR Future<Void> masterServerCxx(MasterInterface mi,
 		           "Master: terminated due to backup worker failure",
 		           probe::decoration::rare);
 
-		if (normalMasterErrors().count(err.code())) {
+		if (normalMasterErrors().contains(err.code())) {
 			TraceEvent("MasterTerminated", mi.id()).error(err);
 			return Void();
 		}

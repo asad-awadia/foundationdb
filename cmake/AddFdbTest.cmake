@@ -230,8 +230,8 @@ function(stage_correctness_package)
                             ${STAGE_OUT_DIR}/bin/coverage.fdbclient.xml
                             ${STAGE_OUT_DIR}/bin/coverage.fdbrpc.xml
                             ${STAGE_OUT_DIR}/bin/coverage.flow.xml
-                            ${STAGE_OUT_DIR}/bin/TestHarness.exe
-                            ${STAGE_OUT_DIR}/bin/TraceLogHelper.dll
+                            # ${STAGE_OUT_DIR}/bin/TestHarness.exe
+                            # ${STAGE_OUT_DIR}/bin/TraceLogHelper.dll
                             ${STAGE_OUT_DIR}/CMakeCache.txt
     )
 
@@ -243,16 +243,16 @@ function(stage_correctness_package)
             ${CMAKE_BINARY_DIR}/lib/coverage.fdbclient.xml
             ${CMAKE_BINARY_DIR}/lib/coverage.fdbrpc.xml
             ${CMAKE_BINARY_DIR}/lib/coverage.flow.xml
-            ${CMAKE_BINARY_DIR}/packages/bin/TestHarness.exe
-            ${CMAKE_BINARY_DIR}/packages/bin/TraceLogHelper.dll
+            # ${CMAKE_BINARY_DIR}/packages/bin/TestHarness.exe
+            # ${CMAKE_BINARY_DIR}/packages/bin/TraceLogHelper.dll
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/CMakeCache.txt ${STAGE_OUT_DIR}
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/packages/bin/fdbserver
                                      ${CMAKE_BINARY_DIR}/bin/coverage.fdbserver.xml
                                      ${CMAKE_BINARY_DIR}/lib/coverage.fdbclient.xml
                                      ${CMAKE_BINARY_DIR}/lib/coverage.fdbrpc.xml
                                      ${CMAKE_BINARY_DIR}/lib/coverage.flow.xml
-                                     ${CMAKE_BINARY_DIR}/packages/bin/TestHarness.exe
-                                     ${CMAKE_BINARY_DIR}/packages/bin/TraceLogHelper.dll
+                                     # ${CMAKE_BINARY_DIR}/packages/bin/TestHarness.exe
+                                     # ${CMAKE_BINARY_DIR}/packages/bin/TraceLogHelper.dll
                                      ${STAGE_OUT_DIR}/bin
     COMMENT "Copying files for ${STAGE_CONTEXT} package"
     )
@@ -549,6 +549,29 @@ function(package_bindingtester)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bindingtester
     COMMENT "Pack bindingtester")
   add_custom_target(bindingtester ALL DEPENDS ${tar_file} copy_bindingtester_binaries)
+endfunction()
+
+function(add_fdb_unit_test TEST_NAME PATTERN)
+  add_test(NAME ${TEST_NAME}
+           WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+           COMMAND ${CMAKE_BINARY_DIR}/bin/fdbserver -r unittests -f "${PATTERN}")
+  set_tests_properties(${TEST_NAME} PROPERTIES
+    FAIL_REGULAR_EXPRESSION "0 tests passed; 1 tests failed."
+  )
+endfunction()
+
+function(collect_unit_tests SOURCE_DIR)
+  message("Collecting unit_tests in ${SOURCE_DIR}")
+  execute_process(
+    COMMAND grep --include \*.h --include \*.cpp --include \*.hpp -rhoP "TEST_CASE\\(\\\"\\K[^\\\"]+(?=\\\"\\))" "${SOURCE_DIR}"
+    OUTPUT_VARIABLE TEST_NAMES
+  )
+  string(REGEX REPLACE "\n" ";" TEST_NAMES "${TEST_NAMES}")
+
+  foreach(TEST_NAME ${TEST_NAMES})
+    message("ADDING DISCOVERED UNIT TEST: ${TEST_NAME}")
+    add_fdb_unit_test(UnitTest_${TEST_NAME} ${TEST_NAME})
+  endforeach()
 endfunction()
 
 # Test for setting up Python venv for client tests.
