@@ -1186,7 +1186,7 @@ ACTOR Future<Void> updatePersistentData(TLogData* self, Reference<LogData> logDa
 		}
 		if (minVersion != std::numeric_limits<Version>::max()) {
 			self->persistentQueue->forgetBefore(
-			    newPersistentDataVersion,
+			    minVersion,
 			    logData); // SOMEDAY: this can cause a slow task (~0.5ms), presumably from erasing too many versions.
 			              // Should we limit the number of versions cleared at a time?
 		}
@@ -1826,7 +1826,7 @@ Future<Void> tLogPeekMessages(PromiseType replyPromise,
 	//   - Otherwise, wait for new data as long as the tLog isn't locked.
 	state Optional<Version> replyWithRecoveryVersion = Optional<Version>();
 	if (logData->version.get() < reqBegin) {
-		if (SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST && logData->stopped() && reqEnd.present() &&
+		if (SERVER_KNOBS->ENABLE_VERSION_VECTOR_REPLY_RECOVERY && logData->stopped() && reqEnd.present() &&
 		    reqEnd.get() != std::numeric_limits<Version>::max()) {
 			replyWithRecoveryVersion = reqEnd;
 		} else if (reqReturnIfBlocked) {

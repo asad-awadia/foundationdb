@@ -22,13 +22,18 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <type_traits>
 #include <unordered_map>
 
 #include "fdbclient/BlobCipher.h"
 #include "fdbclient/BlobGranuleCommon.h"
+#include "fdbclient/BulkLoading.h"
+#include "fdbclient/Knobs.h"
 #include "fdbrpc/TenantInfo.h"
 #include "flow/ApiVersion.h"
+#include "flow/Buggify.h"
+#include "flow/Platform.h"
 #include "flow/network.h"
 #include "fmt/format.h"
 #include "fdbclient/Audit.h"
@@ -71,6 +76,7 @@
 #include "fdbrpc/Smoother.h"
 #include "fdbrpc/Stats.h"
 #include "fdbserver/AccumulativeChecksumUtil.h"
+#include "fdbserver/BulkDumpUtil.actor.h"
 #include "fdbserver/BulkLoadUtil.actor.h"
 #include "fdbserver/DataDistribution.actor.h"
 #include "fdbserver/FDBExecHelper.actor.h"
@@ -109,6 +115,7 @@
 #include "flow/Trace.h"
 #include "flow/Util.h"
 #include "flow/genericactors.actor.h"
+#include "fdbserver/FDBRocksDBVersion.h"
 
 #include "flow/actorcompiler.h" // This must be the last #include.
 
@@ -213,7 +220,7 @@ static const KeyRangeRef persistPendingCheckpointKeys =
 static const std::string serverCheckpointFolder = "serverCheckpoints";
 static const std::string checkpointBytesSampleTempFolder = "/metadata_temp";
 static const std::string fetchedCheckpointFolder = "fetchedCheckpoints";
-static const std::string bulkLoadFolder = "bulkLoadFiles";
+static const std::string serverBulkDumpFolder = "bulkDumpFiles";
 
 // Accumulative checksum related prefix
 static const KeyRangeRef persistAccumulativeChecksumKeys =
@@ -1368,6 +1375,7 @@ public:
 	std::string folder;
 	std::string checkpointFolder;
 	std::string fetchedCheckpointFolder;
+	std::string bulkDumpFolder;
 
 	// defined only during splitMutations()/addMutation()
 	UpdateEagerReadInfo* updateEagerReads;
@@ -1398,6 +1406,8 @@ public:
 	}
 
 	FlowLock serveAuditStorageParallelismLock;
+
+	FlowLock serveBulkDumpParallelismLock;
 
 	int64_t instanceID;
 
@@ -1517,9 +1527,9 @@ public:
 		LatencySample updateEncryptionLatencySample;
 
 		LatencyBands readLatencyBands;
-		LatencySample mappedRangeSample; // Samples getMappedRange latency
-		LatencySample mappedRangeRemoteSample; // Samples getMappedRange remote subquery latency
-		LatencySample mappedRangeLocalSample; // Samples getMappedRange local subquery latency
+		std::unique_ptr<LatencySample> mappedRangeSample; // Samples getMappedRange latency
+		std::unique_ptr<LatencySample> mappedRangeRemoteSample; // Samples getMappedRange remote subquery latency
+		std::unique_ptr<LatencySample> mappedRangeLocalSample; // Samples getMappedRange local subquery latency
 
 		explicit Counters(StorageServer* self)
 		  : CommonStorageCounters("StorageServer", self->thisServerID.toString(), &self->metrics),
@@ -1577,19 +1587,6 @@ public:
 		                        self->thisServerID,
 		                        SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
 		                        SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
-		    readLatencyBands("ReadLatencyBands", self->thisServerID, SERVER_KNOBS->STORAGE_LOGGING_DELAY),
-		    mappedRangeSample("GetMappedRangeMetrics",
-		                      self->thisServerID,
-		                      SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                      SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
-		    mappedRangeRemoteSample("GetMappedRangeRemoteMetrics",
-		                            self->thisServerID,
-		                            SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                            SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
-		    mappedRangeLocalSample("GetMappedRangeLocalMetrics",
-		                           self->thisServerID,
-		                           SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                           SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
 		    kvReadRangeLatencySample("KVGetRangeMetrics",
 		                             self->thisServerID,
 		                             SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
@@ -1601,7 +1598,20 @@ public:
 		    updateEncryptionLatencySample("UpdateEncryptionLatencyMetrics",
 		                                  self->thisServerID,
 		                                  SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-		                                  SERVER_KNOBS->LATENCY_SKETCH_ACCURACY) {
+		                                  SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
+		    readLatencyBands("ReadLatencyBands", self->thisServerID, SERVER_KNOBS->STORAGE_LOGGING_DELAY),
+		    mappedRangeSample(std::make_unique<LatencySample>("GetMappedRangeMetrics",
+		                                                      self->thisServerID,
+		                                                      SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                      SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)),
+		    mappedRangeRemoteSample(std::make_unique<LatencySample>("GetMappedRangeRemoteMetrics",
+		                                                            self->thisServerID,
+		                                                            SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                            SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)),
+		    mappedRangeLocalSample(std::make_unique<LatencySample>("GetMappedRangeLocalMetrics",
+		                                                           self->thisServerID,
+		                                                           SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
+		                                                           SERVER_KNOBS->LATENCY_SKETCH_ACCURACY)) {
 			specialCounter(cc, "LastTLogVersion", [self]() { return self->lastTLogVersion; });
 			specialCounter(cc, "Version", [self]() { return self->version.get(); });
 			specialCounter(cc, "StorageVersion", [self]() { return self->storageVersion(); });
@@ -1631,6 +1641,10 @@ public:
 			specialCounter(cc, "ServeValidateStorageWaiting", [self]() {
 				return self->serveAuditStorageParallelismLock.waiters();
 			});
+			specialCounter(
+			    cc, "ServerBulkDumpActive", [self]() { return self->serveBulkDumpParallelismLock.activePermits(); });
+			specialCounter(
+			    cc, "ServerBulkDumpWaiting", [self]() { return self->serveBulkDumpParallelismLock.waiters(); });
 			specialCounter(cc, "QueryQueueMax", [self]() { return self->getAndResetMaxQueryQueueSize(); });
 			specialCounter(cc, "ActiveWatches", [self]() { return self->numWatches; });
 			specialCounter(cc, "WatchBytes", [self]() { return self->watchBytes; });
@@ -1705,6 +1719,7 @@ public:
 	    ssLock(makeReference<PriorityMultiLock>(SERVER_KNOBS->STORAGE_SERVER_READ_CONCURRENCY,
 	                                            SERVER_KNOBS->STORAGESERVER_READ_PRIORITIES)),
 	    serveAuditStorageParallelismLock(SERVER_KNOBS->SERVE_AUDIT_STORAGE_PARALLELISM),
+	    serveBulkDumpParallelismLock(SERVER_KNOBS->SS_SERVE_BULKDUMP_PARALLELISM),
 	    instanceID(deterministicRandom()->randomUniqueID().first()), shuttingDown(false), behind(false),
 	    versionBehind(false), debug_inApplyUpdate(false), debug_lastValidateTime(0), lastBytesInputEBrake(0),
 	    lastDurableVersionEBrake(0), maxQueryQueue(0),
@@ -4164,7 +4179,7 @@ ACTOR Future<GetValueReqAndResultRef> quickGetValue(StorageServer* data,
 				++data->counters.quickGetValueHit;
 				copyOptionalValue(a, getValue, reply.value);
 				const double duration = g_network->timer() - getValueStart;
-				data->counters.mappedRangeLocalSample.addMeasurement(duration);
+				data->counters.mappedRangeLocalSample->addMeasurement(duration);
 				return getValue;
 			}
 			// Otherwise fallback.
@@ -4188,7 +4203,7 @@ ACTOR Future<GetValueReqAndResultRef> quickGetValue(StorageServer* data,
 		Optional<Value> valueOption = wait(valueFuture);
 		copyOptionalValue(a, getValue, valueOption);
 		double duration = g_network->timer() - getValueStart;
-		data->counters.mappedRangeRemoteSample.addMeasurement(duration);
+		data->counters.mappedRangeRemoteSample->addMeasurement(duration);
 		return getValue;
 	} else {
 		throw quick_get_value_miss();
@@ -4911,7 +4926,7 @@ ACTOR Future<GetRangeReqAndResultRef> quickGetKeyValues(
 			a->dependsOn(reply.arena);
 			getRange.result = RangeResultRef(reply.data, reply.more);
 			const double duration = g_network->timer() - getValuesStart;
-			data->counters.mappedRangeLocalSample.addMeasurement(duration);
+			data->counters.mappedRangeLocalSample->addMeasurement(duration);
 			if (pOriginalReq->options.present() && pOriginalReq->options.get().debugID.present())
 				g_traceBatch.addEvent("TransactionDebug",
 				                      pOriginalReq->options.get().debugID.get().first(),
@@ -4942,7 +4957,7 @@ ACTOR Future<GetRangeReqAndResultRef> quickGetKeyValues(
 		a->dependsOn(rangeResult.arena());
 		getRange.result = rangeResult;
 		const double duration = g_network->timer() - getValuesStart;
-		data->counters.mappedRangeRemoteSample.addMeasurement(duration);
+		data->counters.mappedRangeRemoteSample->addMeasurement(duration);
 		if (pOriginalReq->options.present() && pOriginalReq->options.get().debugID.present())
 			g_traceBatch.addEvent("TransactionDebug",
 			                      pOriginalReq->options.get().debugID.get().first(),
@@ -5951,6 +5966,270 @@ ACTOR Future<Void> auditStorageShardReplicaQ(StorageServer* data, AuditStorageRe
 	return Void();
 }
 
+struct RangeDumpData {
+	std::map<Key, Value> kvs;
+	std::map<Key, Value> sampled;
+	Key lastKey;
+	int64_t kvsBytes;
+	RangeDumpData() = default;
+	RangeDumpData(const std::map<Key, Value>& kvs,
+	              const std::map<Key, Value>& sampled,
+	              const Key& lastKey,
+	              int64_t kvsBytes)
+	  : kvs(kvs), sampled(sampled), lastKey(lastKey), kvsBytes(kvsBytes) {}
+};
+
+ACTOR Future<RangeDumpData> getRangeDataToDump(StorageServer* data, KeyRange range, Version version) {
+	state std::map<Key, Value> kvsToDump;
+	state std::map<Key, Value> sample;
+	state int64_t currentExpectedBytes = 0;
+	state Key beginKey = range.begin;
+	state Key lastKey = range.begin;
+	state bool immediateError = true;
+	// Accumulate data read from local storage to kvsToDump and make sampling until any error presents
+	loop {
+		// Read data and stop for any error
+		state ErrorOr<GetKeyValuesReply> rep;
+		try {
+			state GetKeyValuesRequest localReq;
+			localReq.begin = firstGreaterOrEqual(beginKey);
+			localReq.end = firstGreaterOrEqual(range.end);
+			localReq.version = version;
+			localReq.limit = SERVER_KNOBS->MOVE_SHARD_KRM_ROW_LIMIT;
+			localReq.limitBytes = SERVER_KNOBS->MOVE_SHARD_KRM_BYTE_LIMIT;
+			localReq.tags = TagSet();
+			data->actors.add(getKeyValuesQ(data, localReq));
+			wait(store(rep, errorOr(localReq.reply.getFuture())));
+			if (rep.isError()) {
+				throw rep.getError();
+			}
+			if (rep.get().error.present()) {
+				throw rep.get().error.get();
+			}
+		} catch (Error& e) {
+			if (e.code() == error_code_actor_cancelled) {
+				throw e;
+			}
+			break;
+		}
+
+		// immediateError is used in case the read is failed at the first range
+		immediateError = false;
+
+		// Given the data, create KVS and sample. Stop if the accumulated data size is too large.
+		for (const auto& kv : rep.get().data) { // TODO(BulkDump): directly read from special key space.
+			lastKey = kv.key;
+			auto res = kvsToDump.insert({ kv.key, kv.value });
+			ASSERT(res.second);
+			ByteSampleInfo sampleInfo = isKeyValueInSample(KeyValueRef(kv.key, kv.value));
+			if (sampleInfo.inSample) {
+				auto resSample =
+				    sample.insert({ kv.key, BinaryWriter::toValue(sampleInfo.sampledSize, Unversioned()) });
+				ASSERT(resSample.second);
+			}
+			currentExpectedBytes = currentExpectedBytes + kv.expectedSize();
+			if (currentExpectedBytes >= SERVER_KNOBS->SS_BULKDUMP_BATCH_BYTES) {
+				break;
+			}
+		}
+
+		// Stop if no more data or having too large bytes
+		if (currentExpectedBytes >= SERVER_KNOBS->SS_BULKDUMP_BATCH_BYTES) {
+			break;
+		} else if (!rep.get().more) {
+			lastKey = range.end; // Use the range end as the lastKey
+			break;
+		}
+
+		// Yield and go to the next round
+		wait(delay(0.1));
+		beginKey = keyAfter(lastKey);
+	}
+
+	if (immediateError) {
+		throw retry();
+	}
+
+	return RangeDumpData(kvsToDump, sample, lastKey, currentExpectedBytes);
+}
+
+void cleanUpBulkDumpFolder(StorageServer* data) {
+	try {
+		platform::eraseDirectoryRecursive(abspath(data->bulkDumpFolder));
+	} catch (Error& e) {
+		return;
+	}
+	return;
+}
+
+// The SS actor handling bulk dump task sent from DD.
+// The SS partitions the task range into batches and make progress on each batch one by one.
+// Each batch is a subrange of the task range sent from DD.
+// When SS completes one batch, SS persists the metadata indicating this batch range completed.
+// If the SS fails on dumping a batch data, the SS will send an error to DD and the leftover files
+// is cleaned up when this actor returns.
+// In the case of SS crashes, the leftover files will be cleared at the init step when the SS restores.
+// If the SS uploads any file with succeed but the blob store is actually stored, this inconsistency will
+// be captured by DD and DD will retry to dump the problematic range with a new task.
+// DD will retry later if it receives any error from SS.
+// Upload the data for the range with the following path organization:
+//  <rootRemote>/<JobId>/<TaskId>/<batchNum>/<dumpVersion>-manifest.sst
+//	<rootRemote>/<JobId>/<TaskId>/<batchNum>/<dumpVersion>-data.sst
+//	<rootRemote>/<JobId>/<TaskId>/<batchNum>/<dumpVersion>-sample.sst
+// where rootRemote = req.bulkDumpState.remoteRoot, jobId = req.bulkDumpState.jobId, taskId = req.bulkDumpState.taskId,
+// batchNum and dumpVersion are dynamically generated.
+// Each task must have one manifest file.
+// If the task's range is empty, data file and sample file do not exist
+// If the task's data size is too small, the sample file may omitted
+ACTOR Future<Void> bulkDumpQ(StorageServer* data, BulkDumpRequest req) {
+	wait(data->serveBulkDumpParallelismLock.take(TaskPriority::DefaultYield));
+	state FlowLock::Releaser holder(data->serveBulkDumpParallelismLock); // A SS can handle one bulkDump task at a time
+	state Key rangeBegin = req.bulkDumpState.getRange().begin;
+	state Key rangeEnd = req.bulkDumpState.getRange().end;
+	state BulkLoadTransportMethod transportMethod = req.bulkDumpState.getTransportMethod();
+	state BulkLoadType dumpType = req.bulkDumpState.getType();
+	state int64_t readBytes = 0;
+	state int retryCount = 0;
+	state uint64_t batchNum = 0;
+	state Version versionToDump;
+	state RangeDumpData rangeDumpData;
+	state UID jobId = req.bulkDumpState.getJobId();
+	state std::string rootFolderLocal = data->bulkDumpFolder;
+	state std::string rootFolderRemote = req.bulkDumpState.getJobRoot();
+	// Use jobId and taskId as the folder to store the data of the task range
+	ASSERT(req.bulkDumpState.getTaskId().present());
+	state std::string taskFolder = getBulkDumpJobTaskFolder(jobId, req.bulkDumpState.getTaskId().get());
+	state BulkLoadFileSet destinationFileSets;
+	state Transaction tr(data->cx);
+
+	loop {
+		try {
+			// Clear local files
+			clearFileFolder(abspath(joinPath(rootFolderLocal, taskFolder)));
+
+			// Dump data of rangeToDump in a relativeFolder
+			state KeyRange rangeToDump = Standalone(KeyRangeRef(rangeBegin, rangeEnd));
+
+			// relativeFolder = <JobId>/<TaskId>/<batchNum>
+			// relativeFolder remains consistent between local path and remote path
+			state std::string relativeFolder = joinPath(taskFolder, std::to_string(batchNum));
+
+			// Get version to dump
+			tr.reset();
+			wait(store(versionToDump, tr.getReadVersion()));
+
+			// Read data
+			// TODO(BulkDump): Read data from other servers at the versionToDump as much as possible
+			wait(store(rangeDumpData, getRangeDataToDump(data, rangeToDump, versionToDump)));
+
+			// Generate local file paths and remote file paths
+			// The data in KVStore is dumped to the local folder at first and then
+			// the local files are uploaded to the remote folder
+			// Local files and remotes files have the same relative path but different root
+			state std::pair<BulkLoadFileSet, BulkLoadFileSet> resFileSets =
+			    getLocalRemoteFileSetSetting(versionToDump,
+			                                 relativeFolder,
+			                                 /*rootLocal=*/rootFolderLocal,
+			                                 /*rootRemote=*/rootFolderRemote);
+
+			// The remote file path:
+			state BulkLoadFileSet localFileSetSetting = resFileSets.first;
+			state BulkLoadFileSet remoteFileSetSetting = resFileSets.second;
+
+			// Generate byte sampling setting
+			BulkLoadByteSampleSetting byteSampleSetting(0,
+			                                            "hashlittle2", // use function name to represent the method
+			                                            SERVER_KNOBS->BYTE_SAMPLING_FACTOR,
+			                                            SERVER_KNOBS->BYTE_SAMPLING_OVERHEAD,
+			                                            SERVER_KNOBS->MIN_BYTE_SAMPLING_PROBABILITY);
+
+			// Write to SST file
+			state KeyRange dataRange = rangeToDump & KeyRangeRef(rangeBegin, keyAfter(rangeDumpData.lastKey));
+			state BulkLoadManifest manifest =
+			    dumpDataFileToLocalDirectory(data->thisServerID,
+			                                 rangeDumpData.kvs,
+			                                 rangeDumpData.sampled,
+			                                 localFileSetSetting,
+			                                 remoteFileSetSetting,
+			                                 byteSampleSetting,
+			                                 versionToDump,
+			                                 dataRange, // the actual range of the rangeDumpData.kvs
+			                                 rangeDumpData.kvsBytes,
+			                                 rangeDumpData.kvs.size(),
+			                                 dumpType,
+			                                 transportMethod);
+			readBytes = readBytes + rangeDumpData.kvsBytes;
+			TraceEvent(SevInfo, "SSBulkDumpDataFileGenerated", data->thisServerID)
+			    .setMaxEventLength(-1)
+			    .setMaxFieldLength(-1)
+			    .detail("Task", req.bulkDumpState.toString())
+			    .detail("ChecksumServers", describe(req.checksumServers))
+			    .detail("RangeToDump", rangeToDump)
+			    .detail("DataRange", dataRange)
+			    .detail("RootFolderLocal", rootFolderLocal)
+			    .detail("RelativeFolder", relativeFolder)
+			    .detail("DataKeyCount", rangeDumpData.kvs.size())
+			    .detail("DataBytes", rangeDumpData.kvsBytes)
+			    .detail("RemoteFileSet", manifest.fileSet.toString())
+			    .detail("BatchNum", batchNum);
+
+			// Upload Files
+			state BulkLoadFileSet localFileSet = localFileSetSetting;
+			if (!manifest.fileSet.hasDataFile()) {
+				localFileSet.removeDataFile();
+			}
+			if (!manifest.fileSet.hasByteSampleFile()) {
+				localFileSet.removeByteSampleFile();
+			}
+			wait(uploadBulkDumpFileSet(
+			    req.bulkDumpState.getTransportMethod(), localFileSet, manifest.fileSet, data->thisServerID));
+
+			// Progressively set metadata of the data range as complete phase
+			// Persist remoteFilePaths to the corresponding range
+			if (!dataRange.empty()) {
+				// The persisting range (dataRange) must be exactly same as the range presented in the manifest file
+				ASSERT(dataRange == KeyRangeRef(manifest.beginKey, manifest.endKey));
+				wait(persistCompleteBulkDumpRange(data->cx,
+				                                  req.bulkDumpState.generateBulkDumpMetadataToPersist(manifest)));
+			}
+
+			// Move to the next range
+			rangeBegin = keyAfter(rangeDumpData.lastKey);
+			if (rangeBegin >= rangeEnd) {
+				req.reply.send(req.bulkDumpState);
+				break;
+			}
+			batchNum++;
+		} catch (Error& e) {
+			if (e.code() == error_code_actor_cancelled) {
+				throw e;
+			}
+			TraceEvent(SevInfo, "SSBulkDumpError", data->thisServerID)
+			    .errorUnsuppressed(e)
+			    .detail("Task", req.bulkDumpState.toString())
+			    .detail("RetryCount", retryCount)
+			    .detail("BatchNum", batchNum);
+			if (e.code() == error_code_bulkdump_task_outdated) {
+				req.reply.sendError(bulkdump_task_outdated()); // give up
+				break; // silently exit
+			}
+			if (e.code() == error_code_wrong_shard_server || e.code() == error_code_platform_error ||
+			    e.code() == error_code_io_error || retryCount >= 50) {
+				req.reply.sendError(bulkdump_task_failed()); // give up
+				break; // silently exit
+			}
+			retryCount++;
+		}
+		wait(delay(1.0));
+	}
+	try {
+		clearFileFolder(abspath(joinPath(rootFolderLocal, taskFolder)));
+	} catch (Error& e) {
+		// exit
+	}
+	return Void();
+}
+
 TEST_CASE("/fdbserver/storageserver/constructMappedKey") {
 	Key key = Tuple::makeTuple("key-0"_sr, "key-1"_sr, "key-2"_sr).getDataAsStandalone();
 	Value value = Tuple::makeTuple("value-0"_sr, "value-1"_sr, "value-2"_sr).getDataAsStandalone();
@@ -6543,7 +6822,7 @@ ACTOR Future<Void> getMappedKeyValuesQ(StorageServer* data, GetMappedKeyValuesRe
 
 	double duration = g_network->timer() - req.requestTime();
 	data->counters.readLatencySample.addMeasurement(duration);
-	data->counters.mappedRangeSample.addMeasurement(duration);
+	data->counters.mappedRangeSample->addMeasurement(duration);
 	if (data->latencyBandConfig.present()) {
 		int maxReadBytes =
 		    data->latencyBandConfig.get().readConfig.maxReadBytes.orDefault(std::numeric_limits<int>::max());
@@ -9132,77 +9411,96 @@ ACTOR Future<Void> fallBackToAddingShard(StorageServer* data, MoveInShard* moveI
 	return Void();
 }
 
-ACTOR Future<Void> fetchShardFetchBulkLoadSSTFiles(StorageServer* data,
-                                                   MoveInShard* moveInShard,
-                                                   std::string dir,
-                                                   BulkLoadState bulkLoadState) {
+ACTOR Future<Void> bulkLoadFetchSSTFilesToLoad(StorageServer* data,
+                                               MoveInShard* moveInShard,
+                                               std::string localRoot,
+                                               BulkLoadTaskState bulkLoadTaskState) {
+	ASSERT(bulkLoadTaskState.getLoadType() == BulkLoadType::SST);
 	TraceEvent(SevInfo, "SSBulkLoadTaskFetchSSTFile", data->thisServerID)
-	    .detail("BulkLoadTask", bulkLoadState.toString())
+	    .setMaxEventLength(-1)
+	    .setMaxFieldLength(-1)
+	    .detail("BulkLoadTask", bulkLoadTaskState.toString())
 	    .detail("MoveInShard", moveInShard->toString())
-	    .detail("Folder", abspath(dir));
+	    .detail("LocalRoot", abspath(localRoot));
 
 	state double fetchStartTime = now();
 
-	// Step 1: Fetch data to dir
-	state SSBulkLoadFileSet fileSetToLoad;
-	ASSERT(bulkLoadState.getTransportMethod() != BulkLoadTransportMethod::Invalid);
-	if (bulkLoadState.getTransportMethod() == BulkLoadTransportMethod::CP) {
-		wait(store(
-		    fileSetToLoad,
-		    bulkLoadTransportCP_impl(dir, bulkLoadState, SERVER_KNOBS->BULKLOAD_FILE_BYTES_MAX, data->thisServerID)));
-	} else {
-		throw not_implemented();
+	// Step 1: Download files to localRoot
+	state BulkLoadFileSet fromRemoteFileSet = bulkLoadTaskState.getFileSet();
+	BulkLoadByteSampleSetting currentClusterByteSampleSetting(
+	    0,
+	    "hashlittle2", // use function name to represent the method
+	    SERVER_KNOBS->BYTE_SAMPLING_FACTOR,
+	    SERVER_KNOBS->BYTE_SAMPLING_OVERHEAD,
+	    SERVER_KNOBS->MIN_BYTE_SAMPLING_PROBABILITY);
+	if (currentClusterByteSampleSetting != bulkLoadTaskState.getByteSampleSetting()) {
+		// If the byte sampling setting mismatches between the data to load and the current cluster setting,
+		// we need to redo the byte sampling.
+		// Setting byteSampleFileName to empty string triggers redo byte sampling in the step 2.
+		fromRemoteFileSet.removeByteSampleFile();
 	}
-	// At this point, all necessary data for bulk loading locate at fileSetToLoad
+	// Download data file and byte sample file from fromRemoteFileSet to toLocalFileSet
+	state BulkLoadFileSet toLocalFileSet = wait(bulkLoadDownloadTaskFileSet(
+	    bulkLoadTaskState.getTransportMethod(), fromRemoteFileSet, localRoot, data->thisServerID));
 	TraceEvent(SevInfo, "SSBulkLoadTaskFetchSSTFileFetched", data->thisServerID)
-	    .detail("BulkLoadTask", bulkLoadState.toString())
+	    .setMaxEventLength(-1)
+	    .setMaxFieldLength(-1)
+	    .detail("BulkLoadTask", bulkLoadTaskState.toString())
 	    .detail("MoveInShard", moveInShard->toString())
-	    .detail("Dir", dir)
-	    .detail("FileSetToLoad", fileSetToLoad.toString());
+	    .detail("RemoteFileSet", fromRemoteFileSet.toString())
+	    .detail("LocalFileSet", toLocalFileSet.toString());
 
-	// Step 2: Validation
-	// TODO(BulkLoad): Validate all files specified in fileSetToLoad exist
-	// TODO(BulkLoad): Check file checksum
-	// TODO(BulkLoad): Check file data all in the moveInShard range
-	// TODO(BulkLoad): checkContent(fileSetToLoad.dataFileList, data->thisServerID);
-	if (!fileSetToLoad.bytesSampleFile.present()) {
-		TraceEvent(SevWarn, "SSBulkLoadTaskFetchSSTFileByteSampleNotFound", data->thisServerID)
-		    .detail("BulkLoadState", bulkLoadState.toString())
-		    .detail("FileSetToLoad", fileSetToLoad.toString());
-		Optional<std::string> bytesSampleFile_ =
-		    wait(getBytesSamplingFromSSTFiles(fileSetToLoad.folder, fileSetToLoad.dataFileList, data->thisServerID));
-		fileSetToLoad.bytesSampleFile = bytesSampleFile_;
+	// Step 2: Do byte sampling locally if the remote byte sampling file is not valid nor existing
+	if (!toLocalFileSet.hasByteSampleFile()) {
+		TraceEvent(SevInfo, "SSBulkLoadTaskFetchSSTFileValidByteSampleNotFound", data->thisServerID)
+		    .setMaxEventLength(-1)
+		    .setMaxFieldLength(-1)
+		    .detail("BulkLoadTaskState", bulkLoadTaskState.toString())
+		    .detail("LocalFileSet", toLocalFileSet.toString());
+		state std::string byteSampleFileName =
+		    generateBulkLoadBytesSampleFileNameFromDataFileName(toLocalFileSet.getDataFileName());
+		std::string byteSampleFilePathLocal = abspath(joinPath(toLocalFileSet.getFolder(), byteSampleFileName));
+		bool bytesSampleFileGenerated = wait(doBytesSamplingOnDataFile(
+		    toLocalFileSet.getDataFileFullPath(), byteSampleFilePathLocal, data->thisServerID));
+		if (bytesSampleFileGenerated) {
+			toLocalFileSet.setByteSampleFileName(byteSampleFileName);
+		}
 	}
-	TraceEvent(SevInfo, "SSBulkLoadTaskFetchSSTFileValidated", data->thisServerID)
-	    .detail("BulkLoadTask", bulkLoadState.toString())
+	TraceEvent(SevInfo, "SSBulkLoadTaskByteSampled", data->thisServerID)
+	    .setMaxEventLength(-1)
+	    .setMaxFieldLength(-1)
+	    .detail("BulkLoadTask", bulkLoadTaskState.toString())
 	    .detail("MoveInShard", moveInShard->toString())
-	    .detail("Folder", abspath(dir))
-	    .detail("FileSetToLoad", fileSetToLoad.toString());
+	    .detail("RemoteFileSet", fromRemoteFileSet.toString())
+	    .detail("LocalFileSet", toLocalFileSet.toString());
 
-	// Step 3: Build LocalRecord (used by ShardedRocksDB KVStore)
+	// Step 3: Build LocalRecord used by ShardedRocksDB KVStore when injecting data
 	state CheckpointMetaData localRecord;
 	localRecord.checkpointID = UID();
-	localRecord.dir = abspath(fileSetToLoad.folder);
+	localRecord.dir = abspath(toLocalFileSet.getFolder());
 	for (const auto& range : moveInShard->ranges()) {
-		ASSERT(bulkLoadState.getRange().contains(range));
+		ASSERT(bulkLoadTaskState.getRange().contains(range));
 	}
-	localRecord.ranges = moveInShard->ranges();
-	RocksDBCheckpointKeyValues rcp({ bulkLoadState.getRange() });
-	for (const auto& filePath : fileSetToLoad.dataFileList) {
-		std::vector<KeyRange> coalesceRanges = coalesceRangeList(moveInShard->ranges());
-		if (coalesceRanges.size() != 1) {
-			TraceEvent(SevError, "SSBulkLoadTaskFetchSSTFileError", data->thisServerID)
-			    .detail("Reason", "MoveInShard ranges unexpected")
-			    .detail("BulkLoadState", bulkLoadState.toString())
-			    .detail("MoveInShard", moveInShard->toString())
-			    .detail("FileSetToLoad", fileSetToLoad.toString());
-		}
-		// TODO(BulkLoad): set loading file size --- logging purpose
-		rcp.fetchedFiles.emplace_back(abspath(filePath), coalesceRanges[0], 0);
+	RocksDBCheckpointKeyValues rcp({ bulkLoadTaskState.getRange() });
+	std::vector<KeyRange> coalesceRanges = coalesceRangeList(moveInShard->ranges());
+	if (coalesceRanges.size() != 1) {
+		TraceEvent(SevError, "SSBulkLoadTaskFetchSSTFileError", data->thisServerID)
+		    .detail("Reason", "MoveInShard ranges unexpected, resulting in partially injecting data")
+		    .setMaxEventLength(-1)
+		    .setMaxFieldLength(-1)
+		    .detail("BulkLoadTaskState", bulkLoadTaskState.toString())
+		    .detail("MoveInShard", moveInShard->toString())
+		    .detail("LocalFileSet", toLocalFileSet.toString());
 	}
+	localRecord.ranges = coalesceRanges;
+	rcp.fetchedFiles.emplace_back(
+	    abspath(toLocalFileSet.getDataFileFullPath()), coalesceRanges[0], bulkLoadTaskState.getTotalBytes());
 	localRecord.serializedCheckpoint = ObjectWriter::toValue(rcp, IncludeVersion());
 	localRecord.version = moveInShard->meta->createVersion;
-	localRecord.bytesSampleFile = fileSetToLoad.bytesSampleFile;
+	if (toLocalFileSet.hasByteSampleFile()) {
+		ASSERT(fileExists(abspath(toLocalFileSet.getBytesSampleFileFullPath())));
+		localRecord.bytesSampleFile = abspath(toLocalFileSet.getBytesSampleFileFullPath());
+	}
 	localRecord.setFormat(CheckpointFormat::RocksDBKeyValues);
 	localRecord.setState(CheckpointMetaData::Complete);
 	moveInShard->meta->checkpoints.push_back(localRecord);
@@ -9210,13 +9508,15 @@ ACTOR Future<Void> fetchShardFetchBulkLoadSSTFiles(StorageServer* data,
 	const double duration = now() - fetchStartTime;
 	const int64_t totalBytes = getTotalFetchedBytes(moveInShard->meta->checkpoints);
 	TraceEvent(SevInfo, "SSBulkLoadTaskFetchSSTFileBuildMetadata", data->thisServerID)
-	    .detail("BulkLoadTask", bulkLoadState.toString())
+	    .setMaxEventLength(-1)
+	    .setMaxFieldLength(-1)
+	    .detail("BulkLoadTask", bulkLoadTaskState.toString())
 	    .detail("MoveInShard", moveInShard->toString())
-	    .detail("Folder", abspath(dir))
-	    .detail("FileSetToLoad", fileSetToLoad.toString())
+	    .detail("LocalRoot", abspath(localRoot))
+	    .detail("LocalFileSet", toLocalFileSet.toString())
 	    .detail("Duration", duration)
 	    .detail("TotalBytes", totalBytes)
-	    .detail("Rate", (double)totalBytes / duration);
+	    .detail("Rate", duration == 0 ? -1.0 : (double)totalBytes / duration);
 
 	// Step 4: Update the moveInShard phase
 	moveInShard->setPhase(MoveInPhase::Ingesting);
@@ -9318,10 +9618,10 @@ ACTOR Future<Void> fetchShardCheckpoint(StorageServer* data, MoveInShard* moveIn
 
 ACTOR Future<Void> fetchShardIngestCheckpoint(StorageServer* data,
                                               MoveInShard* moveInShard,
-                                              Optional<BulkLoadState> bulkLoadState) {
+                                              Optional<BulkLoadTaskState> bulkLoadTaskState) {
 	TraceEvent(SevInfo, "FetchShardIngestCheckpointBegin", data->thisServerID)
 	    .detail("Checkpoints", describe(moveInShard->checkpoints()))
-	    .detail("BulkLoadTask", bulkLoadState.present() ? bulkLoadState.get().toString() : "");
+	    .detail("BulkLoadTask", bulkLoadTaskState.present() ? bulkLoadTaskState.get().toString() : "");
 	ASSERT(moveInShard->getPhase() == MoveInPhase::Ingesting);
 	state double startTime = now();
 
@@ -9334,7 +9634,7 @@ ACTOR Future<Void> fetchShardIngestCheckpoint(StorageServer* data,
 		    .errorUnsuppressed(e)
 		    .detail("MoveInShard", moveInShard->toString())
 		    .detail("Checkpoints", describe(moveInShard->checkpoints()))
-		    .detail("BulkLoadTask", bulkLoadState.present() ? bulkLoadState.get().toString() : "");
+		    .detail("BulkLoadTask", bulkLoadTaskState.present() ? bulkLoadTaskState.get().toString() : "");
 		if (e.code() == error_code_failed_to_restore_checkpoint && !moveInShard->failed()) {
 			moveInShard->setPhase(MoveInPhase::Fetching);
 			updateMoveInShardMetaData(data, moveInShard);
@@ -9346,7 +9646,7 @@ ACTOR Future<Void> fetchShardIngestCheckpoint(StorageServer* data,
 	TraceEvent(SevInfo, "FetchShardIngestedCheckpoint", data->thisServerID)
 	    .detail("MoveInShard", moveInShard->toString())
 	    .detail("Checkpoints", describe(moveInShard->checkpoints()))
-	    .detail("BulkLoadTask", bulkLoadState.present() ? bulkLoadState.get().toString() : "");
+	    .detail("BulkLoadTask", bulkLoadTaskState.present() ? bulkLoadTaskState.get().toString() : "");
 
 	if (moveInShard->failed()) {
 		return Void();
@@ -9373,14 +9673,14 @@ ACTOR Future<Void> fetchShardIngestCheckpoint(StorageServer* data,
 				    .detail("Checkpoint", checkpoint.toString())
 				    .detail("SampleKey", key)
 				    .detail("Size", size)
-				    .detail("BulkLoadTask", bulkLoadState.present() ? bulkLoadState.get().toString() : "");
+				    .detail("BulkLoadTask", bulkLoadTaskState.present() ? bulkLoadTaskState.get().toString() : "");
 				continue;
 			}
 			TraceEvent(moveInShard->logSev, "StorageRestoreCheckpointKeySample", data->thisServerID)
 			    .detail("Checkpoint", checkpoint.checkpointID.toString())
 			    .detail("SampleKey", key)
 			    .detail("Size", size)
-			    .detail("BulkLoadTask", bulkLoadState.present() ? bulkLoadState.get().toString() : "");
+			    .detail("BulkLoadTask", bulkLoadTaskState.present() ? bulkLoadTaskState.get().toString() : "");
 			data->metrics.byteSample.sample.insert(key, size);
 			data->metrics.notifyBytes(key, size);
 			data->addMutationToMutationLogOrStorage(
@@ -9401,7 +9701,7 @@ ACTOR Future<Void> fetchShardIngestCheckpoint(StorageServer* data,
 	    .detail("Bytes", totalBytes)
 	    .detail("Duration", duration)
 	    .detail("Rate", static_cast<double>(totalBytes) / duration)
-	    .detail("BulkLoadTask", bulkLoadState.present() ? bulkLoadState.get().toString() : "");
+	    .detail("BulkLoadTask", bulkLoadTaskState.present() ? bulkLoadTaskState.get().toString() : "");
 
 	return Void();
 }
@@ -9612,21 +9912,21 @@ ACTOR Future<Void> fetchShard(StorageServer* data, MoveInShard* moveInShard) {
 	wait(data->fetchKeysParallelismLock.take(TaskPriority::DefaultYield));
 	state FlowLock::Releaser holdingFKPL(data->fetchKeysParallelismLock);
 
-	state Optional<BulkLoadState> bulkLoadState;
+	state Optional<BulkLoadTaskState> bulkLoadTaskState;
 	if (moveInShard->meta->conductBulkLoad) {
-		wait(store(bulkLoadState,
-		           getBulkLoadStateFromDataMove(data->cx, moveInShard->dataMoveId(), data->thisServerID)));
+		wait(store(bulkLoadTaskState,
+		           getBulkLoadTaskStateFromDataMove(data->cx, moveInShard->dataMoveId(), data->thisServerID)));
 	}
 	// It is possible that the data move id is generated by an old binary which does not
 	// encode the data move type. In this case, it is possible that the data move id indicates
 	// this is an bulk load data move but it is not. To tolerate this issue, here we check
-	// whether the bulkLoadState metadata is persisted in the data move metadata. If yes,
+	// whether the bulkLoadTaskState metadata is persisted in the data move metadata. If yes,
 	// this SS conducts bulk loading. If no, the SS conducts a normal data move.
-	if (bulkLoadState.present()) {
-		ASSERT(bulkLoadState.get().getDataMoveId() == moveInShard->dataMoveId());
+	if (bulkLoadTaskState.present()) {
+		ASSERT(bulkLoadTaskState.get().getDataMoveId() == moveInShard->dataMoveId());
 		TraceEvent(SevInfo, "FetchShardBeginReceivedBulkLoadTask", data->thisServerID)
 		    .detail("MoveInShard", moveInShard->toString())
-		    .detail("BulkLoadTask", bulkLoadState.get().toString());
+		    .detail("BulkLoadTask", bulkLoadTaskState.get().toString());
 	}
 
 	loop {
@@ -9636,13 +9936,13 @@ ACTOR Future<Void> fetchShard(StorageServer* data, MoveInShard* moveInShard) {
 		try {
 			// Pending = 0, Fetching = 1, Ingesting = 2, ApplyingUpdates = 3, Complete = 4, Deleting = 4, Fail = 6,
 			if (phase == MoveInPhase::Fetching) {
-				if (bulkLoadState.present()) {
-					wait(fetchShardFetchBulkLoadSSTFiles(data, moveInShard, dir, bulkLoadState.get()));
+				if (bulkLoadTaskState.present()) {
+					wait(bulkLoadFetchSSTFilesToLoad(data, moveInShard, dir, bulkLoadTaskState.get()));
 				} else {
 					wait(fetchShardCheckpoint(data, moveInShard, dir));
 				}
 			} else if (phase == MoveInPhase::Ingesting) {
-				wait(fetchShardIngestCheckpoint(data, moveInShard, bulkLoadState));
+				wait(fetchShardIngestCheckpoint(data, moveInShard, bulkLoadTaskState));
 			} else if (phase == MoveInPhase::ApplyingUpdates) {
 				wait(fetchShardApplyUpdates(data, moveInShard, moveInUpdates));
 			} else if (phase == MoveInPhase::Complete) {
@@ -13533,6 +13833,7 @@ ACTOR Future<Void> metricsCore(StorageServer* self, StorageServerInterface ssi) 
 	    self->thisServerID.toString() + "/StorageMetrics",
 	    [self = self](TraceEvent& te) {
 		    te.detail("StorageEngine", self->storage.getKeyValueStoreType().toString());
+		    te.detail("RocksDBVersion", format("%d.%d.%d", FDB_ROCKSDB_MAJOR, FDB_ROCKSDB_MINOR, FDB_ROCKSDB_PATCH));
 		    te.detail("Tag", self->tag.toString());
 		    std::vector<int> rpr = self->readPriorityRanks;
 		    te.detail("ReadsTotalActive", self->ssLock->getRunnersCount());
@@ -14126,6 +14427,9 @@ ACTOR Future<Void> storageServerCore(StorageServer* self, StorageServerInterface
 					req.reply.sendError(not_implemented());
 				}
 			}
+			when(BulkDumpRequest req = waitNext(ssi.bulkdump.getFuture())) {
+				self->actors.add(bulkDumpQ(self, req));
+			}
 			when(wait(updateProcessStatsTimer)) {
 				updateProcessStats(self);
 				updateProcessStatsTimer = delay(SERVER_KNOBS->FASTRESTORE_UPDATE_PROCESS_STATS_INTERVAL);
@@ -14486,6 +14790,7 @@ ACTOR Future<Void> storageServer(IKeyValueStore* persistentData,
 		self.setTssPair(ssi.tssPairID.get());
 		ASSERT(self.isTss());
 	}
+	static_assert(sizeof(self) < 16384, "FastAlloc doesn't allow allocations larger than 16KB");
 	TraceEvent("StorageServerInitProgress", ssi.id())
 	    .detail("EngineType", self.storage.getKeyValueStoreType().toString())
 	    .detail("Step", "4.StartInit");
@@ -14495,6 +14800,7 @@ ACTOR Future<Void> storageServer(IKeyValueStore* persistentData,
 	self.folder = folder;
 	self.checkpointFolder = joinPath(self.folder, serverCheckpointFolder);
 	self.fetchedCheckpointFolder = joinPath(self.folder, fetchedCheckpointFolder);
+	self.bulkDumpFolder = joinPath(self.folder, serverBulkDumpFolder);
 	self.actors.add(rocksdbLogCleaner(folder));
 
 	try {
@@ -14510,6 +14816,8 @@ ACTOR Future<Void> storageServer(IKeyValueStore* persistentData,
 
 		platform::createDirectory(self.checkpointFolder);
 		platform::createDirectory(self.fetchedCheckpointFolder);
+
+		cleanUpBulkDumpFolder(&self);
 
 		EncryptionAtRestMode encryptionMode = wait(self.storage.encryptionMode());
 		TraceEvent("StorageServerInitProgress", ssi.id())
@@ -14611,6 +14919,7 @@ ACTOR Future<Void> storageServer(IKeyValueStore* persistentData,
 	self.folder = folder;
 	self.checkpointFolder = joinPath(self.folder, serverCheckpointFolder);
 	self.fetchedCheckpointFolder = joinPath(self.folder, fetchedCheckpointFolder);
+	self.bulkDumpFolder = joinPath(self.folder, serverBulkDumpFolder);
 
 	if (!directoryExists(self.checkpointFolder)) {
 		TraceEvent(SevWarnAlways, "SSRebootCheckpointDirNotExists", self.thisServerID);
@@ -14620,6 +14929,8 @@ ACTOR Future<Void> storageServer(IKeyValueStore* persistentData,
 		TraceEvent(SevWarnAlways, "SSRebootFetchedCheckpointDirNotExists", self.thisServerID);
 		platform::createDirectory(self.fetchedCheckpointFolder);
 	}
+
+	cleanUpBulkDumpFolder(&self);
 
 	self.actors.add(rocksdbLogCleaner(folder));
 	try {

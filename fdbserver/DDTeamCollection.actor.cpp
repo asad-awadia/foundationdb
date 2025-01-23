@@ -199,7 +199,7 @@ public:
 	// Random selection for load balance
 	ACTOR static Future<Void> getTeamForBulkLoad(DDTeamCollection* self, GetTeamRequest req) {
 		try {
-			TraceEvent(SevInfo, "DDBulkLoadTaskGetTeamReqReceived", self->distributorId)
+			TraceEvent(SevInfo, "DDBulkLoadEngineTaskGetTeamReqReceived", self->distributorId)
 			    .detail("TCReady", self->readyToStart.isReady())
 			    .detail("TeamBuilderValid", self->teamBuilder.isValid())
 			    .detail("TeamBuilderReady", self->teamBuilder.isValid() ? self->teamBuilder.isReady() : false)
@@ -208,7 +208,7 @@ public:
 			    .detail("TeamSize", self->teams.size());
 			wait(self->checkBuildTeams());
 
-			TraceEvent(SevInfo, "DDBulkLoadTaskGetTeamCheckBuildTeamDone", self->distributorId)
+			TraceEvent(SevInfo, "DDBulkLoadEngineTaskGetTeamCheckBuildTeamDone", self->distributorId)
 			    .detail("TCReady", self->readyToStart.isReady())
 			    .detail("TeamBuilderValid", self->teamBuilder.isValid())
 			    .detail("TeamBuilderReady", self->teamBuilder.isValid() ? self->teamBuilder.isReady() : false)
@@ -221,7 +221,7 @@ public:
 				// a data movement to that team can't be completed and such a move
 				// may block the primary DC from reaching "storage_recovered".
 				auto team = self->findTeamFromServers(req.completeSources, /*wantHealthy=*/false);
-				TraceEvent(SevWarn, "DDBulkLoadTaskGetTeamRemoteDCNotReady", self->distributorId)
+				TraceEvent(SevWarn, "DDBulkLoadEngineTaskGetTeamRemoteDCNotReady", self->distributorId)
 				    .suppressFor(1.0)
 				    .detail("Primary", self->primary)
 				    .detail("Team", team.present() ? describe(team.get()->getServerIDs()) : "");
@@ -251,7 +251,8 @@ public:
 					std::vector<UID> serverIds = dest->getServerIDs();
 					for (const auto& serverId : serverIds) {
 						if (serverId == srcId) {
-							ok = false; // Do not select a team that has a server owning the bulk loading range
+							ok = false; // Do not select a team that has a server owning the bulk loading range.
+							// TODO(BulkLoad): remove this later. Require the support in SS.
 							break;
 						}
 					}
@@ -268,7 +269,7 @@ public:
 			Optional<Reference<IDataDistributionTeam>> res;
 			if (candidateTeams.size() >= 1) {
 				res = deterministicRandom()->randomChoice(candidateTeams);
-				TraceEvent(SevInfo, "DDBulkLoadTaskGetTeamReply", self->distributorId)
+				TraceEvent(SevInfo, "DDBulkLoadEngineTaskGetTeamReply", self->distributorId)
 				    .detail("TCReady", self->readyToStart.isReady())
 				    .detail("SrcIds", describe(req.src))
 				    .detail("Primary", self->isPrimary())
@@ -280,7 +281,7 @@ public:
 				    .detail("DestIds", describe(res.get()->getServerIDs()))
 				    .detail("DestTeam", res.get()->getTeamID());
 			} else {
-				TraceEvent(SevWarnAlways, "DDBulkLoadTaskGetTeamFailedToFindValidTeam", self->distributorId)
+				TraceEvent(SevWarnAlways, "DDBulkLoadEngineTaskGetTeamFailedToFindValidTeam", self->distributorId)
 				    .detail("TCReady", self->readyToStart.isReady())
 				    .detail("SrcIds", describe(req.src))
 				    .detail("Primary", self->isPrimary())
@@ -2314,20 +2315,28 @@ public:
 			takeRest = self->server_info.size() <= self->configuration.storageTeamSize ||
 			           self->machine_info.size() < self->configuration.storageTeamSize || imbalance;
 
+			if (SERVER_KNOBS->PERPETUAL_WIGGLE_PAUSE_AFTER_TSS_TARGET_MET &&
+			    self->configuration.storageMigrationType == StorageMigrationType::DEFAULT) {
+				takeRest = takeRest || (self->getTargetTSSInDC() > 0 && self->reachTSSPairTarget());
+			}
+
 			// log the extra delay and change the wiggler state
 			if (takeRest) {
 				self->storageWiggler->setWiggleState(StorageWiggler::PAUSE);
-				if (self->configuration.storageMigrationType == StorageMigrationType::GRADUAL) {
-					TraceEvent(SevWarn, "PerpetualStorageWiggleSleep", self->distributorId)
-					    .suppressFor(SERVER_KNOBS->PERPETUAL_WIGGLE_DELAY * 4)
-					    .detail("Primary", self->primary)
-					    .detail("ImbalanceFactor",
-					            SERVER_KNOBS->PW_MAX_SS_LESSTHAN_MIN_BYTES_BALANCE_RATIO ? numSSToBeLoadBytesBalanced
-					                                                                     : ratio)
-					    .detail("ServerSize", self->server_info.size())
-					    .detail("MachineSize", self->machine_info.size())
-					    .detail("StorageTeamSize", self->configuration.storageTeamSize);
-				}
+				Severity sev =
+				    self->configuration.storageMigrationType == StorageMigrationType::GRADUAL ? SevWarn : SevInfo;
+				TraceEvent(sev, "PerpetualStorageWiggleSleep", self->distributorId)
+				    .suppressFor(SERVER_KNOBS->PERPETUAL_WIGGLE_DELAY * 4)
+				    .detail("Primary", self->primary)
+				    .detail("ImbalanceFactor",
+				            SERVER_KNOBS->PW_MAX_SS_LESSTHAN_MIN_BYTES_BALANCE_RATIO ? numSSToBeLoadBytesBalanced
+				                                                                     : ratio)
+				    .detail("ServerSize", self->server_info.size())
+				    .detail("MachineSize", self->machine_info.size())
+				    .detail("StorageTeamSize", self->configuration.storageTeamSize)
+				    .detail("TargetTSSInDC", self->getTargetTSSInDC())
+				    .detail("ReachTSSPairTarget", self->reachTSSPairTarget())
+				    .detail("MigrationType", self->configuration.storageMigrationType.toString());
 			}
 		}
 		return Void();

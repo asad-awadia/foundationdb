@@ -984,11 +984,11 @@ static bool shardBackwardMergeFeasible(DataDistributionTracker* self, KeyRange c
 }
 
 // Must be atomic
-void createShardToBulkLoad(DataDistributionTracker* self, BulkLoadState bulkLoadState) {
-	KeyRange keys = bulkLoadState.getRange();
+void createShardToBulkLoad(DataDistributionTracker* self, BulkLoadTaskState bulkLoadTaskState) {
+	KeyRange keys = bulkLoadTaskState.getRange();
 	ASSERT(!keys.empty());
-	TraceEvent e(SevInfo, "DDBulkLoadCreateShardToBulkLoad", self->distributorId);
-	e.detail("TaskId", bulkLoadState.getTaskId());
+	TraceEvent e(SevInfo, "DDBulkLoadEngineCreateShardToBulkLoad", self->distributorId);
+	e.detail("TaskId", bulkLoadTaskState.getTaskId());
 	e.detail("BulkLoadRange", keys);
 	// Create shards at the two ends and do not data move for those shards
 	// Create a new shard and trigger data move for bulk loading on the new shard
@@ -996,8 +996,8 @@ void createShardToBulkLoad(DataDistributionTracker* self, BulkLoadState bulkLoad
 	for (auto it : self->shards->intersectingRanges(keys)) {
 		if (it->range().begin < keys.begin) {
 			KeyRange leftRange = Standalone(KeyRangeRef(it->range().begin, keys.begin));
-			restartShardTrackers(self, leftRange);
 			e.detail("FirstSplitShard", it->range());
+			restartShardTrackers(self, leftRange);
 		}
 		break;
 	}
@@ -1006,8 +1006,8 @@ void createShardToBulkLoad(DataDistributionTracker* self, BulkLoadState bulkLoad
 	for (auto it : self->shards->intersectingRanges(keys)) {
 		if (it->range().end > keys.end) {
 			KeyRange rightRange = Standalone(KeyRangeRef(keys.end, it->range().end));
-			restartShardTrackers(self, rightRange);
 			e.detail("LastSplitShard", it->range());
+			restartShardTrackers(self, rightRange);
 			break;
 		}
 	}
@@ -1025,7 +1025,7 @@ void createShardToBulkLoad(DataDistributionTracker* self, BulkLoadState bulkLoad
 	restartShardTrackers(self, keys, ShardMetrics(oldStats, now(), shardCount));
 	self->shardsAffectedByTeamFailure->defineShard(keys);
 	self->output.send(
-	    RelocateShard(keys, DataMovementReason::TEAM_HEALTHY, RelocateReason::OTHER, bulkLoadState.getTaskId()));
+	    RelocateShard(keys, DataMovementReason::TEAM_HEALTHY, RelocateReason::OTHER, bulkLoadTaskState.getTaskId()));
 	e.detail("NewShardToLoad", keys);
 	return;
 }
@@ -1684,7 +1684,7 @@ struct DataDistributionTrackerImpl {
 					triggerStorageQueueRebalance(self, req);
 				}
 				when(BulkLoadShardRequest req = waitNext(self->triggerShardBulkLoading)) {
-					createShardToBulkLoad(self, req.bulkLoadState);
+					createShardToBulkLoad(self, req.bulkLoadTaskState);
 				}
 				when(wait(self->actors.getResult())) {}
 				when(TenantCacheTenantCreated newTenant = waitNext(tenantCreationSignal.getFuture())) {

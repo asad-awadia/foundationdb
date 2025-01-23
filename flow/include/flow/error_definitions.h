@@ -156,10 +156,14 @@ ERROR( audit_storage_task_outdated, 1234, "Audit task is scheduled by an outdate
 ERROR( transaction_throttled_hot_shard, 1235, "Transaction throttled due to hot shard" )
 ERROR( storage_replica_comparison_error, 1236, "Storage replicas not consistent" )
 ERROR( unreachable_storage_replica, 1237, "Storage replica cannot be reached" )
-ERROR( bulkload_task_failed, 1238, "Bulk loading task failed")
+ERROR( bulkload_task_failed, 1238, "Bulk loading task failed" )
 ERROR( bulkload_task_outdated, 1239, "Bulk loading task outdated" )
 ERROR( range_lock_failed, 1241, "Lock range failed" )
 ERROR( transaction_rejected_range_locked, 1242, "Transaction rejected due to range lock" )
+ERROR( bulkdump_task_failed, 1243, "Bulk dumping task failed" )
+ERROR( bulkdump_task_outdated, 1244, "Bulk dumping task outdated" )
+ERROR( bulkload_fileset_invalid_filepath, 1245, "Bulkload fileset provides invalid filepath" )
+ERROR( bulkload_manifest_decode_error, 1246, "Bulkload manifest string is failed to decode" )
 
 // 15xx Platform errors
 ERROR( platform_error, 1500, "Platform error" )
@@ -412,6 +416,10 @@ ERROR( digital_signature_ops_error, 6002, "Digital signature operation error" )
 ERROR( authorization_token_verify_failed, 6003, "Failed to verify authorization token" )
 ERROR( pkey_decode_error, 6004, "Failed to decode public/private key" )
 ERROR( pkey_encode_error, 6005, "Failed to encode public/private key" )
+
+// gRPC error
+ERROR( grpc_error, 7000, "gRPC Error" )
+
 // clang-format on
 
 #undef ERROR

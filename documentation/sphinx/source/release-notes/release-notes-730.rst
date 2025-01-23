@@ -2,6 +2,33 @@
 Release Notes
 #############
 
+7.3.59
+======
+* Same as 7.3.58 release with AVX enabled.
+
+7.3.58
+======
+* Updated fdbmonitor to only delay the restart of fdbserver if the process exited with an exit code other than 0. `(PR #11812) <https://github.com/apple/foundationdb/pull/11812>`_
+* Added knob to pause perpetual storage wiggle when TSS count target is met. `(PR #11824) <https://github.com/apple/foundationdb/pull/11824>`_
+* Updated exclusion code to reduce the requests that are made by locality-based exclusions. `(PR #11848) <https://github.com/apple/foundationdb/pull/11848>`_
+* Added multiple improvements to reduce the false positive rate of gray failure triggered recoveries. `(PR #11850) <https://github.com/apple/foundationdb/pull/11850>`_, `(PR #11852) <https://github.com/apple/foundationdb/pull/11852>`_, `(PR #11885) <https://github.com/apple/foundationdb/pull/11885>`_
+* Added a knob to use direct IO for ShardedRocks storage engine. `(PR #11891) <https://github.com/apple/foundationdb/pull/11891>`_
+* Added a knob to compact based on number of range deletions in file for ShardedRocks storage engine. `(PR #11890) <https://github.com/apple/foundationdb/pull/11890>`_
+* Updated RocksDB force flush interval based on the last flush time. `(PR #11845) <https://github.com/apple/foundationdb/pull/11845>`_
+
+7.3.57
+======
+* Same as 7.3.56 release with AVX enabled.
+
+7.3.56
+======
+* Added an option to force flush if RocksCb flush does not happen within a time interval. `(PR #11792) <https://github.com/apple/foundationdb/pull/11792>`_
+* Changed RocksDB histogram sample rate to 1. `(PR #11794) <https://github.com/apple/foundationdb/pull/11794>`_
+* Updated TLS input handling to allow multiple Criteria per NID. `(PR #11763) <https://github.com/apple/foundationdb/pull/11763>`_
+* Added Sharded RocksDB knobs and metrics for bloom filters. `(PR #11785) <https://github.com/apple/foundationdb/pull/11785>`_
+* Fixed a backup agent crash bug when receiving an invalid token error from S3. `(PR #11774) <https://github.com/apple/foundationdb/pull/11774>`_
+* Updated ROCKSDB_MEMTABLE_MAX_RANGE_DELETIONS Knob to prevent OOMs of RocksDB storage servers `(PR #11739) <https://github.com/apple/foundationdb/pull/11739>`_
+
 7.3.55
 ======
 * Same as 7.3.54 release with AVX enabled.

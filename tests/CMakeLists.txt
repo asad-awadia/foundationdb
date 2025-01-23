@@ -152,6 +152,7 @@ if(WITH_PYTHON)
   add_fdb_test(TEST_FILES rare/BlobRestoreLarge.toml IGNORE)
   add_fdb_test(TEST_FILES rare/BlobRestoreToVersion.toml)
   add_fdb_test(TEST_FILES rare/BlobRestoreTenantMode.toml)
+  add_fdb_test(TEST_FILES fast/BulkDumping.toml)
   add_fdb_test(TEST_FILES fast/BulkLoading.toml)
   add_fdb_test(TEST_FILES fast/CacheTest.toml)
   add_fdb_test(TEST_FILES fast/CloggedSideband.toml)
@@ -163,6 +164,7 @@ if(WITH_PYTHON)
   add_fdb_test(TEST_FILES fast/ConstrainedRandomSelector.toml)
   add_fdb_test(TEST_FILES fast/CycleAndLock.toml)
   add_fdb_test(TEST_FILES fast/CycleTest.toml)
+  add_fdb_test(TEST_FILES fast/RocksdbNondeterministicTest.toml)
   add_fdb_test(TEST_FILES rare/ChangeFeeds.toml)
   add_fdb_test(TEST_FILES rare/ChangeFeedOperations.toml)
   add_fdb_test(TEST_FILES rare/ChangeFeedOperationsMove.toml)
@@ -205,6 +207,7 @@ if(WITH_PYTHON)
   add_fdb_test(TEST_FILES fast/ReportConflictingKeys.toml)
   add_fdb_test(TEST_FILES fast/RESTUnit.toml IGNORE)
   add_fdb_test(TEST_FILES fast/SelectorCorrectness.toml)
+  add_fdb_test(TEST_FILES fast/ShardedRocksNondeterministicTest.toml)
   add_fdb_test(TEST_FILES fast/Sideband.toml)
   add_fdb_test(TEST_FILES fast/SidebandSingle.toml)
   add_fdb_test(TEST_FILES fast/SidebandWithStatus.toml)
@@ -419,23 +422,23 @@ if(WITH_PYTHON)
     TEST_FILES restarting/to_7.2.0_until_7.3.0/CycleTestRestart-1.toml
     restarting/to_7.2.0_until_7.3.0/CycleTestRestart-2.toml IGNORE)
   add_fdb_test(
-    TEST_FILES restarting/to_7.3.0_until_7.3.39/BlobGranuleRestartCorrectness-1.toml
-    restarting/to_7.3.0_until_7.3.39/BlobGranuleRestartCorrectness-2.toml IGNORE)
+    TEST_FILES restarting/to_7.3.0_until_7.3.51/BlobGranuleRestartCorrectness-1.toml
+    restarting/to_7.3.0_until_7.3.51/BlobGranuleRestartCorrectness-2.toml IGNORE)
   add_fdb_test(
-    TEST_FILES restarting/to_7.3.0_until_7.3.39/ConfigureStorageMigrationTestRestart-1.toml
-    restarting/to_7.3.0_until_7.3.39/ConfigureStorageMigrationTestRestart-2.toml)
+    TEST_FILES restarting/to_7.3.0_until_7.3.51/ConfigureStorageMigrationTestRestart-1.toml
+    restarting/to_7.3.0_until_7.3.51/ConfigureStorageMigrationTestRestart-2.toml)
   add_fdb_test(
-    TEST_FILES restarting/to_7.3.0_until_7.3.39/CycleTestRestart-1.toml
-    restarting/to_7.3.0_until_7.3.39/CycleTestRestart-2.toml)
+    TEST_FILES restarting/to_7.3.0_until_7.3.51/CycleTestRestart-1.toml
+    restarting/to_7.3.0_until_7.3.51/CycleTestRestart-2.toml)
   add_fdb_test(
-    TEST_FILES restarting/to_7.3.39_until_7.4.0/BlobGranuleRestartCorrectness-1.toml
-    restarting/to_7.3.39_until_7.4.0/BlobGranuleRestartCorrectness-2.toml IGNORE)
+    TEST_FILES restarting/to_7.3.51_until_7.4.0/BlobGranuleRestartCorrectness-1.toml
+    restarting/to_7.3.51_until_7.4.0/BlobGranuleRestartCorrectness-2.toml IGNORE)
   add_fdb_test(
-    TEST_FILES restarting/to_7.3.39_until_7.4.0/ConfigureStorageMigrationTestRestart-1.toml
-    restarting/to_7.3.39_until_7.4.0/ConfigureStorageMigrationTestRestart-2.toml)
+    TEST_FILES restarting/to_7.3.51_until_7.4.0/ConfigureStorageMigrationTestRestart-1.toml
+    restarting/to_7.3.51_until_7.4.0/ConfigureStorageMigrationTestRestart-2.toml)
   add_fdb_test(
-    TEST_FILES restarting/to_7.3.39_until_7.4.0/CycleTestRestart-1.toml
-    restarting/to_7.3.39_until_7.4.0/CycleTestRestart-2.toml)
+    TEST_FILES restarting/to_7.3.51_until_7.4.0/CycleTestRestart-1.toml
+    restarting/to_7.3.51_until_7.4.0/CycleTestRestart-2.toml)
   add_fdb_test(
     TEST_FILES restarting/to_7.4.0/BlobGranuleRestartCorrectness-1.toml
     restarting/to_7.4.0/BlobGranuleRestartCorrectness-2.toml)
@@ -450,6 +453,7 @@ if(WITH_PYTHON)
   add_fdb_test(TEST_FILES slow/ApiCorrectnessAtomicRestore.toml)
   add_fdb_test(TEST_FILES slow/ApiCorrectnessSwitchover.toml)
   add_fdb_test(TEST_FILES slow/ApiCorrectnessWithConsistencyCheck.toml)
+  add_fdb_test(TEST_FILES slow/BackupCorrectnessPartitioned.toml)
   add_fdb_test(TEST_FILES slow/ClogWithRollbacks.toml)
   add_fdb_test(TEST_FILES slow/CloggedCycleTest.toml)
   add_fdb_test(TEST_FILES slow/CloggedStorefront.toml)

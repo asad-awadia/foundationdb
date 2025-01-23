@@ -20,11 +20,15 @@
 
 #include "fdbclient/S3BlobStore.h"
 
+#include "fdbclient/ClientKnobs.h"
+#include "fdbclient/Knobs.h"
 #include "flow/IConnection.h"
+#include "flow/Trace.h"
 #include "md5/md5.h"
 #include "libb64/encode.h"
 #include "fdbclient/sha1/SHA1.h"
 #include <climits>
+#include <iostream>
 #include <time.h>
 #include <iomanip>
 #include <openssl/sha.h>
@@ -33,6 +37,8 @@
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string.hpp>
+#include <boost/algorithm/string.hpp>
+#include <boost/algorithm/hex.hpp>
 #include "flow/IAsyncFile.h"
 #include "flow/Hostname.h"
 #include "flow/UnitTest.h"
@@ -98,6 +104,7 @@ S3BlobStoreEndpoint::BlobKnobs::BlobKnobs() {
 	max_delay_retryable_error = CLIENT_KNOBS->BLOBSTORE_MAX_DELAY_RETRYABLE_ERROR;
 	max_delay_connection_failed = CLIENT_KNOBS->BLOBSTORE_MAX_DELAY_CONNECTION_FAILED;
 	sdk_auth = false;
+	enable_object_integrity_check = CLIENT_KNOBS->BLOBSTORE_ENABLE_OBJECT_INTEGRITY_CHECK;
 	global_connection_pool = CLIENT_KNOBS->BLOBSTORE_GLOBAL_CONNECTION_POOL;
 }
 
@@ -139,6 +146,7 @@ bool S3BlobStoreEndpoint::BlobKnobs::set(StringRef name, int value) {
 	TRY_PARAM(max_delay_retryable_error, dre);
 	TRY_PARAM(max_delay_connection_failed, dcf);
 	TRY_PARAM(sdk_auth, sa);
+	TRY_PARAM(enable_object_integrity_check, eoic);
 	TRY_PARAM(global_connection_pool, gcp);
 #undef TRY_PARAM
 	return false;
@@ -178,6 +186,7 @@ std::string S3BlobStoreEndpoint::BlobKnobs::getURLParameters() const {
 	_CHECK_PARAM(max_send_bytes_per_second, sbps);
 	_CHECK_PARAM(max_recv_bytes_per_second, rbps);
 	_CHECK_PARAM(sdk_auth, sa);
+	_CHECK_PARAM(enable_object_integrity_check, eoic);
 	_CHECK_PARAM(global_connection_pool, gcp);
 	_CHECK_PARAM(max_delay_retryable_error, dre);
 	_CHECK_PARAM(max_delay_connection_failed, dcf);
@@ -422,7 +431,10 @@ std::string constructResourcePath(Reference<S3BlobStoreEndpoint> b,
 	}
 
 	if (!object.empty()) {
-		resource += "/";
+		// Don't add a slash if the object starts with one
+		if (!object.starts_with("/")) {
+			resource += "/";
+		}
 		resource += object;
 	}
 
@@ -432,8 +444,8 @@ std::string constructResourcePath(Reference<S3BlobStoreEndpoint> b,
 ACTOR Future<bool> bucketExists_impl(Reference<S3BlobStoreEndpoint> b, std::string bucket) {
 	wait(b->requestRateRead->getAllowance(1));
 
-	std::string resource = constructResourcePath(b, bucket, "");
-	HTTP::Headers headers;
+	state std::string resource = constructResourcePath(b, bucket, "");
+	state HTTP::Headers headers;
 
 	Reference<HTTP::IncomingResponse> r = wait(b->doRequest("HEAD", resource, headers, nullptr, 0, { 200, 404 }));
 	return r->code == 200;
@@ -446,8 +458,8 @@ Future<bool> S3BlobStoreEndpoint::bucketExists(std::string const& bucket) {
 ACTOR Future<bool> objectExists_impl(Reference<S3BlobStoreEndpoint> b, std::string bucket, std::string object) {
 	wait(b->requestRateRead->getAllowance(1));
 
-	std::string resource = constructResourcePath(b, bucket, object);
-	HTTP::Headers headers;
+	state std::string resource = constructResourcePath(b, bucket, object);
+	state HTTP::Headers headers;
 
 	Reference<HTTP::IncomingResponse> r = wait(b->doRequest("HEAD", resource, headers, nullptr, 0, { 200, 404 }));
 	return r->code == 200;
@@ -460,8 +472,8 @@ Future<bool> S3BlobStoreEndpoint::objectExists(std::string const& bucket, std::s
 ACTOR Future<Void> deleteObject_impl(Reference<S3BlobStoreEndpoint> b, std::string bucket, std::string object) {
 	wait(b->requestRateDelete->getAllowance(1));
 
-	std::string resource = constructResourcePath(b, bucket, object);
-	HTTP::Headers headers;
+	state std::string resource = constructResourcePath(b, bucket, object);
+	state HTTP::Headers headers;
 	// 200 or 204 means object successfully deleted, 404 means it already doesn't exist, so any of those are considered
 	// successful
 	Reference<HTTP::IncomingResponse> r =
@@ -549,23 +561,24 @@ Future<Void> S3BlobStoreEndpoint::deleteRecursively(std::string const& bucket,
 }
 
 ACTOR Future<Void> createBucket_impl(Reference<S3BlobStoreEndpoint> b, std::string bucket) {
+	state UnsentPacketQueue packets;
 	wait(b->requestRateWrite->getAllowance(1));
 
 	bool exists = wait(b->bucketExists(bucket));
 	if (!exists) {
-		std::string resource = constructResourcePath(b, bucket, "");
-		HTTP::Headers headers;
+		state std::string resource = constructResourcePath(b, bucket, "");
+		state HTTP::Headers headers;
 
 		std::string region = b->getRegion();
 		if (region.empty()) {
 			Reference<HTTP::IncomingResponse> r =
 			    wait(b->doRequest("PUT", resource, headers, nullptr, 0, { 200, 409 }));
 		} else {
-			UnsentPacketQueue packets;
-			StringRef body(format("<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-			                      "  <LocationConstraint>%s</LocationConstraint>"
-			                      "</CreateBucketConfiguration>",
-			                      region.c_str()));
+			Standalone<StringRef> body(
+			    format("<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+			           "  <LocationConstraint>%s</LocationConstraint>"
+			           "</CreateBucketConfiguration>",
+			           region.c_str()));
 			PacketWriter pw(packets.getWriteBuffer(), nullptr, Unversioned());
 			pw.serializeBytes(body);
 
@@ -583,8 +596,8 @@ Future<Void> S3BlobStoreEndpoint::createBucket(std::string const& bucket) {
 ACTOR Future<int64_t> objectSize_impl(Reference<S3BlobStoreEndpoint> b, std::string bucket, std::string object) {
 	wait(b->requestRateRead->getAllowance(1));
 
-	std::string resource = constructResourcePath(b, bucket, object);
-	HTTP::Headers headers;
+	state std::string resource = constructResourcePath(b, bucket, object);
+	state HTTP::Headers headers;
 
 	Reference<HTTP::IncomingResponse> r = wait(b->doRequest("HEAD", resource, headers, nullptr, 0, { 200, 404 }));
 	if (r->code == 404)
@@ -1032,6 +1045,14 @@ ACTOR Future<Reference<HTTP::IncomingResponse>> doRequest_impl(Reference<S3BlobS
 			connectionEstablished = true;
 			connID = rconn.conn->getDebugID();
 			reqStartTimer = g_network->timer();
+			TraceEvent(SevDebug, "S3BlobStoreEndpointConnected")
+			    .suppressFor(60)
+			    .detail("RemoteEndpoint", rconn.conn->getPeerAddress())
+			    .detail("Reusing", reusingConn)
+			    .detail("ConnID", connID)
+			    .detail("Verb", req->verb)
+			    .detail("Resource", resource)
+			    .detail("Proxy", bstore->proxyHost.orDefault(""));
 
 			try {
 				if (s3TokenError && isWriteRequest(req->verb) && CLIENT_KNOBS->BACKUP_ALLOW_DRYRUN) {
@@ -1101,8 +1122,8 @@ ACTOR Future<Reference<HTTP::IncomingResponse>> doRequest_impl(Reference<S3BlobS
 
 			Future<Reference<HTTP::IncomingResponse>> reqF =
 			    HTTP::doRequest(rconn.conn, req, bstore->sendRate, &bstore->s_stats.bytes_sent, bstore->recvRate);
-			// if we reused a connection from the pool, and immediately got an error, retry immediately discarding the
-			// connection
+			// if we reused a connection from the pool, and immediately got an error, retry immediately discarding
+			// the connection
 			if (reqF.isReady() && reusingConn) {
 				fastRetry = true;
 			}
@@ -1123,9 +1144,11 @@ ACTOR Future<Reference<HTTP::IncomingResponse>> doRequest_impl(Reference<S3BlobS
 				++bstore->blobStats->expiredConnections;
 			}
 			rconn.conn.clear();
-
 		} catch (Error& e) {
-			TraceEvent("S3BlobStoreDoRequestError").errorUnsuppressed(e);
+			TraceEvent("S3BlobStoreDoRequestError")
+			    .errorUnsuppressed(e)
+			    .detail("Verb", verb)
+			    .detail("Resource", resource);
 			if (e.code() == error_code_actor_cancelled)
 				throw;
 			// TODO: should this also do rconn.conn.clear()? (would need to extend lifetime outside of try block)
@@ -1314,7 +1337,7 @@ ACTOR Future<Void> listObjectsStream_impl(Reference<S3BlobStoreEndpoint> bstore,
 		wait(bstore->concurrentLists.take());
 		state FlowLock::Releaser listReleaser(bstore->concurrentLists, 1);
 
-		HTTP::Headers headers;
+		state HTTP::Headers headers;
 		state std::string fullResource = resource + lastFile;
 		lastFile.clear();
 		Reference<HTTP::IncomingResponse> r =
@@ -1495,7 +1518,7 @@ ACTOR Future<std::vector<std::string>> listBuckets_impl(Reference<S3BlobStoreEnd
 		wait(bstore->concurrentLists.take());
 		state FlowLock::Releaser listReleaser(bstore->concurrentLists, 1);
 
-		HTTP::Headers headers;
+		state HTTP::Headers headers;
 		state std::string fullResource = resource + lastName;
 		Reference<HTTP::IncomingResponse> r =
 		    wait(bstore->doRequest("GET", fullResource, headers, nullptr, 0, { 200 }));
@@ -1581,17 +1604,32 @@ std::string S3BlobStoreEndpoint::hmac_sha1(Credentials const& creds, std::string
 	return SHA1::from_string(kopad);
 }
 
-std::string sha256_hex(std::string str) {
-	unsigned char hash[SHA256_DIGEST_LENGTH];
+static void sha256(const unsigned char* data, const size_t len, unsigned char* hash) {
 	SHA256_CTX sha256;
 	SHA256_Init(&sha256);
-	SHA256_Update(&sha256, str.c_str(), str.size());
+	SHA256_Update(&sha256, data, len);
 	SHA256_Final(hash, &sha256);
+}
+
+std::string sha256_hex(std::string str) {
+	unsigned char hash[SHA256_DIGEST_LENGTH];
+	sha256((const unsigned char*)str.c_str(), str.size(), hash);
 	std::stringstream ss;
 	for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
 		ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
 	}
 	return ss.str();
+}
+
+// Return base64'd SHA256 hash of input string.
+std::string sha256_base64(std::string str) {
+	unsigned char hash[SHA256_DIGEST_LENGTH];
+	sha256((const unsigned char*)str.c_str(), str.size(), hash);
+	std::string hashAsStr = std::string((char*)hash, SHA256_DIGEST_LENGTH);
+	std::string sig = base64::encoder::from_string(hashAsStr);
+	// base64 encoded blocks end in \n so remove last character.
+	sig.resize(sig.size() - 1);
+	return sig;
 }
 
 std::string hmac_sha256_hex(std::string key, std::string msg) {
@@ -1674,8 +1712,8 @@ void S3BlobStoreEndpoint::setV4AuthHeaders(std::string const& verb,
 	using namespace boost::algorithm;
 	// Create the canonical headers and signed headers
 	ASSERT(!headers["Host"].empty());
-	// Using unsigned payload here and adding content-md5 to the signed headers. It may be better to also include sha256
-	// sum for added security.
+	// Be careful. There is x-amz-content-sha256 for auth and then
+	// x-amz-checksum-sha256 for object integrity check.
 	headers["x-amz-content-sha256"] = "UNSIGNED-PAYLOAD";
 	headers["x-amz-date"] = amzDate;
 	std::vector<std::pair<std::string, std::string>> headersList;
@@ -1776,11 +1814,30 @@ ACTOR Future<std::string> readEntireFile_impl(Reference<S3BlobStoreEndpoint> bst
                                               std::string object) {
 	wait(bstore->requestRateRead->getAllowance(1));
 
-	std::string resource = constructResourcePath(bstore, bucket, object);
-	HTTP::Headers headers;
+	state std::string resource = constructResourcePath(bstore, bucket, object);
+	state HTTP::Headers headers;
+	// Set this header on the GET for it to volunteer saved checksum in the response headers.
+	// See https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html#API_GetObject_RequestSyntax
+	headers["x-amz-checksum-mode"] = "ENABLED";
 	Reference<HTTP::IncomingResponse> r = wait(bstore->doRequest("GET", resource, headers, nullptr, 0, { 200, 404 }));
 	if (r->code == 404)
 		throw file_not_found();
+	if (bstore->knobs.enable_object_integrity_check) {
+		// Verify the content. We set 'x-amz-checksum-mode' on the GET request above so
+		// the server will return the sha256 checksum we set when we uploaded the object in the
+		// GET response headers. See
+		// https://stackoverflow.com/questions/36540234/what-is-the-difference-getcontentmd5-and-getetag-of-aws-s3-putobjectresult
+		std::string checksumSHA256 = r->data.headers["x-amz-checksum-sha256"];
+		if (checksumSHA256.empty()) {
+			// This is what is thrown elsewhere when no expected etag.
+			throw http_bad_response();
+		}
+		// Calculate the sha256 checksum of the content and compare it to the checksum returned by the server.
+		std::string contentSHA256 = sha256_base64(r->data.content);
+		if (checksumSHA256 != contentSHA256) {
+			throw checksum_failed();
+		}
+	}
 	return r->data.content;
 }
 
@@ -1793,7 +1850,7 @@ ACTOR Future<Void> writeEntireFileFromBuffer_impl(Reference<S3BlobStoreEndpoint>
                                                   std::string object,
                                                   UnsentPacketQueue* pContent,
                                                   int contentLen,
-                                                  std::string contentMD5) {
+                                                  std::string contentHash) {
 	if (contentLen > bstore->knobs.multipart_max_part_size)
 		throw file_too_large();
 
@@ -1801,19 +1858,22 @@ ACTOR Future<Void> writeEntireFileFromBuffer_impl(Reference<S3BlobStoreEndpoint>
 	wait(bstore->concurrentUploads.take());
 	state FlowLock::Releaser uploadReleaser(bstore->concurrentUploads, 1);
 
-	std::string resource = constructResourcePath(bstore, bucket, object);
-	HTTP::Headers headers;
-	// Send MD5 sum for content so blobstore can verify it
-	headers["Content-MD5"] = contentMD5;
+	state std::string resource = constructResourcePath(bstore, bucket, object);
+	state HTTP::Headers headers;
+	// contentHash is calculated by the caller. It is md5 or sha256 dependent on
+	// enable_object_integrity_check setting. If the hash (md5 or sha256) we
+	// volunteer doesn't match that calculated serverside, the upload fails with:
+	// InvalidDigest</Code><Message>The Content-MD5 you specified was invalid.</Message>
+	if (bstore->knobs.enable_object_integrity_check) {
+		headers["x-amz-checksum-sha256"] = contentHash;
+		headers["x-amz-checksum-algorithm"] = "SHA256";
+	} else {
+		headers["Content-MD5"] = contentHash;
+	}
 	if (!CLIENT_KNOBS->BLOBSTORE_ENCRYPTION_TYPE.empty())
 		headers["x-amz-server-side-encryption"] = CLIENT_KNOBS->BLOBSTORE_ENCRYPTION_TYPE;
-	state Reference<HTTP::IncomingResponse> r =
+	Reference<HTTP::IncomingResponse> r =
 	    wait(bstore->doRequest("PUT", resource, headers, pContent, contentLen, { 200 }));
-
-	// For uploads, Blobstore returns an MD5 sum of uploaded content so check it.
-	if (!HTTP::verifyMD5(&r->data, false, contentMD5))
-		throw checksum_failed();
-
 	return Void();
 }
 
@@ -1834,16 +1894,31 @@ ACTOR Future<Void> writeEntireFile_impl(Reference<S3BlobStoreEndpoint> bstore,
 	// yield() every 20k or so.
 	wait(yield());
 
-	MD5_CTX sum;
-	::MD5_Init(&sum);
-	::MD5_Update(&sum, content.data(), content.size());
-	std::string sumBytes;
-	sumBytes.resize(16);
-	::MD5_Final((unsigned char*)sumBytes.data(), &sum);
-	std::string contentMD5 = base64::encoder::from_string(sumBytes);
-	contentMD5.resize(contentMD5.size() - 1);
+	// If enable_object_integrity_check is true, calculate the sha256 sum of the content.
+	// Otherwise, do md5. Save the calculated hash to contentHash. Whichever, when we
+	// upload to the server, it will check the hash -- md5 or sha256 -- and if a mismatch,
+	// the upload will fail. The difference is that sha256 is a better hash than md5 and
+	// when enable_object_integrity_check is set, we will verify the sha256 hash of the
+	// content when we download it too; we do not do this latter when
+	// enable_object_integrity_check is false (the etag returned in the GET response is an
+	// md5 most of the time but NOT always so it can't be relied upon. See
+	// https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html
+	std::string contentHash;
+	if (CLIENT_KNOBS->BLOBSTORE_ENABLE_OBJECT_INTEGRITY_CHECK) {
+		// If the content is small enough to fit in a single packet then we can calculate the sha256 sum now.
+		contentHash = sha256_base64(content);
+	} else {
+		MD5_CTX sum;
+		::MD5_Init(&sum);
+		::MD5_Update(&sum, content.data(), content.size());
+		std::string sumBytes;
+		sumBytes.resize(16);
+		::MD5_Final((unsigned char*)sumBytes.data(), &sum);
+		contentHash = base64::encoder::from_string(sumBytes);
+		contentHash.resize(contentHash.size() - 1);
+	}
 
-	wait(writeEntireFileFromBuffer_impl(bstore, bucket, object, &packets, content.size(), contentMD5));
+	wait(writeEntireFileFromBuffer_impl(bstore, bucket, object, &packets, content.size(), contentHash));
 	return Void();
 }
 
@@ -1857,9 +1932,9 @@ Future<Void> S3BlobStoreEndpoint::writeEntireFileFromBuffer(std::string const& b
                                                             std::string const& object,
                                                             UnsentPacketQueue* pContent,
                                                             int contentLen,
-                                                            std::string const& contentMD5) {
+                                                            std::string const& contentHash) {
 	return writeEntireFileFromBuffer_impl(
-	    Reference<S3BlobStoreEndpoint>::addRef(this), bucket, object, pContent, contentLen, contentMD5);
+	    Reference<S3BlobStoreEndpoint>::addRef(this), bucket, object, pContent, contentLen, contentHash);
 }
 
 ACTOR Future<int> readObject_impl(Reference<S3BlobStoreEndpoint> bstore,
@@ -1872,8 +1947,8 @@ ACTOR Future<int> readObject_impl(Reference<S3BlobStoreEndpoint> bstore,
 		return 0;
 	wait(bstore->requestRateRead->getAllowance(1));
 
-	std::string resource = constructResourcePath(bstore, bucket, object);
-	HTTP::Headers headers;
+	state std::string resource = constructResourcePath(bstore, bucket, object);
+	state HTTP::Headers headers;
 	headers["Range"] = format("bytes=%lld-%lld", offset, offset + length - 1);
 	Reference<HTTP::IncomingResponse> r =
 	    wait(bstore->doRequest("GET", resource, headers, nullptr, 0, { 200, 206, 404 }));
@@ -1900,9 +1975,9 @@ ACTOR static Future<std::string> beginMultiPartUpload_impl(Reference<S3BlobStore
                                                            std::string object) {
 	wait(bstore->requestRateWrite->getAllowance(1));
 
-	std::string resource = constructResourcePath(bstore, bucket, object);
+	state std::string resource = constructResourcePath(bstore, bucket, object);
 	resource += "?uploads";
-	HTTP::Headers headers;
+	state HTTP::Headers headers;
 	if (!CLIENT_KNOBS->BLOBSTORE_ENCRYPTION_TYPE.empty())
 		headers["x-amz-server-side-encryption"] = CLIENT_KNOBS->BLOBSTORE_ENCRYPTION_TYPE;
 	Reference<HTTP::IncomingResponse> r = wait(bstore->doRequest("POST", resource, headers, nullptr, 0, { 200 }));
@@ -1943,9 +2018,9 @@ ACTOR Future<std::string> uploadPart_impl(Reference<S3BlobStoreEndpoint> bstore,
 	wait(bstore->concurrentUploads.take());
 	state FlowLock::Releaser uploadReleaser(bstore->concurrentUploads, 1);
 
-	std::string resource = constructResourcePath(bstore, bucket, object);
+	state std::string resource = constructResourcePath(bstore, bucket, object);
 	resource += format("?partNumber=%d&uploadId=%s", partNumber, uploadID.c_str());
-	HTTP::Headers headers;
+	state HTTP::Headers headers;
 	// Send MD5 sum for content so blobstore can verify it
 	headers["Content-MD5"] = contentMD5;
 	state Reference<HTTP::IncomingResponse> r =
@@ -1996,9 +2071,9 @@ ACTOR Future<Void> finishMultiPartUpload_impl(Reference<S3BlobStoreEndpoint> bst
 		manifest += format("<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>\n", p.first, p.second.c_str());
 	manifest += "</CompleteMultipartUpload>";
 
-	std::string resource = constructResourcePath(bstore, bucket, object);
+	state std::string resource = constructResourcePath(bstore, bucket, object);
 	resource += format("?uploadId=%s", uploadID.c_str());
-	HTTP::Headers headers;
+	state HTTP::Headers headers;
 	PacketWriter pw(part_list.getWriteBuffer(manifest.size()), nullptr, Unversioned());
 	pw.serializeBytes(manifest);
 	Reference<HTTP::IncomingResponse> r =

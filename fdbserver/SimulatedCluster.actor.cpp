@@ -1805,22 +1805,12 @@ void redwoodStorageEngineConfig(SimulationConfig* simCfg) {
 void rocksdbStorageEngineConfig(SimulationConfig* simCfg) {
 	CODE_PROBE(true, "Simulated cluster using RocksDB storage engine", probe::assert::hasRocksDB);
 	simCfg->set_config("ssd-rocksdb-v1");
-	// Tests using the RocksDB engine are necessarily non-deterministic because of RocksDB
-	// background threads.
-	TraceEvent(SevWarnAlways, "RocksDBNonDeterminism")
-	    .detail("Explanation", "The RocksDB storage engine is threaded and non-deterministic");
-	noUnseed = true;
 }
 
 void shardedRocksDBStorageEngineConfig(SimulationConfig* simCfg) {
 	CODE_PROBE(true, "Simulated cluster using Sharded RocksDB storage engine", probe::assert::hasRocksDB);
 	simCfg->set_config("encryption_at_rest_mode=disabled");
 	simCfg->set_config("ssd-sharded-rocksdb");
-	// Tests using the RocksDB engine are necessarily non-deterministic because of RocksDB
-	// background threads.
-	TraceEvent(SevWarnAlways, "ShardedRocksDBNonDeterminism")
-	    .detail("Explanation", "The Sharded RocksDB storage engine is threaded and non-deterministic");
-	noUnseed = true;
 }
 
 const std::unordered_map<SimulationStorageEngine, StorageEngineConfigFunc> STORAGE_ENGINE_CONFIG_MAPPER = {
@@ -2937,12 +2927,13 @@ ACTOR void simulationSetupAndRun(std::string dataFolder,
 	state bool allowCreatingTenants = testConfig.allowCreatingTenants;
 
 	if (!SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA &&
-	    // NOTE: PhysicalShardMove and BulkLoading are required to have SHARDED_ROCKSDB storage engine working.
-	    // Inside the TOML file, the SHARD_ENCODE_LOCATION_METADATA is overridden, however, the
-	    // override will not take effect until the test starts. Here, we do an additional check
-	    // for this special simulation test.
+	    // NOTE: PhysicalShardMove and BulkLoading and Bulkdumping are required to have SHARDED_ROCKSDB storage engine
+	    // working. Inside the TOML file, the SHARD_ENCODE_LOCATION_METADATA is overridden, however, the override will
+	    // not take effect until the test starts. Here, we do an additional check for this special simulation test.
 	    (std::string_view(testFile).find("PhysicalShardMove") == std::string_view::npos &&
-	     std::string_view(testFile).find("BulkLoading") == std::string_view::npos)) {
+	     std::string_view(testFile).find("BulkLoading") == std::string_view::npos &&
+	     std::string_view(testFile).find("BulkDumping") == std::string_view::npos &&
+	     std::string_view(testFile).find("ShardedRocksNondeterministicTest") == std::string_view::npos)) {
 		testConfig.storageEngineExcludeTypes.insert(SimulationStorageEngine::SHARDED_ROCKSDB);
 	}
 
