@@ -286,7 +286,7 @@ private:
 		uniquify(info.tags);
 		keyInfo->insert(insertRange, info);
 		if (toCommit && SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST) {
-			toCommit->setShardChanged();
+			toCommit->setLogsChanged();
 		}
 	}
 
@@ -440,47 +440,6 @@ private:
 		}
 		if (!initialCommit)
 			txnStateStore->set(KeyValueRef(m.param1, m.param2));
-	}
-
-	void checkSetChangeFeedPrefix(MutationRef m) {
-		if (!m.param1.startsWith(changeFeedPrefix)) {
-			return;
-		}
-		if (toCommit && keyInfo) {
-			KeyRange r = std::get<0>(decodeChangeFeedValue(m.param2));
-			MutationRef privatized = m;
-			privatized.clearChecksumAndAccumulativeIndex();
-			privatized.param1 = m.param1.withPrefix(systemKeys.begin, arena);
-			auto ranges = keyInfo->intersectingRanges(r);
-			auto firstRange = ranges.begin();
-			++firstRange;
-			if (firstRange == ranges.end()) {
-				ranges.begin().value().populateTags();
-				if (acsBuilder != nullptr) {
-					updateMutationWithAcsAndAddMutationToAcsBuilder(acsBuilder,
-					                                                privatized,
-					                                                ranges.begin().value().tags,
-					                                                accumulativeChecksumIndex,
-					                                                epoch.get(),
-					                                                version,
-					                                                dbgid);
-				}
-				toCommit->addTags(ranges.begin().value().tags);
-			} else {
-				std::set<Tag> allSources;
-				for (auto r : ranges) {
-					r.value().populateTags();
-					allSources.insert(r.value().tags.begin(), r.value().tags.end());
-				}
-				if (acsBuilder != nullptr) {
-					updateMutationWithAcsAndAddMutationToAcsBuilder(
-					    acsBuilder, privatized, allSources, accumulativeChecksumIndex, epoch.get(), version, dbgid);
-				}
-				toCommit->addTags(allSources);
-			}
-			TraceEvent(SevDebug, "SendingPrivatized_ChangeFeed", dbgid).detail("M", privatized);
-			writeMutation(privatized);
-		}
 	}
 
 	void checkSetServerListPrefix(MutationRef m) {
@@ -655,6 +614,11 @@ private:
 		}
 		if (!initialCommit)
 			txnStateStore->set(KeyValueRef(m.param1, m.param2));
+
+		if (toCommit && SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST) {
+			toCommit->setLogsChanged();
+		}
+
 		if (!vecBackupKeys) {
 			return;
 		}
@@ -973,7 +937,7 @@ private:
 			                    ? ServerCacheInfo()
 			                    : keyInfo->rangeContainingKeyBefore(clearRange.begin).value());
 			if (toCommit && SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST) {
-				toCommit->setShardChanged();
+				toCommit->setLogsChanged();
 			}
 		}
 
@@ -1189,6 +1153,10 @@ private:
 		    .detail("RangeEnd", range.end)
 		    .detail("IntersectBegin", commonLogRange.begin)
 		    .detail("IntersectEnd", commonLogRange.end);
+
+		if (toCommit && SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST) {
+			toCommit->setLogsChanged();
+		}
 
 		// Remove the key range from the vector, if defined
 		if (vecBackupKeys) {
@@ -1570,7 +1538,6 @@ public:
 				checkSetCacheKeysPrefix(m);
 				checkSetConfigKeys(m);
 				checkSetServerListPrefix(m);
-				checkSetChangeFeedPrefix(m);
 				checkSetTSSMappingKeys(m);
 				checkSetTSSQuarantineKeys(m);
 				checkSetApplyMutationsEndRange(m);

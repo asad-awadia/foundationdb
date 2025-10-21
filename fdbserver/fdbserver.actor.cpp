@@ -73,6 +73,7 @@
 #include "fdbserver/WorkerInterface.actor.h"
 #include "fdbserver/pubsub.h"
 #include "fdbserver/OnDemandStore.h"
+#include "fdbserver/MockS3Server.h"
 #include "fdbserver/workloads/workloads.actor.h"
 #include "flow/ArgParseUtil.h"
 #include "flow/DeterministicRandom.h"
@@ -87,6 +88,7 @@
 #include "flow/FaultInjection.h"
 #include "flow/flow.h"
 #include "flow/network.h"
+#include "flow/SimpleCounter.h"
 
 #include "flow/swift.h"
 #include "flow/swift_concurrency_hooks.h"
@@ -134,7 +136,7 @@ enum {
 	OPT_DCID, OPT_MACHINE_CLASS, OPT_BUGGIFY, OPT_VERSION, OPT_BUILD_FLAGS, OPT_CRASHONERROR, OPT_HELP, OPT_NETWORKIMPL, OPT_NOBUFSTDOUT, OPT_BUFSTDOUTERR,
 	OPT_TRACECLOCK, OPT_NUMTESTERS, OPT_DEVHELP, OPT_PRINT_CODE_PROBES, OPT_ROLLSIZE, OPT_MAXLOGS, OPT_MAXLOGSSIZE, OPT_KNOB, OPT_UNITTESTPARAM, OPT_TESTSERVERS, OPT_TEST_ON_SERVERS, OPT_METRICSCONNFILE,
 	OPT_METRICSPREFIX, OPT_LOGGROUP, OPT_LOCALITY, OPT_IO_TRUST_SECONDS, OPT_IO_TRUST_WARN_ONLY, OPT_FILESYSTEM, OPT_PROFILER_RSS_SIZE, OPT_KVFILE,
-	OPT_TRACE_FORMAT, OPT_WHITELIST_BINPATH, OPT_BLOB_CREDENTIALS, OPT_CONFIG_PATH, OPT_USE_TEST_CONFIG_DB, OPT_NO_CONFIG_DB, OPT_FAULT_INJECTION, OPT_PROFILER, OPT_PRINT_SIMTIME,
+	OPT_TRACE_FORMAT, OPT_WHITELIST_BINPATH, OPT_BLOB_CREDENTIALS, OPT_PROXY, OPT_CONFIG_PATH, OPT_USE_TEST_CONFIG_DB, OPT_NO_CONFIG_DB, OPT_FAULT_INJECTION, OPT_PROFILER, OPT_PRINT_SIMTIME,
 	OPT_FLOW_PROCESS_NAME, OPT_FLOW_PROCESS_ENDPOINT, OPT_IP_TRUSTED_MASK, OPT_KMS_CONN_DISCOVERY_URL_FILE, OPT_KMS_CONNECTOR_TYPE, OPT_KMS_REST_ALLOW_NOT_SECURE_CONECTION, OPT_KMS_CONN_VALIDATION_TOKEN_DETAILS,
 	OPT_KMS_CONN_GET_ENCRYPTION_KEYS_ENDPOINT, OPT_KMS_CONN_GET_LATEST_ENCRYPTION_KEYS_ENDPOINT, OPT_KMS_CONN_GET_BLOB_METADATA_ENDPOINT, OPT_NEW_CLUSTER_KEY, OPT_AUTHZ_PUBLIC_KEY_FILE, OPT_USE_FUTURE_PROTOCOL_VERSION, OPT_CONSISTENCY_CHECK_URGENT_MODE
 };
@@ -221,6 +223,7 @@ CSimpleOpt::SOption g_rgOptions[] = {
 	{ OPT_TRACE_FORMAT,          "--trace-format",              SO_REQ_SEP },
 	{ OPT_WHITELIST_BINPATH,     "--whitelist-binpath",         SO_REQ_SEP },
 	{ OPT_BLOB_CREDENTIALS,      "--blob-credentials",          SO_REQ_SEP },
+	{ OPT_PROXY,                 "--proxy",                     SO_REQ_SEP },
 	{ OPT_CONFIG_PATH,           "--config-path",               SO_REQ_SEP },
 	{ OPT_USE_TEST_CONFIG_DB,    "--use-test-config-db",        SO_NONE },
 	{ OPT_NO_CONFIG_DB,          "--no-config-db",              SO_NONE },
@@ -259,10 +262,6 @@ extern const char* getSourceVersion();
 extern void flushTraceFileVoid();
 
 extern const int MAX_CLUSTER_FILE_BYTES;
-
-#ifdef ALLOC_INSTRUMENTATION
-extern uint8_t* g_extra_memory;
-#endif
 
 bool enableFailures = true;
 
@@ -406,6 +405,14 @@ ACTOR Future<Void> histogramReport() {
 		wait(delay(SERVER_KNOBS->HISTOGRAM_REPORT_INTERVAL));
 
 		GetHistogramRegistry().logReport();
+	}
+}
+
+ACTOR Future<Void> metricsReport() {
+	loop {
+		wait(delay(SERVER_KNOBS->GENERIC_METRICS_REPORT_INTERVAL));
+
+		simpleCounterReport();
 	}
 }
 
@@ -701,6 +708,7 @@ static void printUsage(const char* name, bool devhelp) {
 	printOptionUsage("--blob-credentials FILE",
 	                 "File containing blob credentials in JSON format. Can be specified "
 	                 "multiple times for multiple files. See fdbbackup usage for more details.");
+	printOptionUsage("--proxy PROXY:PORT", "IP:port or host:port to proxy server for connecting to external network.");
 	printOptionUsage("--profiler-",
 	                 "Set an actor profiler option. Supported options are:\n"
 	                 "  collector -- None or FluentD (FluentD requires collector_endpoint to be set)\n"
@@ -715,7 +723,7 @@ static void printUsage(const char* name, bool devhelp) {
 		                 " Server role (valid options are fdbd, test, multitest,"
 		                 " simulation, networktestclient, networktestserver, restore"
 		                 " consistencycheck, consistencycheckurgent, kvfileintegritycheck, kvfilegeneratesums, "
-		                 "kvfiledump, unittests)."
+		                 "kvfiledump, mocks3server, unittests)."
 		                 " The default is `fdbd'.");
 #ifdef _WIN32
 		printOptionUsage("-n, --newconsole", " Create a new console.");
@@ -896,6 +904,47 @@ Optional<bool> checkBuggifyOverride(const char* testFile) {
 	return Optional<bool>();
 }
 
+Optional<bool> checkFaultInjectionOverride(const char* testFile) {
+	std::ifstream ifs;
+	ifs.open(testFile, std::ifstream::in);
+	if (!ifs.good())
+		return 0;
+
+	std::string cline;
+
+	while (ifs.good()) {
+		getline(ifs, cline);
+		std::string line = removeWhitespace(std::string(cline));
+		if (!line.size() || line.find(';') == 0)
+			continue;
+
+		size_t found = line.find('=');
+		if (found == std::string::npos)
+			// hmmm, not good
+			continue;
+		std::string attrib = removeWhitespace(line.substr(0, found));
+		std::string value = removeWhitespace(line.substr(found + 1));
+
+		if (attrib == "faultInjection") {
+			// Testspec uses `on` or `off` (without quotes).
+			// TOML uses literal `true` and `false`.
+			if (!strcmp(value.c_str(), "on") || !strcmp(value.c_str(), "true")) {
+				ifs.close();
+				return true;
+			} else if (!strcmp(value.c_str(), "off") || !strcmp(value.c_str(), "false")) {
+				ifs.close();
+				return false;
+			} else {
+				fprintf(stderr, "ERROR: Unknown fault injection override state `%s'\n", value.c_str());
+				flushAndExit(FDB_EXIT_ERROR);
+			}
+		}
+	}
+
+	ifs.close();
+	return Optional<bool>();
+}
+
 // Takes a vector of public and listen address strings given via command line, and returns vector of NetworkAddress
 // objects.
 std::pair<NetworkAddressList, NetworkAddressList> buildNetworkAddresses(
@@ -1050,6 +1099,7 @@ enum class ServerRole {
 	KVFileGenerateIOLogChecksums,
 	KVFileIntegrityCheck,
 	KVFileDump,
+	MockS3Server,
 	MultiTester,
 	NetworkTestClient,
 	NetworkTestServer,
@@ -1107,6 +1157,7 @@ struct CLIOptions {
 	bool fileIoWarnOnly = false;
 	uint64_t rsssize = -1;
 	std::vector<std::string> blobCredentials; // used for fast restore workers & backup workers
+	Optional<std::string> proxy;
 	const char* blobCredsFromENV = nullptr;
 
 	std::string configPath;
@@ -1133,8 +1184,27 @@ struct CLIOptions {
 	void buildNetwork(const char* name) {
 		try {
 			if (!publicAddressStrs.empty()) {
-				std::tie(publicAddresses, listenAddresses) =
-				    buildNetworkAddresses(*connectionFile, publicAddressStrs, listenAddressStrs);
+				// For roles without a cluster file, parse addresses directly
+				if (!connectionFile) {
+					// Parse addresses directly without needing connection record
+					listenAddressStrs.resize(publicAddressStrs.size(), "public");
+					for (int ii = 0; ii < publicAddressStrs.size(); ++ii) {
+						NetworkAddress pubAddr = NetworkAddress::parse(publicAddressStrs[ii]);
+						NetworkAddress listenAddr = (listenAddressStrs[ii] == "public")
+						                                ? pubAddr
+						                                : NetworkAddress::parse(listenAddressStrs[ii]);
+						if (ii == 0) {
+							publicAddresses.address = pubAddr;
+							listenAddresses.address = listenAddr;
+						} else {
+							publicAddresses.secondaryAddress = pubAddr;
+							listenAddresses.secondaryAddress = listenAddr;
+						}
+					}
+				} else {
+					std::tie(publicAddresses, listenAddresses) =
+					    buildNetworkAddresses(*connectionFile, publicAddressStrs, listenAddressStrs);
+				}
 			}
 		} catch (Error&) {
 			printHelpTeaser(name);
@@ -1341,6 +1411,8 @@ private:
 					role = ServerRole::FlowProcess;
 				else if (!strcmp(sRole, "changeclusterkey"))
 					role = ServerRole::ChangeClusterKey;
+				else if (!strcmp(sRole, "mocks3server"))
+					role = ServerRole::MockS3Server;
 				else {
 					fprintf(stderr, "ERROR: Unknown role `%s'\n", sRole);
 					printHelpTeaser(argv[0]);
@@ -1662,6 +1734,14 @@ private:
 				// Add blob credential following backup agent example
 				blobCredentials.push_back(args.OptionArg());
 				break;
+			case OPT_PROXY:
+				proxy = args.OptionArg();
+				if (!Hostname::isHostname(proxy.get()) && !NetworkAddress::parseOptional(proxy.get()).present()) {
+					fprintf(stderr, "ERROR: proxy format should be either IP:port or host:port\n");
+					printHelpTeaser(argv[0]);
+					flushAndExit(FDB_EXIT_ERROR);
+				}
+				break;
 			case OPT_CONFIG_PATH:
 				configPath = args.OptionArg();
 				break;
@@ -1798,6 +1878,17 @@ private:
 			} while (t.size() != 0);
 		}
 
+		// Sets up proxy from ENV if it is not set by arg.
+		const char* proxyENV = getenv("FDB_PROXY");
+		if (proxyENV != nullptr && !proxy.present()) {
+			proxy = proxyENV;
+			if (!Hostname::isHostname(proxy.get()) && !NetworkAddress::parseOptional(proxy.get()).present()) {
+				fprintf(stderr, "ERROR: proxy format should be either IP:port or host:port\n");
+				printHelpTeaser(argv[0]);
+				flushAndExit(FDB_EXIT_ERROR);
+			}
+		}
+
 		setThreadLocalDeterministicRandomSeed(randomSeed);
 
 		try {
@@ -1836,7 +1927,7 @@ private:
 		    });
 		if ((role != ServerRole::Simulation && role != ServerRole::CreateTemplateDatabase &&
 		     role != ServerRole::KVFileIntegrityCheck && role != ServerRole::KVFileGenerateIOLogChecksums &&
-		     role != ServerRole::KVFileDump && role != ServerRole::UnitTests) ||
+		     role != ServerRole::KVFileDump && role != ServerRole::UnitTests && role != ServerRole::MockS3Server) ||
 		    autoPublicAddress) {
 
 			if (seedSpecified && !fileExists(connFile)) {
@@ -1878,6 +1969,10 @@ private:
 			Optional<bool> buggifyOverride = checkBuggifyOverride(testFile);
 			if (buggifyOverride.present())
 				buggifyEnabled = buggifyOverride.get();
+
+			Optional<bool> faultInjectionOverride = checkFaultInjectionOverride(testFile);
+			if (faultInjectionOverride.present())
+				faultInjectionEnabled = faultInjectionOverride.get();
 		}
 
 		if (role == ServerRole::SearchMutations && !targetKey) {
@@ -1974,9 +2069,6 @@ int main(int argc, char* argv[]) {
 	try {
 		platformInit();
 
-#ifdef ALLOC_INSTRUMENTATION
-		g_extra_memory = new uint8_t[1000000];
-#endif
 		registerCrashHandler();
 
 		// Set default of line buffering standard out and error
@@ -1985,11 +2077,6 @@ int main(int argc, char* argv[]) {
 
 		// Enables profiling on this thread (but does not start it)
 		registerThreadForProfiling();
-
-#ifdef _WIN32
-		// Windows needs a gentle nudge to format floats correctly
-		//_set_output_format(_TWO_DIGIT_EXPONENT);
-#endif
 
 		auto opts = CLIOptions::parseArgs(argc, argv);
 		const auto role = opts.role;
@@ -2063,8 +2150,8 @@ int main(int argc, char* argv[]) {
 			flushAndExit(FDB_EXIT_SUCCESS);
 		}
 
-		// Initialize the thread pool
 		CoroThreadPool::init();
+
 		// Ordinarily, this is done when the network is run. However, network thread should be set before TraceEvents
 		// are logged. This thread will eventually run the network, so call it now.
 		TraceEvent::setNetworkThread();
@@ -2111,8 +2198,9 @@ int main(int argc, char* argv[]) {
 			FlowTransport::createInstance(false, 1, WLTOKEN_RESERVED_COUNT, &opts.allowList);
 			opts.buildNetwork(argv[0]);
 
-			const bool expectsPublicAddress = (role == ServerRole::FDBD || role == ServerRole::NetworkTestServer ||
-			                                   role == ServerRole::Restore || role == ServerRole::FlowProcess);
+			const bool expectsPublicAddress =
+			    (role == ServerRole::FDBD || role == ServerRole::NetworkTestServer || role == ServerRole::Restore ||
+			     role == ServerRole::FlowProcess || role == ServerRole::MockS3Server);
 			if (opts.publicAddressStrs.empty()) {
 				if (expectsPublicAddress) {
 					fprintf(stderr, "ERROR: The -p or --public-address option is required\n");
@@ -2145,7 +2233,8 @@ int main(int argc, char* argv[]) {
 			if (FLOW_KNOBS->ALLOW_TOKENLESS_TENANT_ACCESS)
 				TraceEvent(SevWarnAlways, "AuthzTokenlessAccessEnabled");
 
-			if (expectsPublicAddress) {
+			// MockS3Server uses HTTP, not FlowTransport, so skip FlowTransport binding for it
+			if (expectsPublicAddress && role != ServerRole::MockS3Server) {
 				for (int ii = 0; ii < (opts.publicAddresses.secondaryAddress.present() ? 2 : 1); ++ii) {
 					const NetworkAddress& publicAddress =
 					    ii == 0 ? opts.publicAddresses.address : opts.publicAddresses.secondaryAddress.get();
@@ -2230,6 +2319,7 @@ int main(int argc, char* argv[]) {
 			TraceEvent("Simulation").detail("TestFile", opts.testFile);
 
 			auto histogramReportActor = histogramReport();
+			auto metricsReportActor = metricsReport();
 
 			CLIENT_KNOBS->trace();
 			FLOW_KNOBS->trace();
@@ -2350,8 +2440,6 @@ int main(int argc, char* argv[]) {
 						}
 					}
 				}
-				g_knobs.setKnob("enable_blob_granule_compression",
-				                KnobValue::create(ini.GetBoolValue("META", "enableBlobGranuleEncryption", false)));
 				g_knobs.setKnob("encrypt_header_auth_token_enabled",
 				                KnobValue::create(ini.GetBoolValue("META", "encryptHeaderAuthTokenEnabled", false)));
 				g_knobs.setKnob("encrypt_header_auth_token_algo",
@@ -2375,6 +2463,10 @@ int main(int argc, char* argv[]) {
 					pFiles->push_back(f);
 				}
 			}
+
+			// Update proxy string
+			Optional<std::string>* pProxy = (Optional<std::string>*)g_network->global(INetwork::enProxy);
+			*pProxy = opts.proxy;
 
 			// Call fast restore for the class FastRestoreClass. This is a short-cut to run fast restore in circus
 			if (opts.processClass == ProcessClass::FastRestoreClass) {
@@ -2415,11 +2507,12 @@ int main(int argc, char* argv[]) {
 				                      opts.configDBType,
 				                      opts.consistencyCheckUrgentMode));
 				actors.push_back(histogramReport());
-				// actors.push_back( recurring( []{}, .001 ) );  // for ASIO latency measurement
+				actors.push_back(metricsReport());
+
 #ifdef FLOW_GRPC_ENABLED
 				if (opts.grpcAddressStrs.size() > 0) {
-					auto grpcServer = GrpcServer::initInstance(NetworkAddress::parse(opts.grpcAddressStrs[0]));
-					actors.push_back(grpcServer->run());
+					FlowGrpc::init(&opts.tlsConfig, NetworkAddress::parse(opts.grpcAddressStrs[0]));
+					actors.push_back(GrpcServer::instance()->run());
 				}
 #endif
 				f = stopAfter(waitForAll(actors));
@@ -2472,6 +2565,7 @@ int main(int argc, char* argv[]) {
 			setupRunLoopProfiler();
 			auto m =
 			    startSystemMonitor(opts.dataFolder, opts.dcId, opts.zoneId, opts.zoneId, opts.localities.dataHallId());
+			auto metricsReportActor = metricsReport();
 			f = stopAfter(runTests(opts.connectionFile,
 			                       TEST_TYPE_UNIT_TESTS,
 			                       TEST_HERE,
@@ -2542,6 +2636,10 @@ int main(int argc, char* argv[]) {
 			Key newClusterKey(opts.newClusterKey);
 			Key oldClusterKey = opts.connectionFile->getConnectionString().clusterKey();
 			f = stopAfter(coordChangeClusterKey(opts.dataFolder, newClusterKey, oldClusterKey));
+			g_network->run();
+		} else if (role == ServerRole::MockS3Server) {
+			printf("Starting MockS3Server on %s\n", opts.publicAddresses.address.toString().c_str());
+			f = stopAfter(startMockS3ServerReal(opts.publicAddresses.address));
 			g_network->run();
 		}
 

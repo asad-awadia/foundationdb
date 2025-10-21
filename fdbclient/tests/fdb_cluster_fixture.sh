@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Functions to stand up an fdb cluster.
 # To use:
@@ -11,9 +11,9 @@ FDB_PIDS=()
 
 # Shutdown all processes.
 function shutdown_fdb_cluster {
-  # Kill all running fdb processes.
+  # Kill all running fdb processes from tracked PIDs
   for (( i=0; i < "${#FDB_PIDS[@]}"; ++i)); do
-    kill -9 "${FDB_PIDS[i]}"
+    kill -9 "${FDB_PIDS[i]}" 2>/dev/null || true
   done
 }
 
@@ -30,6 +30,7 @@ function start_fdb_cluster {
   local local_scratch_dir="${3}"
   local ss_count="${4}"
   shift 4
+  #TODO(BulkLoad): enable_read_lock_on_range
   local knobs="--knob_shard_encode_location_metadata=true"
   if (( $# > 0 )); then
     for item in "${@}"; do
@@ -49,12 +50,15 @@ function start_fdb_cluster {
     # In the below $knobs will pick up single quotes -- its what bash does when it
     # outputs strings with spaces or special characters. In this case, we want the
     # single quotes.
+    # TODO(BulkLoad): randomly select storage engine.
+    # Currently, we cannot use shardedrocksdb because bulkload fetchkey does not support
+    # shardedrocksdb. 
     LOOPBACK_DIR="${local_scratch_dir}/loopback_cluster" PORT_PREFIX="${port_prefix}" \
       "${local_source_dir}/tests/loopback_cluster/run_custom_cluster.sh" \
       "${local_build_dir}" \
       --knobs "${knobs}" \
       --stateless_count 1 --replication_count 1 --logs_count 1 \
-      --storage_count "${ss_count}" --storage_type ssd-sharded-rocksdb \
+      --storage_count "${ss_count}" --storage_type ssd-rocksdb-v1 \
       --dump_pids on \
       > >(tee "${output}") \
       2> >(tee "${output}" >&2)
@@ -62,8 +66,26 @@ function start_fdb_cluster {
     # Restore exit on error.
     set -o errexit  # a.k.a. set -e
     set -o noclobber
-    # Set the global FDB_PIDS
-    FDB_PIDS=($(grep -e "PIDS=" "${output}" | sed -e 's/PIDS=//' | xargs)) || true
+    # Set the global FDB_PIDS with retry logic for robustness
+    FDB_PIDS=()
+    local retries=5
+    for ((i=0; i<retries; i++)); do
+      if [[ -f "${output}" ]]; then
+        FDB_PIDS=($(grep -e "PIDS=" "${output}" | sed -e 's/PIDS=//' | xargs)) || true
+        if [[ ${#FDB_PIDS[@]} -gt 0 ]]; then
+          break
+        fi
+      fi
+      echo "Retrying PID extraction (attempt $((i+1))/${retries})..."
+      sleep 0.5
+    done
+    
+    # For debugging... on exit, it can complain: 'line 16: kill: Binary: arguments must be process or job IDs'
+    if [[ -n "${FDB_PIDS[*]:-}" ]]; then
+      echo "Tracked FDB PIDs: ${FDB_PIDS[*]}"
+    else
+      echo "WARNING: No FDB PIDs found for tracking"
+    fi
     if (( status == 0 )); then
       # Give the db a second to come healthy.
       sleep 1

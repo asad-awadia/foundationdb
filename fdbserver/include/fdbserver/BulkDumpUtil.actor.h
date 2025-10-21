@@ -31,11 +31,24 @@
 #include "fdbclient/StorageServerInterface.h"
 #include "flow/actorcompiler.h" // has to be last include
 
+struct RangeDumpRawData {
+	std::map<Key, Value> kvs;
+	std::map<Key, Value> sampled;
+	Key lastKey;
+	int64_t kvsBytes;
+	RangeDumpRawData() = default;
+	RangeDumpRawData(const std::map<Key, Value>& kvs,
+	                 const std::map<Key, Value>& sampled,
+	                 const Key& lastKey,
+	                 int64_t kvsBytes)
+	  : kvs(kvs), sampled(sampled), lastKey(lastKey), kvsBytes(kvsBytes) {}
+};
+
 struct SSBulkDumpTask {
 	SSBulkDumpTask(const StorageServerInterface& targetServer,
 	               const std::vector<UID>& checksumServers,
 	               const BulkDumpState& bulkDumpState)
-	  : targetServer(targetServer), checksumServers(checksumServers), bulkDumpState(bulkDumpState){};
+	  : targetServer(targetServer), checksumServers(checksumServers), bulkDumpState(bulkDumpState) {};
 
 	std::string toString() const {
 		return "[BulkDumpState]: " + bulkDumpState.toString() + ", [TargetServer]: " + targetServer.toString() +
@@ -81,31 +94,20 @@ std::string getBulkDumpJobTaskFolder(const UID& jobId, const UID& taskId);
 // Define job root folder.
 std::string getBulkLoadJobRoot(const std::string& root, const UID& jobId);
 
-// Define job manifest file content based on job's all BulkLoadManifest.
-// Each row is a range sorted by the beginKey. Any two ranges do not have overlapping.
-// Col: beginKey, endKey, dataVersion, dataBytes, manifestPath.
-// dataVersion should be always valid. dataBytes can be 0 in case of an empty range.
-std::string generateBulkLoadJobManifestFileContent(const std::map<Key, BulkLoadManifest>& manifests);
-
+// Generate key-value data, byte sampling data, and manifest file.
+// Return BulkLoadManifest metadata (equivalent to content of the manifest file).
+// TODO(BulkDump): can cause slow tasks, do the task in a separate thread in the future.
 // The size of sortedData is defined at the place of generating the data (getRangeDataToDump).
 // The size is configured by MOVE_SHARD_KRM_ROW_LIMIT.
-BulkLoadManifest dumpDataFileToLocalDirectory(UID logId,
-                                              const std::map<Key, Value>& sortedData,
-                                              const std::map<Key, Value>& sortedSample,
-                                              const BulkLoadFileSet& localFileSet,
-                                              const BulkLoadFileSet& remoteFileSet,
-                                              const BulkLoadByteSampleSetting& byteSampleSetting,
-                                              Version dumpVersion,
-                                              const KeyRange& dumpRange,
-                                              int64_t dumpBytes,
-                                              int64_t dumpKeyCount,
-                                              BulkLoadType dumpType,
-                                              BulkLoadTransportMethod transportMethod);
-
-void generateBulkDumpJobManifestFile(const std::string& workFolder,
-                                     const std::string& localJobManifestFilePath,
-                                     const std::string& content,
-                                     const UID& logId);
+ACTOR Future<BulkLoadManifest> dumpDataFileToLocalDirectory(UID logId,
+                                                            std::shared_ptr<RangeDumpRawData> rangeDumpRawData,
+                                                            BulkLoadFileSet localFileSet,
+                                                            BulkLoadFileSet remoteFileSet,
+                                                            BulkLoadByteSampleSetting byteSampleSetting,
+                                                            Version dumpVersion,
+                                                            KeyRange dumpRange,
+                                                            BulkLoadType dumpType,
+                                                            BulkLoadTransportMethod transportMethod);
 
 // Upload manifest file for bulkdump job
 // Each job has one manifest file including manifest paths of all tasks.
@@ -123,9 +125,6 @@ ACTOR Future<Void> uploadBulkDumpFileSet(BulkLoadTransportMethod transportMethod
                                          BulkLoadFileSet destinationFileSet,
                                          UID logId);
 
-// Erase file folder
-void clearFileFolder(const std::string& folderPath);
-
 class ParallelismLimitor {
 public:
 	ParallelismLimitor(int maxParallelism) : maxParallelism(maxParallelism) {}
@@ -136,10 +135,15 @@ public:
 		ASSERT(numRunningTasks.get() >= 0);
 	}
 
+	inline void incrementTaskCounter() {
+		ASSERT(numRunningTasks.get() < maxParallelism);
+		numRunningTasks.set(numRunningTasks.get() + 1);
+		ASSERT(numRunningTasks.get() <= maxParallelism);
+	}
+
 	// return true if succeed
-	inline bool tryIncrementTaskCounter() {
+	inline bool canStart() {
 		if (numRunningTasks.get() < maxParallelism) {
-			numRunningTasks.set(numRunningTasks.get() + 1);
 			return true;
 		} else {
 			return false;

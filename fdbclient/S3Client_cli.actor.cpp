@@ -44,6 +44,7 @@
 #include "fdbclient/Knobs.h"
 #include "fdbclient/versions.h"
 #include "fdbclient/S3Client.actor.h"
+#include "fdbclient/BackupAgent.actor.h"
 #include "flow/Platform.h"
 #include "flow/ArgParseUtil.h"
 #include "flow/FastRef.h"
@@ -68,7 +69,9 @@ enum {
 	OPT_TRACE_LOG_GROUP,
 	OPT_BUILD_FLAGS,
 	OPT_KNOB,
-	OPT_HELP
+	OPT_PROXY,
+	OPT_HELP,
+	OPT_LS_RECURSIVE
 };
 
 CSimpleOpt::SOption Options[] = { { OPT_TRACE, "--log", SO_NONE },
@@ -81,8 +84,10 @@ CSimpleOpt::SOption Options[] = { { OPT_TRACE, "--log", SO_NONE },
 	                              TLS_OPTION_FLAGS,
 	                              { OPT_BUILD_FLAGS, "--build-flags", SO_NONE },
 	                              { OPT_KNOB, "--knob-", SO_REQ_SEP },
+	                              { OPT_PROXY, "--proxy", SO_REQ_SEP },
 	                              { OPT_HELP, "-h", SO_NONE },
 	                              { OPT_HELP, "--help", SO_NONE },
+	                              { OPT_LS_RECURSIVE, "--recursive", SO_NONE },
 	                              SO_END_OF_OPTIONS };
 
 static void printUsage(std::string const& programName) {
@@ -97,8 +102,10 @@ static void printUsage(std::string const& programName) {
 	             "                 TARGET must be a local directory and vice versa. See 'Backup URLs'\n"
 	             "                 in https://apple.github.io/foundationdb/backups.html for\n"
 	             "                 more on the fdb s3 'blobstore://' URL format.\n"
+	             "  ls             List contents of SOURCE. Must be a s3/blobstore 'Backup URL'.\n"
 	             "  rm             Delete SOURCE. Must be a s3/blobstore 'Backup URL'.\n"
 	             "OPTIONS:\n"
+	             "  --recursive    Recursively list contents of SOURCE. Only valid with 'ls' command.\n"
 	             "  --log          Enables trace file logging for the CLI session.\n"
 	             "  --logdir PATH  Specifies the output directory for trace files. If\n"
 	             "                 unspecified, defaults to the current directory. Has\n"
@@ -113,6 +120,8 @@ static void printUsage(std::string const& programName) {
 	             "                 File containing blob credentials in JSON format.\n"
 	             "                 The same credential format/file fdbbackup uses.\n"
 	             "                 See 'Blob Credential Files' in https://apple.github.io/foundationdb/backups.html.\n"
+	             "  --proxy HOST:PORT\n"
+	             "                 Connect to S3 through proxy at given host:port.\n"
 	             "  --build-flags  Print build information and exit.\n"
 	             "  --knob-KNOBNAME KNOBVALUE\n"
 	             "                 Changes a knob value. KNOBNAME should be lowercase.\n"
@@ -127,7 +136,7 @@ static void printUsage(std::string const& programName) {
 }
 
 static void printBuildInformation() {
-	std::cout << jsonBuildInformation() << "\n";
+	printf("%s", jsonBuildInformation().c_str());
 }
 
 struct Params : public ReferenceCounted<Params> {
@@ -141,6 +150,7 @@ struct Params : public ReferenceCounted<Params> {
 	std::string command;
 	int whichIsBlobstoreURL = -1;
 	const std::string blobstore_enable_object_integrity_check = "blobstore_enable_object_integrity_check";
+	bool ls_recursive = false;
 
 	std::string toString() {
 		std::string s;
@@ -233,6 +243,9 @@ static int parseCommandLine(Reference<Params> param, CSimpleOpt* args) {
 			param->knobs.emplace_back(knobName.get(), args->OptionArg());
 			break;
 		}
+		case OPT_LS_RECURSIVE:
+			param->ls_recursive = true;
+			break;
 		case TLSConfig::OPT_TLS_PLUGIN:
 			args->OptionArg();
 			break;
@@ -254,6 +267,9 @@ static int parseCommandLine(Reference<Params> param, CSimpleOpt* args) {
 		case OPT_BUILD_FLAGS:
 			printBuildInformation();
 			return FDB_EXIT_ERROR;
+			break;
+		case OPT_PROXY:
+			param->proxy = args->OptionArg();
 			break;
 		}
 	}
@@ -290,6 +306,18 @@ static int parseCommandLine(Reference<Params> param, CSimpleOpt* args) {
 		}
 		param->whichIsBlobstoreURL = 0;
 		param->tgt = "";
+	} else if (command == "ls") {
+		if (args->FileCount() != 2) {
+			std::cerr << "ERROR: ls command requires a SOURCE" << std::endl;
+			return FDB_EXIT_ERROR;
+		}
+		param->src = args->Files()[1];
+		if (!isBlobStoreURL(param->src)) {
+			std::cerr << "ERROR: SOURCE must be a blobstore URL for ls command" << std::endl;
+			return FDB_EXIT_ERROR;
+		}
+		param->whichIsBlobstoreURL = 0;
+		param->tgt = "";
 	} else {
 		std::cerr << "ERROR: Invalid command: " << command << std::endl;
 		return FDB_EXIT_ERROR;
@@ -315,6 +343,32 @@ ACTOR Future<Void> run(Reference<Params> params) {
 		}
 	} else if (params->command == "rm") {
 		wait(deleteResource(params->src));
+	} else if (params->command == "ls") {
+		if (params->ls_recursive) {
+			wait(listFiles(params->src, std::numeric_limits<int>::max()));
+		} else {
+			wait(listFiles(params->src, 1));
+		}
+	}
+	return Void();
+}
+
+ACTOR Future<Void> deleteResource(std::string src) {
+	try {
+		wait(::deleteResource(src));
+	} catch (Error& e) {
+		// Rethrow the error to ensure it's handled by the main error handler
+		throw;
+	}
+	return Void();
+}
+
+ACTOR Future<Void> listFiles(std::string src, int maxDepth) {
+	try {
+		wait(::listFiles(src, maxDepth));
+	} catch (Error& e) {
+		// Rethrow the error to ensure it's handled by the main error handler
+		throw;
 	}
 	return Void();
 }
@@ -337,7 +391,10 @@ int main(int argc, char** argv) {
 		    new CSimpleOpt(argc, argv, s3client_cli::Options, SO_O_EXACT | SO_O_HYPHEN_TO_UNDERSCORE | SO_O_NOERR));
 		auto param = makeReference<s3client_cli::Params>();
 		status = s3client_cli::parseCommandLine(param, args.get());
-		std::cout << "Command line: " << commandLine << " " << param->toString() << std::endl;
+		TraceEvent("S3ClientCommandLine")
+		    .detail("CommandLine", commandLine)
+		    .detail("Params", param->toString())
+		    .detail("Status", status);
 		if (status != FDB_EXIT_SUCCESS) {
 			s3client_cli::printUsage(argv[0]);
 			return status;
@@ -369,6 +426,25 @@ int main(int argc, char** argv) {
 
 		// Must be called after setupNetwork() to be effective
 		param->updateKnobs();
+
+		// Check for proxy from environment variable if not set via command line
+		if (!param->proxy.present()) {
+			const char* proxyEnv = getenv("FDB_PROXY");
+			if (proxyEnv != nullptr) {
+				param->proxy = std::string(proxyEnv);
+			}
+		}
+
+		// Set the proxy in g_network if it's present
+		if (param->proxy.present()) {
+			if (!Hostname::isHostname(param->proxy.get()) &&
+			    !NetworkAddress::parseOptional(param->proxy.get()).present()) {
+				fprintf(stderr, "ERROR: proxy format should be either IP:port or host:port\n");
+				flushAndExit(FDB_EXIT_ERROR);
+			}
+			Optional<std::string>* pProxy = (Optional<std::string>*)g_network->global(INetwork::enProxy);
+			*pProxy = param->proxy.get();
+		}
 
 		TraceEvent("ProgramStart")
 		    .setMaxEventLength(12000)

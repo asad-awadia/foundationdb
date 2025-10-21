@@ -19,12 +19,34 @@
  */
 
 #include "fdbclient/BulkLoading.h"
-#include "flow/Error.h"
+#include "fdbclient/SystemData.h"
 
 #include <boost/url/url.hpp>
 #include <boost/url/parse.hpp>
 #include <boost/url/error_types.hpp>
 #include <boost/url/string_view.hpp>
+
+bool getConductBulkLoadFromDataMoveId(const UID& dataMoveId) {
+	bool nowAssigned = false;
+	bool emptyRange = false;
+	DataMoveType dataMoveType = DataMoveType::LOGICAL;
+	DataMovementReason dataMoveReason = DataMovementReason::INVALID;
+	decodeDataMoveId(dataMoveId, nowAssigned, emptyRange, dataMoveType, dataMoveReason);
+	bool conductBulkLoad =
+	    dataMoveType == DataMoveType::LOGICAL_BULKLOAD || dataMoveType == DataMoveType::PHYSICAL_BULKLOAD;
+	if (conductBulkLoad) {
+		ASSERT(!emptyRange && dataMoveIdIsValidForBulkLoad(dataMoveId));
+		ASSERT(nowAssigned);
+	}
+	if (!nowAssigned) {
+		ASSERT(!conductBulkLoad);
+	}
+	return conductBulkLoad;
+}
+
+bool dataMoveIdIsValidForBulkLoad(const UID& dataMoveId) {
+	return dataMoveId.isValid() && dataMoveId != anonymousShardId;
+}
 
 std::string stringRemovePrefix(std::string str, const std::string& prefix) {
 	if (str.compare(0, prefix.length(), prefix) == 0) {
@@ -66,49 +88,83 @@ std::string generateEmptyManifestFileName() {
 	return "manifest-empty.sst";
 }
 
-// Generate the bulkload job manifest file. Here is an example.
-// Assuming the job manifest file is in the folder: "/tmp".
-// Row 0: [FormatVersion]: 1, [ManifestCount]: 3;
-// Row 1: "", "01", 100, 9000, "range1", "manifest1.txt"
-// Row 2: "01", "02 ff", 200, 0, "range2", "manifest2.txt"
-// Row 3: "02 ff", "ff", 300, 8100, "range3", "manifest3.txt"
-// In this example, the job manifest file is in the format of version 1.
-// The file contains three ranges: "" ~ "\x01", "\x01" ~ "\x02\xff", and "\x02\xff" ~ "\xff".
-// For the first range, the data version is at 100, the data size is 9KB, the manifest file path is
-// "/tmp/range1/manifest1.txt". For the second range, the data version is at 200, the data size is 0 indicating this is
-// an empty range. The manifest file path is "/tmp/range2/manifest2.txt". For the third range, the data version is at
-// 300, the data size is 8.1KB, the manifest file path is "/tmp/range1/manifest3.txt".
-std::string generateBulkLoadJobManifestFileContent(const std::map<Key, BulkLoadManifest>& manifests) {
-	std::string res = BulkLoadJobManifestFileHeader(bulkLoadManifestFormatVersion, manifests.size()).toString() + "\n";
-	for (const auto& [beginKey, manifest] : manifests) {
-		res = res + BulkLoadJobFileManifestEntry(manifest).toString() + "\n";
+std::string convertBulkLoadJobPhaseToString(const BulkLoadJobPhase& phase) {
+	if (phase == BulkLoadJobPhase::Invalid) {
+		return "Invalid";
+	} else if (phase == BulkLoadJobPhase::Submitted) {
+		return "Submitted";
+	} else if (phase == BulkLoadJobPhase::Complete) {
+		return "Complete";
+	} else if (phase == BulkLoadJobPhase::Error) {
+		return "Error";
+	} else if (phase == BulkLoadJobPhase::Cancelled) {
+		return "Cancelled";
+	} else {
+		TraceEvent(SevError, "UnexpectedBulkLoadJobPhase").detail("Val", phase);
+		return "";
 	}
-	return res;
 }
 
+// TODO(BulkLoad): Support file:// urls, etc.
+// For now, we only support blobstore:// urls.
+// 'blobstore://' is the first match, credentials including '@' are optional and second regex match.
+// The third match is the host + path, etc. of the url.
+static const std::regex BLOBSTORE_URL_PATTERN(R"((blobstore://)([A-Z0-9]+:[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+@)?(.+)$)");
+
 std::string getPath(const std::string& path) {
-	boost::system::result<boost::urls::url_view> parse_result = boost::urls::parse_uri(path);
-	return parse_result.has_value() ? parse_result.value().path() : path;
+	std::smatch matches;
+	if (!std::regex_match(path, matches, BLOBSTORE_URL_PATTERN)) {
+		return path;
+	}
+	// We want boost::url to parse out the path but it cannot digest credentials. Strip them out
+	// before passing to boost::url.
+	try {
+		return boost::urls::parse_uri(matches[1].str() + matches[3].str()).value().path();
+	} catch (std::system_error& e) {
+		TraceEvent(SevError, "BulkLoadGetPathError")
+		    .detail("Path", path)
+		    .detail("Error", e.what())
+		    .detail("Matches", matches.str());
+		throw std::invalid_argument("Invalid url " + path + " " + e.what());
+	}
 }
 
 // TODO(BulkLoad): use this everywhere
 std::string appendToPath(const std::string& path, const std::string& append) {
-	boost::system::result<boost::urls::url_view> parse_result = boost::urls::parse_uri(path);
-	if (!parse_result.has_value()) {
-		// Failed to parse 'path' as an URL. Do the default path join.
+	std::smatch matches;
+	if (!std::regex_match(path, matches, BLOBSTORE_URL_PATTERN)) {
 		return joinPath(path, append);
 	}
-	// boost::urls::url thinks its an URL.
-	boost::urls::url url = parse_result.value();
-	if (url.scheme() != "blobstore") {
-		// For now, until we add support for other urls like file:///.
-		throw std::invalid_argument("Invalid url scheme");
+	// We want boost::url to parse out the path but it cannot digest credentials. Strip them out
+	// before passing to boost::url.
+	try {
+		boost::urls::url url = boost::urls::parse_uri(matches[1].str() + matches[3].str()).value();
+		auto newUrl = std::string(url.set_path(joinPath(url.path(), append)).buffer());
+		return matches[1].str() + matches[2].str() + newUrl.substr(matches[1].str().length());
+	} catch (std::system_error& e) {
+		TraceEvent(SevError, "BulkLoadAppendToPathError")
+		    .detail("Path", path)
+		    .detail("Error", e.what())
+		    .detail("Matches", matches.str());
+		throw std::invalid_argument("Invalid url " + path + " " + e.what());
 	}
-	return std::string(url.set_path(joinPath(url.path(), append)).buffer());
 }
 
 std::string getBulkLoadJobRoot(const std::string& root, const UID& jobId) {
 	return appendToPath(root, jobId.toString());
+}
+
+std::string convertBulkLoadTransportMethodToString(BulkLoadTransportMethod method) {
+	if (method == BulkLoadTransportMethod::Invalid) {
+		return "Invalid";
+	} else if (method == BulkLoadTransportMethod::CP) {
+		return "LocalFileCopy";
+	} else if (method == BulkLoadTransportMethod::BLOBSTORE) {
+		return "BlobStore";
+	} else {
+		TraceEvent(SevError, "UnexpectedBulkLoadTransportMethod").detail("Val", method);
+		return "";
+	}
 }
 
 // For submitting a task manually (for testing)
@@ -123,7 +179,9 @@ BulkLoadTaskState createBulkLoadTask(const UID& jobId,
                                      const BulkLoadTransportMethod& transportMethod) {
 	BulkLoadManifest manifest(
 	    fileSet, range.begin, range.end, snapshotVersion, bytes, keyCount, byteSampleSetting, type, transportMethod);
-	return BulkLoadTaskState(jobId, manifest);
+	BulkLoadManifestSet manifests(1);
+	manifests.addManifest(manifest);
+	return BulkLoadTaskState(jobId, manifests, range);
 }
 
 BulkLoadJobState createBulkLoadJob(const UID& dumpJobIdToLoad,

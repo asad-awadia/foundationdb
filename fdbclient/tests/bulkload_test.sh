@@ -1,10 +1,9 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
-# Test bulkload. Uses S3 or seaweedfs if not available:
-# (https://github.com/seaweedfs/seaweedfs) as substitute.
+# Test bulkload. Uses S3 or MockS3Server if not available.
 #
 # In the below we start a small FDB cluster, populate it with
-# some data and then start up a seaweedfs instance. We
+# some data and then start up MockS3Server. We
 # then run a bulkdump to 'S3' and then a restore. We verify
 # the restore is the same as the original.
 #
@@ -13,7 +12,8 @@
 # so you can manually rerun commands or peruse logs and data
 # under SCRATCH_DIR.
 
-# Make sure cleanup on script exit.
+# Install signal traps. Depends on globals being set.
+# Calls the cleanup function.
 trap "exit 1" HUP INT PIPE QUIT TERM
 trap cleanup  EXIT
 
@@ -22,8 +22,8 @@ function cleanup {
   if type shutdown_fdb_cluster &> /dev/null; then
     shutdown_fdb_cluster
   fi
-  if type shutdown_weed &> /dev/null; then
-    shutdown_weed "${TEST_SCRATCH_DIR}"
+  if type shutdown_mocks3 &> /dev/null; then
+    shutdown_mocks3
   fi
   if type shutdown_aws &> /dev/null; then
     shutdown_aws "${TEST_SCRATCH_DIR}"
@@ -64,7 +64,7 @@ function bulkdump {
   fi
   if ! "${local_build_dir}"/bin/fdbcli \
     -C "${local_scratch_dir}/loopback_cluster/fdb.cluster" \
-    --exec "bulkdump blobstore \"\" \xff \"${url}\"" > /dev/null
+    --exec "bulkdump dump \"\" \xff \"${url}\"" > /dev/null
   then
     err "Bulkdump start failed"
     return 1
@@ -75,7 +75,7 @@ function bulkdump {
   while true; do
     if ! output=$( "${local_build_dir}"/bin/fdbcli \
       -C "${local_scratch_dir}/loopback_cluster/fdb.cluster" \
-      --exec "bulkdump status \"\" \xff " )
+      --exec "bulkdump status" )
     then
       err "Bulkdump status 1 failed"
       return 1
@@ -93,7 +93,7 @@ function bulkdump {
   while true; do
     if ! output=$( "${local_build_dir}"/bin/fdbcli \
       -C "${local_scratch_dir}/loopback_cluster/fdb.cluster" \
-      --exec "bulkdump status \"\" \xff " )
+      --exec "bulkdump status" )
     then
       err "Bulkdump status 2 failed"
       return 1
@@ -134,7 +134,14 @@ function bulkload {
   fi
   if ! "${local_build_dir}"/bin/fdbcli \
     -C "${local_scratch_dir}/loopback_cluster/fdb.cluster" \
-    --exec "bulkload blobstore ${jobid} \"\" \xff \"${url}\""
+    --exec "bulkload addlockowner BulkLoad"
+  then
+    err "Bulkload add BulkLoad lockower failed"
+    return 1
+  fi
+  if ! "${local_build_dir}"/bin/fdbcli \
+    -C "${local_scratch_dir}/loopback_cluster/fdb.cluster" \
+    --exec "bulkload load ${jobid} \"\" \xff \"${url}\""
   then
     err "Bulkload start failed"
     return 1
@@ -143,7 +150,7 @@ function bulkload {
   while true; do
     if ! output=$( "${local_build_dir}"/bin/fdbcli \
       -C "${local_scratch_dir}/loopback_cluster/fdb.cluster" \
-      --exec "bulkload status \"\" \xff " )
+      --exec "bulkload status" )
     then
       err "Bulkload status 1 failed"
       return 1
@@ -156,7 +163,7 @@ function bulkload {
   while true; do
     if ! output=$( "${local_build_dir}"/bin/fdbcli \
       -C "${local_scratch_dir}/loopback_cluster/fdb.cluster" \
-      --exec "bulkload status \"\" \xff " )
+      --exec "bulkload status" )
     then
       err "Bulkload status 2 failed"
       return 1
@@ -207,10 +214,12 @@ function test_basic_bulkdump_and_bulkload {
     err "Failed bulkdump"
     return 1
   fi
+  log "Clear data"
   if ! clear_data "${local_build_dir}" "${local_scratch_dir}"; then
     err "Failed clear data in fdb"
     return 1
   fi
+  log "Bulkload"
   if ! bulkload "${local_url}" "${local_scratch_dir}" "${credentials}" "${local_build_dir}" "${jobid}"; then
     err "Failed bulkload"
     return 1
@@ -237,15 +246,40 @@ set -o noclobber
 # TEST_SCRATCH_DIR gets set below. Tests should be their data in here.
 # It gets cleaned up on the way out of the test.
 TEST_SCRATCH_DIR=
-TLS_CA_FILE="${TLS_CA_FILE:-/etc/ssl/cert.pem}"
-readonly TLS_CA_FILE
-readonly HTTP_VERBOSE_LEVEL=10
-KNOBS=("--knob_blobstore_encryption_type=aws:kms" "--knob_http_verbose_level=${HTTP_VERBOSE_LEVEL}")
-readonly KNOBS
+readonly HTTP_VERBOSE_LEVEL=2
 # Should we use S3? If USE_S3 is not defined, then check if
 # OKTETO_NAMESPACE is defined (It is defined on the okteto
 # internal apple dev environments where S3 is available).
 readonly USE_S3="${USE_S3:-$( if [[ -n "${OKTETO_NAMESPACE+x}" ]]; then echo "true" ; else echo "false"; fi )}"
+
+# Set KNOBS based on whether we're using real S3 or MockS3Server
+if [[ "${USE_S3}" == "true" ]]; then
+  # Use AWS KMS encryption for real S3
+  KNOBS=("--knob_blobstore_encryption_type=aws:kms" "--knob_http_verbose_level=${HTTP_VERBOSE_LEVEL}")
+else
+  # No encryption for MockS3Server
+  KNOBS=("--knob_http_verbose_level=${HTTP_VERBOSE_LEVEL}")
+fi
+readonly KNOBS
+
+# Set TLS_CA_FILE only when using real S3, not for SeaweedFS or MockS3Server
+if [[ "${USE_S3}" == "true" ]]; then
+  # Try to find a valid TLS CA file if not explicitly set
+  if [[ -z "${TLS_CA_FILE:-}" ]]; then
+    # Common locations for TLS CA files on different systems
+    for ca_file in "/etc/pki/tls/cert.pem" "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem" "/etc/ssl/certs/ca-certificates.crt" "/etc/pki/tls/certs/ca-bundle.crt" "/etc/ssl/cert.pem" "/usr/local/share/ca-certificates/"; do
+      if [[ -f "${ca_file}" ]]; then
+        TLS_CA_FILE="${ca_file}"
+        break
+      fi
+    done
+  fi
+  TLS_CA_FILE="${TLS_CA_FILE:-}"
+else
+  # For SeaweedFS and MockS3Server, don't use TLS
+  TLS_CA_FILE=""
+fi
+readonly TLS_CA_FILE
 # Clear these environment variables. fdbbackup goes looking for them
 # and if EITHER is set, it will go via a proxy instead of to where we.
 # want it to go.
@@ -313,7 +347,7 @@ if [[ "${USE_S3}" == "true" ]]; then
     exit 1
   fi
   readonly TEST_SCRATCH_DIR
-  if ! readarray -t configs < <(aws_setup "${TEST_SCRATCH_DIR}"); then
+  if ! readarray -t configs < <(aws_setup "${build_dir}" "${TEST_SCRATCH_DIR}"); then
     err "Failed aws_setup"
     exit 1
   fi
@@ -321,33 +355,36 @@ if [[ "${USE_S3}" == "true" ]]; then
   readonly bucket="${configs[1]}"
   readonly blob_credentials_file="${configs[2]}"
   readonly region="${configs[3]}"
-  query_str="bucket=${bucket}&region=${region}"
+  query_str="bucket=${bucket}&region=${region}&secure_connection=1"
   # Make these environment variables available for the fdb cluster when s3.
   export FDB_BLOB_CREDENTIALS="${blob_credentials_file}"
-  export FDB_TLS_CA_FILE="${TLS_CA_FILE}"
+  if [[ -n "${TLS_CA_FILE}" ]]; then
+    export FDB_TLS_CA_FILE="${TLS_CA_FILE}"
+  fi
 else
-  log "Testing against seaweedfs"
-  # Now source in the seaweedfs fixture so we can use its methods in the below.
+  log "Testing against MockS3Server"
+  # Now source in the mocks3 fixture so we can use its methods in the below.
   # shellcheck source=/dev/null
-  if ! source "${cwd}/../../fdbclient/tests/seaweedfs_fixture.sh"; then
-    err "Failed to source seaweedfs_fixture.sh"
+  if ! source "${cwd}/../../fdbclient/tests/mocks3_fixture.sh"; then
+    err "Failed to source mocks3_fixture.sh"
     exit 1
   fi
-  if ! TEST_SCRATCH_DIR=$(create_weed_dir "${scratch_dir}"); then
-    err "Failed create of the weed dir." >&2
+  if ! TEST_SCRATCH_DIR=$(mktemp -d "${scratch_dir}/mocks3_bulkload_test.XXXXXX"); then
+    err "Failed create of the mocks3 test dir." >&2
     exit 1
   fi
   readonly TEST_SCRATCH_DIR
-  if ! host=$( run_weed "${scratch_dir}" "${TEST_SCRATCH_DIR}"); then
-    err "Failed to run seaweed"
+  if ! start_mocks3 "${build_dir}"; then
+    err "Failed to start MockS3Server"
     exit 1
   fi
-  readonly host
-  readonly bucket="${SEAWEED_BUCKET}"
-  readonly region="all_regions"
-  # Reference a non-existent blob file (its ignored by seaweed)
+  readonly host="${MOCKS3_HOST}:${MOCKS3_PORT}"
+  readonly bucket="test-bucket"
+  readonly region="us-east-1"
+  # Create an empty blob credentials file (MockS3Server uses simple auth)
   readonly blob_credentials_file="${TEST_SCRATCH_DIR}/blob_credentials.json"
-  # Let the connection to seaweed be insecure -- not-TLS -- because just awkward to set up.
+  echo '{}' > "${blob_credentials_file}"
+  # Let the connection to MockS3Server be insecure -- not-TLS
   query_str="bucket=${bucket}&region=${region}&secure_connection=0"
 fi
 

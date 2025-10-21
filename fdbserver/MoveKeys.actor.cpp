@@ -21,7 +21,6 @@
 #include <vector>
 #include <limits.h>
 
-#include "fdbclient/BlobRestoreCommon.h"
 #include "fdbclient/FDBOptions.g.h"
 #include "flow/Error.h"
 #include "flow/Trace.h"
@@ -34,7 +33,6 @@
 #include "fdbserver/MoveKeys.actor.h"
 #include "fdbserver/Knobs.h"
 #include "fdbclient/ReadYourWrites.h"
-#include "fdbserver/BlobMigratorInterface.h"
 #include "fdbserver/TSSMappingUtil.actor.h"
 
 #include "flow/actorcompiler.h" // This must be the last #include.
@@ -1638,7 +1636,7 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 	TraceEvent(SevInfo, "StartMoveShardsBegin", relocationIntervalId)
 	    .detail("DataMoveID", dataMoveId)
 	    .detail("TargetRange", describe(ranges))
-	    .detail("BulkLoadTaskState", bulkLoadTaskState.present() ? bulkLoadTaskState.get().toString() : "");
+	    .detail("BulkLoadTaskID", bulkLoadTaskState.present() ? bulkLoadTaskState.get().getTaskId().toString() : "");
 
 	// TODO: make startMoveShards work with multiple ranges.
 	ASSERT(ranges.size() == 1);
@@ -1650,6 +1648,7 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 			state Key begin = keys.begin;
 			state KeyRange currentKeys = keys;
 
+			state std::vector<Future<Void>> actors; // Note this clears ongoing actors from the previous iteration
 			state Transaction tr(occ);
 
 			try {
@@ -1723,7 +1722,6 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 				}
 
 				currentKeys = KeyRangeRef(begin, keys.end);
-				state std::vector<Future<Void>> actors;
 
 				if (!currentKeys.empty()) {
 					const int rowLimit = SERVER_KNOBS->MOVE_SHARD_KRM_ROW_LIMIT;
@@ -1761,8 +1759,10 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 							std::merge(src.begin(), src.end(), dest.begin(), dest.end(), owners.begin());
 							for (const auto& ssid : servers) {
 								if (std::find(owners.begin(), owners.end(), ssid) != owners.end()) {
-									TraceEvent(SevWarn, "DDBulkLoadEngineTaskStartMoveShardsMoveInConflict")
-									    .detail("BulkLoadTaskState", bulkLoadTaskState.get().toString())
+									TraceEvent(SevWarn, "DDBulkLoadTaskStartMoveShardsMoveInConflict")
+									    .detail("TaskID", bulkLoadTaskState.get().getTaskId())
+									    .detail("JobID", bulkLoadTaskState.get().getJobId())
+									    .detail("TaskRange", bulkLoadTaskState.get().getRange())
 									    .detail("DestServerId", ssid)
 									    .detail("OwnerIds", describe(owners))
 									    .detail("DataMove", dataMove.toString());
@@ -1893,16 +1893,19 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 						                 bulkLoadTaskPrefix,
 						                 newBulkLoadTaskState.getRange(),
 						                 bulkLoadTaskStateValue(newBulkLoadTaskState)));
-						TraceEvent(SevInfo, "DDBulkLoadEngineTaskRunningPersist", relocationIntervalId)
-						    .detail("BulkLoadTaskState", newBulkLoadTaskState.toString());
+						TraceEvent(
+						    bulkLoadVerboseEventSev(), "DDBulkLoadTaskSetRunningStateTransaction", relocationIntervalId)
+						    .detail("DataMoveID", dataMoveId)
+						    .detail("JobID", newBulkLoadTaskState.getJobId())
+						    .detail("TaskID", newBulkLoadTaskState.getTaskId());
 						dataMove.bulkLoadTaskState = newBulkLoadTaskState;
 					}
 					dataMove.setPhase(DataMoveMetaData::Running);
 					TraceEvent(sevDm, "StartMoveShardsDataMoveComplete", relocationIntervalId)
 					    .detail("DataMoveID", dataMoveId)
 					    .detail("DataMove", dataMove.toString())
-					    .detail("BulkLoadTaskState",
-					            bulkLoadTaskState.present() ? bulkLoadTaskState.get().toString() : "");
+					    .detail("BulkLoadTaskID",
+					            bulkLoadTaskState.present() ? bulkLoadTaskState.get().getTaskId().toString() : "");
 				} else {
 					dataMove.setPhase(DataMoveMetaData::Prepare);
 					TraceEvent(sevDm, "StartMoveShardsDataMovePartial", relocationIntervalId)
@@ -1918,6 +1921,16 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 
 				wait(tr.commit());
 
+				if (currentKeys.end == keys.end && bulkLoadTaskState.present()) {
+					Version commitVersion = tr.getCommittedVersion();
+					TraceEvent(bulkLoadVerboseEventSev(), "DDBulkLoadTaskPersistRunningState", relocationIntervalId)
+					    .detail("JobID", bulkLoadTaskState.get().getJobId())
+					    .detail("DataMoveID", dataMoveId.toString())
+					    .detail("TaskID", bulkLoadTaskState.get().getTaskId())
+					    .detail("TaskRange", bulkLoadTaskState.get().getRange())
+					    .detail("CommitVersion", commitVersion);
+				}
+
 				TraceEvent(sevDm, "DataMoveMetaDataCommit", relocationIntervalId)
 				    .detail("DataMoveID", dataMoveId)
 				    .detail("DataMoveKey", dataMoveKeyFor(dataMoveId))
@@ -1925,7 +1938,8 @@ ACTOR static Future<Void> startMoveShards(Database occ,
 				    .detail("DeltaRange", currentKeys.toString())
 				    .detail("Range", describe(dataMove.ranges))
 				    .detail("DataMove", dataMove.toString())
-				    .detail("BulkLoadTaskState", bulkLoadTaskState.present() ? bulkLoadTaskState.get().toString() : "");
+				    .detail("BulkLoadTaskID",
+				            bulkLoadTaskState.present() ? bulkLoadTaskState.get().getTaskId().toString() : "");
 
 				dataMove = DataMoveMetaData();
 				if (currentKeys.end == keys.end) {
@@ -2331,8 +2345,11 @@ ACTOR static Future<Void> finishMoveShards(Database occ,
 							                 bulkLoadTaskPrefix,
 							                 newBulkLoadTaskState.getRange(),
 							                 bulkLoadTaskStateValue(newBulkLoadTaskState)));
-							TraceEvent(SevInfo, "DDBulkLoadEngineTaskCompletePersist", relocationIntervalId)
-							    .detail("BulkLoadTaskState", newBulkLoadTaskState.toString());
+							TraceEvent(
+							    bulkLoadVerboseEventSev(), "DDBulkLoadTaskSetCompleteTransaction", relocationIntervalId)
+							    .detail("DataMoveID", dataMoveId)
+							    .detail("JobID", newBulkLoadTaskState.getJobId())
+							    .detail("TaskID", newBulkLoadTaskState.getTaskId());
 							dataMove.bulkLoadTaskState = newBulkLoadTaskState;
 						}
 						wait(deleteCheckpoints(&tr, dataMove.checkpoints, dataMoveId));
@@ -2351,6 +2368,17 @@ ACTOR static Future<Void> finishMoveShards(Database occ,
 					}
 
 					wait(tr.commit());
+
+					if (range.end == dataMove.ranges.front().end && bulkLoadTaskState.present()) {
+						Version commitVersion = tr.getCommittedVersion();
+						TraceEvent(
+						    bulkLoadVerboseEventSev(), "DDBulkLoadTaskPersistCompleteState", relocationIntervalId)
+						    .detail("JobID", bulkLoadTaskState.get().getJobId())
+						    .detail("DataMoveID", dataMoveId)
+						    .detail("TaskID", bulkLoadTaskState.get().getTaskId())
+						    .detail("TaskRange", bulkLoadTaskState.get().getRange())
+						    .detail("CommitVersion", commitVersion);
+					}
 
 					if (range.end == dataMove.ranges.front().end) {
 						// Post validate consistency of update of keyServers and serverKeys
@@ -2397,7 +2425,7 @@ ACTOR static Future<Void> finishMoveShards(Database occ,
 
 	TraceEvent(SevInfo, "FinishMoveShardsEnd", relocationIntervalId)
 	    .detail("DataMoveID", dataMoveId)
-	    .detail("BulkLoadTaskState", bulkLoadTaskState.present() ? bulkLoadTaskState.get().toString() : "")
+	    .detail("BulkLoadTaskID", bulkLoadTaskState.present() ? bulkLoadTaskState.get().getTaskId().toString() : "")
 	    .detail("DataMove", dataMove.toString());
 	return Void();
 }
@@ -3368,7 +3396,7 @@ void seedShardServers(Arena& arena, CommitTransactionRef& tr, std::vector<Storag
 	if (SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA) {
 		const UID shardId = newDataMoveId(deterministicRandom()->randomUInt64(),
 		                                  AssignEmptyRange(false),
-		                                  DataMoveType::PHYSICAL,
+		                                  DataMoveType::LOGICAL,
 		                                  DataMovementReason::SEED_SHARD_SERVER,
 		                                  UnassignShard(false));
 		ksValue = keyServersValue(serverSrcUID, /*dest=*/std::vector<UID>(), shardId, UID());
@@ -3432,46 +3460,4 @@ Future<Void> assignKeysToServer(UID traceId, TrType tr, KeyRangeRef keys, UID se
 	dprint("Assign {} to server {}\n", normalKeys.toString(), serverUID.toString());
 	TraceEvent("AssignKeys", traceId).detail("Keys", keys).detail("SS", serverUID);
 	return Void();
-}
-
-ACTOR Future<Void> prepareBlobRestore(Database occ,
-                                      MoveKeysLock lock,
-                                      const DDEnabledState* ddEnabledState,
-                                      UID traceId,
-                                      KeyRangeRef keys,
-                                      UID bmId,
-                                      UID reqId) {
-	state int retries = 0;
-	state Transaction tr = Transaction(occ);
-	ASSERT(ddEnabledState->isBlobRestorePreparing());
-	loop {
-		tr.debugTransaction(reqId);
-		tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
-		tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
-		tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-		try {
-			wait(checkPersistentMoveKeysLock(&tr, lock));
-			UID currentOwnerId = wait(BlobGranuleRestoreConfig().lock().getD(&tr));
-			if (currentOwnerId != bmId) {
-				CODE_PROBE(true, "Blob migrator replaced in prepareBlobRestore");
-				dprint("Blob migrator {} is replaced by {}\n", bmId.toString(), currentOwnerId.toString());
-				TraceEvent("BlobMigratorReplaced", traceId).detail("Current", currentOwnerId).detail("BM", bmId);
-				throw blob_migrator_replaced();
-			}
-			wait(unassignServerKeys(traceId, &tr, keys, { bmId }));
-			wait(assignKeysToServer(traceId, &tr, keys, bmId));
-			wait(tr.commit());
-			TraceEvent("BlobRestorePrepare", traceId)
-			    .detail("State", "PrepareTxnCommitted")
-			    .detail("ReqId", reqId)
-			    .detail("BM", bmId);
-			return Void();
-		} catch (Error& e) {
-			wait(tr.onError(e));
-
-			if (++retries > SERVER_KNOBS->BLOB_MIGRATOR_ERROR_RETRIES) {
-				throw restore_error();
-			}
-		}
-	}
 }
