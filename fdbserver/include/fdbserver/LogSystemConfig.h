@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,6 +45,8 @@ struct OptionalInterface {
 	std::string toString() const { return ident.toString(); }
 
 	bool operator==(UID const& r) const { return ident == r; }
+	bool operator==(OptionalInterface const& r) const { return ident == r.ident; }
+	bool operator!=(OptionalInterface const& r) const { return ident != r.ident; }
 
 	template <class Ar>
 	void serialize(Ar& ar);

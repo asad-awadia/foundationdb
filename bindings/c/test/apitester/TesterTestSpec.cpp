@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -104,14 +104,6 @@ std::unordered_map<std::string, std::function<void(const std::string& value, Tes
 	{ "disableClientBypass",
 	  [](const std::string& value, TestSpec* spec) { //
 	      spec->disableClientBypass = (value == "true");
-	  } },
-	{ "minTenants",
-	  [](const std::string& value, TestSpec* spec) { //
-	      processIntOption(value, "minTenants", spec->minTenants, 1, 1000);
-	  } },
-	{ "maxTenants",
-	  [](const std::string& value, TestSpec* spec) { //
-	      processIntOption(value, "maxTenants", spec->maxTenants, 1, 1000);
 	  } },
 	{ "runLoopProfiler",
 	  [](const std::string& value, TestSpec* spec) { //

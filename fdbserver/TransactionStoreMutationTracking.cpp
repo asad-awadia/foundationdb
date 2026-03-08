@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,9 +56,9 @@ TraceEvent transactionStoreDebugMutationEnabled(const char* context,
 		label = DEBUG_KEY.label;
 	}
 
-	for (auto& labelRange : debugRanges) {
-		if (labelRange.second.contains(mutation)) {
-			label = labelRange.first;
+	for (const auto& [rangeLabel, debugRange] : debugRanges) {
+		if (debugRange.contains(mutation)) {
+			label = rangeLabel;
 			break;
 		}
 	}

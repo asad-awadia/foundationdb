@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -58,10 +58,10 @@ struct SaveAndKillWorkload : TestWorkload {
 	}
 	Future<Void> start(Database const& cx) override { return _start(this, cx); }
 
-	ACTOR Future<Void> _start(SaveAndKillWorkload* self, Database cx) {
-		state int i;
-		wait(delay(deterministicRandom()->random01() * self->testDuration));
-		DatabaseConfiguration config = wait(getDatabaseConfiguration(cx));
+	Future<Void> _start(SaveAndKillWorkload* self, Database cx) {
+		int i{ 0 };
+		co_await delay(deterministicRandom()->random01() * self->testDuration);
+		DatabaseConfiguration config = co_await getDatabaseConfiguration(cx);
 
 		CSimpleIni ini;
 		ini.SetUnicode();
@@ -75,10 +75,6 @@ struct SaveAndKillWorkload : TestWorkload {
 		ini.SetValue("META", "testerCount", format("%d", g_simulator->testerCount).c_str());
 		ini.SetValue("META", "tssMode", format("%d", g_simulator->tssMode).c_str());
 		ini.SetValue("META", "mockDNS", INetworkConnections::net()->convertMockDNSToString().c_str());
-		ini.SetValue("META", "tenantMode", config.tenantMode.toString().c_str());
-		if (cx->defaultTenant.present()) {
-			ini.SetValue("META", "defaultTenant", cx->defaultTenant.get().toString().c_str());
-		}
 		ini.SetBoolValue("META", "enableShardEncodeLocationMetadata", SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA);
 		ini.SetBoolValue("META", "encryptHeaderAuthTokenEnabled", FLOW_KNOBS->ENCRYPT_HEADER_AUTH_TOKEN_ENABLED);
 		ini.SetLongValue("META", "encryptHeaderAuthTokenAlgo", FLOW_KNOBS->ENCRYPT_HEADER_AUTH_TOKEN_ALGO);
@@ -154,12 +150,10 @@ struct SaveAndKillWorkload : TestWorkload {
 		}
 
 		for (i = 0; i < 100; i++) {
-			wait(delay(0.0));
+			co_await delay(0.0);
 		}
 
 		g_simulator->stop();
-
-		return Void();
 	}
 
 	Future<bool> check(Database const& cx) override { return true; }

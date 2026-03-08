@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -72,6 +72,7 @@ public:
 };
 
 // Workload configuration
+// The comments on this stuff make me weep for humanity.
 struct WorkloadConfig {
 	// Workload name
 	std::string name;
@@ -83,7 +84,11 @@ struct WorkloadConfig {
 	int numClients;
 
 	// Number of Tenants
-	int numTenants;
+	// TODO(gglass): delete tenant support more aggressively out of files in this
+	// directory. For now leave it in with numTenants set to 0.  Prior deletion
+	// caused damage and the test cases spin or break themselves or *something*
+	// and end up timing out due to ctest 10 minute timeout.
+	int numTenants = 0;
 
 	// Selected FDB API version
 	int apiVersion;

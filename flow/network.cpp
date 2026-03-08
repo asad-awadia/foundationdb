@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,7 +37,10 @@ void ChaosMetrics::clear() {
 }
 
 void ChaosMetrics::getFields(TraceEvent* e) {
-	std::pair<const char*, unsigned int> metrics[] = { { "DiskDelays", diskDelays }, { "BitFlips", bitFlips } };
+	std::pair<const char*, unsigned int> metrics[] = {
+		{ "DiskDelays", diskDelays },   { "BitFlips", bitFlips }, { "S3Errors", s3Errors },
+		{ "S3Throttles", s3Throttles }, { "S3Delays", s3Delays }, { "S3Corruptions", s3Corruptions }
+	};
 	if (e != nullptr) {
 		for (auto& m : metrics) {
 			char c = m.first[0];
@@ -105,6 +108,15 @@ BitFlipper* BitFlipper::flipper() {
 		g_network->setGlobal(INetwork::enBitFlipper, res);
 	}
 	return static_cast<BitFlipper*>(res);
+}
+
+S3FaultInjector* S3FaultInjector::injector() {
+	auto res = g_network->global(INetwork::enS3FaultInjector);
+	if (!res) {
+		res = new S3FaultInjector();
+		g_network->setGlobal(INetwork::enS3FaultInjector, res);
+	}
+	return static_cast<S3FaultInjector*>(res);
 }
 
 bool IPAddress::operator==(const IPAddress& rhs) const {

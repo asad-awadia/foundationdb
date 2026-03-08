@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,16 +27,14 @@ class IKeyLocationService {
 
 	// If isBackward == true, returns the shard containing the key before 'key' (an infinitely long, inexpressible key).
 	// Otherwise returns the shard containing key. It's possible the returned location is a failed interface.
-	virtual Future<KeyRangeLocationInfo> getKeyLocation(TenantInfo tenant,
-	                                                    Key key,
+	virtual Future<KeyRangeLocationInfo> getKeyLocation(Key key,
 	                                                    SpanContext spanContext,
 	                                                    Optional<UID> debugID,
 	                                                    UseProvisionalProxies useProvisionalProxies,
 	                                                    Reverse isBackward,
 	                                                    Version version) = 0;
 
-	virtual Future<std::vector<KeyRangeLocationInfo>> getKeyRangeLocations(TenantInfo tenant,
-	                                                                       KeyRange keys,
+	virtual Future<std::vector<KeyRangeLocationInfo>> getKeyRangeLocations(KeyRange keys,
 	                                                                       int limit,
 	                                                                       Reverse reverse,
 	                                                                       SpanContext spanContext,

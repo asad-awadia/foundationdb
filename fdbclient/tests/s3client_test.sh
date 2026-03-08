@@ -3,6 +3,11 @@
 # Run s3client against s3 if available or else against MockS3Server.
 # MockS3Server starts instantly. Tests run for a few seconds after that.
 #
+# Debugging:
+#   - Preserve test data: PRESERVE_TEST_DATA=1 ./s3client_test.sh ...
+#     This will leave all test data including MockS3 persistence files
+#     in the test scratch directory for analysis after the test completes.
+#
 
 # Make sure cleanup on script exit.
 trap "exit 1" HUP INT PIPE QUIT TERM
@@ -10,6 +15,11 @@ trap cleanup  EXIT
 
 # Cleanup. Called from signal trap.
 function cleanup {
+  # Check if test data should be preserved (common function from tests_common.sh)
+  if cleanup_with_preserve_check; then
+    return 0
+  fi
+  
   if type shutdown_mocks3 &> /dev/null; then
     shutdown_mocks3
   fi
@@ -372,6 +382,48 @@ function test_empty_bucket {
   fi
 }
 
+# Wait for files to become available in MockS3Server listings with retry logic
+# $1 s3client binary path
+# $2 credentials file
+# $3 logs directory
+# $4 url to list
+# $5 expected file count
+# $6 search pattern (e.g., "ls_test/file" to match ls_test/file1, ls_test/file2, etc.)
+# Returns 0 if all files found, 1 on timeout
+function wait_for_files_in_listing {
+  local s3client="$1"
+  local credentials="$2"
+  local logsdir="$3"
+  local url="$4"
+  local expected_count="$5"
+  local pattern="$6"
+  
+  local max_attempts=20  # 10 seconds total with 0.5s between attempts
+  local attempt=0
+  
+  while [[ $attempt -lt $max_attempts ]]; do
+    local output
+    # Capture only stdout (listing output), discard stderr (HTTP debug messages)
+    output=$(run_s3client "${s3client}" "${credentials}" "${logsdir}" "false" \
+      --knob_blobstore_list_max_keys_per_page=100 ls --recursive "${url}" 2>/dev/null)
+    
+    local found_count
+    found_count=$(echo "${output}" | grep -c "${pattern}" || true)
+    
+    if [[ $found_count -ge $expected_count ]]; then
+      log "All ${expected_count} files found in listing (attempt $((attempt + 1)))"
+      return 0
+    fi
+    
+    attempt=$((attempt + 1))
+    sleep 0.5
+  done
+  
+  err "Timeout waiting for files in listing after ${max_attempts} attempts (10s)"
+  err "Expected ${expected_count} files matching '${pattern}', found ${found_count}"
+  return 1
+}
+
 # Test listing with existing files
 # $1 The url to go against
 # $2 Directory I can write test files in.
@@ -437,7 +489,6 @@ function test_list_with_files {
   local files_per_level=2
   log "Running ls test with depth ${depth} and ${files_per_level} files per level"
 
-
   local test_dir="${dir}/ls_test_nested"
   mkdir -p "${test_dir}"
 
@@ -465,14 +516,29 @@ function test_list_with_files {
     err "Failed to upload test files for ls test"
     return 1
   fi
+  
+  # Calculate total expected files in nested structure
+  # At each level: files_per_level files, plus subdirectories with their files
+  # Level 1: 2 files + subdir (Level 2: 2 files + subdir (Level 3: 2 files))
+  # Total: 2 + 2 + 2 = 6 files
+  local total_files=$((files_per_level * depth))
+  
+  # Extract path from URL for pattern matching
+  local url_path
+  url_path=$(echo "${url}" | sed -E 's|blobstore://[^/]+/([^?]+).*|\1|')
+  
+  # Wait for all files to be available in MockS3Server listing with retry logic
+  if ! wait_for_files_in_listing "${s3client}" "${credentials}" "${logsdir}" \
+      "${url}" "${total_files}" "${url_path}"; then
+    err "Failed waiting for files to become available in MockS3Server"
+    return 1
+  fi
 
-  # Test ls on the uploaded directory
+  # Now retrieve the listing for validation
   local output
   local status
-
-  # Test recursive listing - use higher page size to avoid MockS3Server pagination edge case
   output=$(run_s3client "${s3client}" "${credentials}" "${logsdir}" "false" \
-    --knob_blobstore_list_max_keys_per_page=10 ls --recursive "${url}" 2>&1)
+    --knob_blobstore_list_max_keys_per_page=100 ls --recursive "${url}" 2>&1)
   status=$?
 
   local missing=0
@@ -485,6 +551,9 @@ function test_list_with_files {
       local expected="${current_path}/file${current_depth}_${i}"
       if ! echo "${output}" | grep -q "${expected}"; then
         err "Missing ${expected} in ls output"
+        log "=== DEBUG: Recursive ls output ==="
+        echo "${output}" | grep -v "HTTP" | head -30
+        log "=== END DEBUG ==="
         missing=1
       fi
     done
@@ -497,11 +566,6 @@ function test_list_with_files {
     fi
   }
 
-  # Extract the path prefix from the URL (everything between host and ?)
-  # URL format: blobstore://host/path/prefix?query
-  local url_path
-  url_path=$(echo "${url}" | sed -E 's|blobstore://[^/]+/([^?]+).*|\1|')
-  
   check_nested_files "${url_path}" 1 "true"
 
   if [[ "${missing}" -ne 0 ]]; then
@@ -509,11 +573,34 @@ function test_list_with_files {
   fi
 
   # Test non-recursive listing - use higher page size to avoid MockS3Server pagination edge case
-  output=$(run_s3client "${s3client}" "${credentials}" "${logsdir}" "false" \
-  --knob_blobstore_list_max_keys_per_page=10 ls "${url}" 2>&1)
-  status=$?
-
-  check_nested_files "${url_path}" 1 "false"
+  # Add retry logic for MockS3Server consistency (similar to recursive listing)
+  local non_recursive_attempts=5
+  local non_recursive_attempt=0
+  local non_recursive_success=0
+  
+  while [[ $non_recursive_attempt -lt $non_recursive_attempts ]]; do
+    output=$(run_s3client "${s3client}" "${credentials}" "${logsdir}" "false" \
+      --knob_blobstore_list_max_keys_per_page=10 ls "${url}" 2>&1)
+    status=$?
+    
+    # Reset missing flag for this attempt
+    missing=0
+    check_nested_files "${url_path}" 1 "false"
+    
+    if [[ "${missing}" -eq 0 ]]; then
+      non_recursive_success=1
+      break
+    fi
+    
+    log "Non-recursive listing attempt $((non_recursive_attempt + 1)) failed, retrying..."
+    non_recursive_attempt=$((non_recursive_attempt + 1))
+    sleep 0.5
+  done
+  
+  if [[ "${non_recursive_success}" -eq 0 ]]; then
+    err "Non-recursive listing failed after ${non_recursive_attempts} attempts"
+    return 1
+  fi
   if [[ "${missing}" -ne 0 ]]; then
     return 1
   fi
@@ -568,36 +655,6 @@ set -o nounset  # a.k.a. set -u
 set -o pipefail
 set -o noclobber
 
-# Globals
-
-# TEST_SCRATCH_DIR gets set below. Tests should be their data in here.
-# It gets cleaned up on the way out of the test.
-TEST_SCRATCH_DIR=
-readonly HTTP_VERBOSE_LEVEL=2
-# Should we use S3? If USE_S3 is not defined, then check if
-# OKTETO_NAMESPACE is defined (It is defined on the okteto
-# internal apple dev environments where S3 is available).
-readonly USE_S3="${USE_S3:-$( if [[ -n "${OKTETO_NAMESPACE+x}" ]]; then echo "true" ; else echo "false"; fi )}"
-
-# Set TLS_CA_FILE only when using real S3, not for SeaweedFS
-if [[ "${USE_S3}" == "true" ]]; then
-  # Try to find a valid TLS CA file if not explicitly set
-  if [[ -z "${TLS_CA_FILE:-}" ]]; then
-    # Common locations for TLS CA files on different systems
-    for ca_file in "/etc/pki/tls/cert.pem" "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem" "/etc/ssl/certs/ca-certificates.crt" "/etc/pki/tls/certs/ca-bundle.crt" "/etc/ssl/cert.pem" "/usr/local/share/ca-certificates/" "/etc/ssl/certs/"; do
-      if [[ -f "${ca_file}" ]]; then
-        TLS_CA_FILE="${ca_file}"
-        break
-      fi
-    done
-  fi
-  TLS_CA_FILE="${TLS_CA_FILE:-}"
-else
-  # For SeaweedFS, don't use TLS
-  TLS_CA_FILE=""
-fi
-readonly TLS_CA_FILE
-
 # Get the working directory for this script.
 if ! path=$(resolve_to_absolute_path "${BASH_SOURCE[0]}"); then
   echo "ERROR: Failed resolve_to_absolute_path"
@@ -613,6 +670,16 @@ if ! source "${cwd}/tests_common.sh"; then
   echo "ERROR: Failed to source tests_common.sh"
   exit 1
 fi
+
+# Globals
+# TEST_SCRATCH_DIR gets set below. Tests should be their data in here.
+# It gets cleaned up on the way out of the test.
+TEST_SCRATCH_DIR=
+readonly HTTP_VERBOSE_LEVEL=2
+
+# Setup USE_S3 and TLS_CA_FILE using common functions
+readonly USE_S3="$(get_use_s3_default)"
+setup_tls_ca_file
 
 blob_credentials_file=""
 bucket=""
@@ -745,7 +812,8 @@ else
     exit 1
   fi
   readonly TEST_SCRATCH_DIR
-  if ! start_mocks3 "${build_dir}"; then
+  # Pass test scratch dir as persistence directory so files are cleaned up with test
+  if ! start_mocks3 "${build_dir}" "${TEST_SCRATCH_DIR}/mocks3_data"; then
     err "Failed to start MockS3Server"
     exit 1
   fi

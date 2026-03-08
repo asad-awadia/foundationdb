@@ -42,6 +42,14 @@ if(NOT OPEN_FOR_IDE)
     LOCATION bin
     SOURCE fdbbackup
     TARGETS fdbdr dr_agent backup_agent fdbrestore fastrestore_tool)
+
+  # Test version of backup.actor.cpp without main() function
+  add_flow_target(EXECUTABLE NAME backup_tests SRCS backup.actor.cpp)
+  target_include_directories(backup_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_BINARY_DIR}/include")
+  target_link_libraries(backup_tests PRIVATE fdbclient)
+  target_compile_definitions(backup_tests PRIVATE EXCLUDE_MAIN_FUNCTION=1)
+  add_test(NAME BackupTests COMMAND backup_tests)
+
 endif()
 
 if (GPERFTOOLS_FOUND)
@@ -53,4 +61,6 @@ if (NOT WIN32 AND NOT OPEN_FOR_IDE)
   enable_testing()
   add_test(NAME dir_backup_tests COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/dir_backup_test.sh ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR})
   add_test(NAME s3_backup_tests COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/s3_backup_test.sh ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR} --encrypt-at-random)
+  # Note: No --encrypt flag - BulkLoad doesn't support encryption yet
+  add_test(NAME s3_backup_bulkdump_bulkload_tests COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/s3_backup_bulkdump_bulkload.sh ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR})
 endif()

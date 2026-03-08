@@ -7,9 +7,10 @@
 #   1. Source this script:
 #      source fdbclient/tests/mocks3_fixture.sh
 #
-#   2. Start the server (optionally specify build directory):
-#      start_mocks3 [/path/to/build_output]
-#      # If no path provided, searches for build_output automatically
+#   2. Start the server (optionally specify build directory and persistence directory):
+#      start_mocks3 [/path/to/build_output] [/path/to/persistence/dir]
+#      # If build path not provided, searches for build_output automatically
+#      # If persistence dir not provided, defaults to "simfdb/mocks3"
 #
 #   3. Get the blobstore URL:
 #      URL=$(get_mocks3_url)
@@ -25,7 +26,7 @@
 #
 # Example standalone usage:
 #   $ source fdbclient/tests/mocks3_fixture.sh
-#   $ start_mocks3 ~/build_output
+#   $ start_mocks3 ~/build_output /tmp/test_scratch/mocks3_data
 #   Starting MockS3Server on 127.0.0.1:8080 (attempt 1/10)
 #   MockS3Server ready on port 8080
 #   $ URL=$(get_mocks3_url)
@@ -44,6 +45,7 @@ MOCKS3_LOG_FILE=""
 
 start_mocks3() {
     local build_dir_param="${1:-}"
+    local persistence_dir_param="${2:-}"
     local max_attempts=10
     local attempt
 
@@ -81,11 +83,22 @@ start_mocks3() {
         # Start MockS3Server using fdbserver with the new role
         # Redirect stderr to log file to detect bind failures
         # Use >| to force overwrite even if noclobber is set
-        "$BUILD_DIR/bin/fdbserver" \
+        local cmd=("$BUILD_DIR/bin/fdbserver" \
             --role mocks3server \
             --public-address "${MOCKS3_HOST}:${MOCKS3_PORT}" \
-            --listen-address "${MOCKS3_HOST}:${MOCKS3_PORT}" \
-            2>|"$MOCKS3_LOG_FILE" &
+            --listen-address "${MOCKS3_HOST}:${MOCKS3_PORT}")
+
+        # Add persistence directory and logdir if provided
+        if [ -n "$persistence_dir_param" ]; then
+            cmd+=(--mocks3-persistence-dir "$persistence_dir_param")
+            
+            # Put fdbserver trace logs alongside persistence data for easy access
+            local logdir="$(dirname "$persistence_dir_param")/logs"
+            mkdir -p "$logdir"
+            cmd+=(--logdir "$logdir")
+        fi
+        
+        "${cmd[@]}" 2>|"$MOCKS3_LOG_FILE" &
         MOCKS3_PID=$!
 
         # Wait briefly for server to start or fail
@@ -122,6 +135,16 @@ start_mocks3() {
 
         # Clean up the log file if we're retrying
         rm -f "$MOCKS3_LOG_FILE"
+        
+        # Clean up trace logs from failed bind attempt
+        # These contain Severity=40 errors that would cause false test failures
+        if [ -n "$persistence_dir_param" ]; then
+            local logdir="$(dirname "$persistence_dir_param")/logs"
+            if [ -d "$logdir" ]; then
+                # Remove trace files for the port that failed to bind
+                rm -f "$logdir/trace.${MOCKS3_HOST}.${MOCKS3_PORT}."* 2>/dev/null || true
+            fi
+        fi
 
         # If we get here, the server failed to start
         # Kill any remaining process and try next port
@@ -145,31 +168,52 @@ start_mocks3() {
 }
 
 shutdown_mocks3() {
+    echo "$(date -Iseconds) shutdown_mocks3: starting (PID: ${MOCKS3_PID:-none})"
+    
     if [ -n "$MOCKS3_PID" ]; then
-        echo "Shutting down MockS3Server (PID: $MOCKS3_PID)"
-        # Try graceful shutdown first
+        # Check if process exists before trying to kill
         if kill -0 $MOCKS3_PID 2>/dev/null; then
+            echo "$(date -Iseconds) shutdown_mocks3: SIGTERM -> PID $MOCKS3_PID"
             kill $MOCKS3_PID 2>/dev/null || true
-            # Wait up to 5 seconds for graceful shutdown
-            for i in {1..5}; do
+            
+            # Very brief wait for graceful shutdown (reduced from 5s to 1s total)
+            for i in {1..2}; do
                 if ! kill -0 $MOCKS3_PID 2>/dev/null; then
+                    echo "$(date -Iseconds) shutdown_mocks3: process exited gracefully"
                     break
                 fi
-                sleep 1
+                sleep 0.5
             done
-            # Force kill if still running
+            
+            # Force kill if still running (SIGKILL)
             if kill -0 $MOCKS3_PID 2>/dev/null; then
-                echo "Force killing MockS3Server (PID: $MOCKS3_PID)"
+                echo "$(date -Iseconds) shutdown_mocks3: SIGKILL -> PID $MOCKS3_PID (didn't respond to SIGTERM)"
                 kill -9 $MOCKS3_PID 2>/dev/null || true
+                # Very brief wait for SIGKILL (reduced from 0.5s)
+                sleep 0.1
+                
+                # Check if it survived kill -9 (should be impossible)
+                if kill -0 $MOCKS3_PID 2>/dev/null; then
+                    # Get process info for debugging
+                    proc_info=$(ps -p $MOCKS3_PID -o pid,ppid,stat,comm 2>/dev/null || echo "PID not in process table")
+                    echo "$(date -Iseconds) ERROR: MockS3Server (PID: $MOCKS3_PID) is unkillable" >&2
+                    echo "       Process info: ${proc_info}" >&2
+                else
+                    echo "$(date -Iseconds) shutdown_mocks3: process killed with SIGKILL"
+                fi
             fi
-            wait $MOCKS3_PID 2>/dev/null || true
+        else
+            echo "$(date -Iseconds) shutdown_mocks3: process already dead"
         fi
     fi
 
     # Clean up log file
     if [ -n "$MOCKS3_LOG_FILE" ] && [ -f "$MOCKS3_LOG_FILE" ]; then
+        echo "$(date -Iseconds) shutdown_mocks3: removing log file"
         rm -f "$MOCKS3_LOG_FILE"
     fi
+    
+    echo "$(date -Iseconds) shutdown_mocks3: complete"
 }
 
 get_mocks3_url() {

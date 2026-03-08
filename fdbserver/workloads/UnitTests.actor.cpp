@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,18 +30,14 @@ void forceLinkVersionedMapTests();
 void forceLinkMemcpyTests();
 void forceLinkMemcpyPerfTests();
 void forceLinkStreamCipherTests();
-void forceLinkBlobCipherTests();
 void forceLinkParallelStreamTests();
 void forceLinkSimExternalConnectionTests();
 void forceLinkMutationLogReaderTests();
-void forceLinkSimKmsConnectorTests();
 void forceLinkIThreadPoolTests();
-void forceLinkTokenSignTests();
 void forceLinkJsonWebKeySetTests();
 void forceLinkVersionVectorTests();
 void forceLinkRESTClientTests();
 void forceLinkRESTUtilsTests();
-void forceLinkRESTKmsConnectorTest();
 void forceLinkCompressionUtilsTest();
 void forceLinkAtomicTests();
 void forceLinkIdempotencyIdTests();
@@ -50,8 +46,6 @@ void forceLinkDDSketchTests();
 void forceLinkCommitProxyTests();
 void forceLinkWipedStringTests();
 void forceLinkRandomKeyValueUtilsTests();
-void forceLinkSimKmsVaultTests();
-void forceLinkRESTSimKmsVaultTest();
 void forceLinkActorFuzzUnitTests();
 void forceLinkGrpcTests();
 void forceLinkGrpcTests2();
@@ -107,18 +101,14 @@ struct UnitTestWorkload : TestWorkload {
 		forceLinkMemcpyTests();
 		forceLinkMemcpyPerfTests();
 		forceLinkStreamCipherTests();
-		forceLinkBlobCipherTests();
 		forceLinkParallelStreamTests();
 		forceLinkSimExternalConnectionTests();
 		forceLinkMutationLogReaderTests();
-		forceLinkSimKmsConnectorTests();
 		forceLinkIThreadPoolTests();
-		forceLinkTokenSignTests();
 		forceLinkJsonWebKeySetTests();
 		forceLinkVersionVectorTests();
 		forceLinkRESTClientTests();
 		forceLinkRESTUtilsTests();
-		forceLinkRESTKmsConnectorTest();
 		forceLinkCompressionUtilsTest();
 		forceLinkAtomicTests();
 		forceLinkIdempotencyIdTests();
@@ -126,8 +116,6 @@ struct UnitTestWorkload : TestWorkload {
 		forceLinkDDSketchTests();
 		forceLinkWipedStringTests();
 		forceLinkRandomKeyValueUtilsTests();
-		forceLinkSimKmsVaultTests();
-		forceLinkRESTSimKmsVaultTest();
 		forceLinkActorFuzzUnitTests();
 		forceLinkSimpleCounterTests();
 
@@ -169,8 +157,8 @@ struct UnitTestWorkload : TestWorkload {
 		return true;
 	}
 
-	ACTOR static Future<Void> runUnitTests(UnitTestWorkload* self) {
-		state std::vector<UnitTest*> tests;
+	static Future<Void> runUnitTests(UnitTestWorkload* self) {
+		std::vector<UnitTest*> tests;
 
 		for (auto test = g_unittests.tests; test != nullptr; test = test->next) {
 			if (self->testMatched(test->name)) {
@@ -190,30 +178,31 @@ struct UnitTestWorkload : TestWorkload {
 			    .detail("TestPattern", self->testPattern)
 			    .detail("TestsIgnored", self->testsIgnored);
 			++self->testsFailed;
-			return Void();
+			co_return;
 		}
 
 		deterministicRandom()->randomShuffle(tests);
 		if (self->testRunLimit > 0 && tests.size() > self->testRunLimit)
 			tests.resize(self->testRunLimit);
 
-		state std::vector<UnitTest*>::iterator t;
+		std::vector<UnitTest*>::iterator t;
 		for (t = tests.begin(); t != tests.end(); ++t) {
-			state UnitTest* test = *t;
+			UnitTest* test = *t;
 			printf("Testing %s\n", test->name);
 
 			TraceEvent(SevInfo, "RunningUnitTest")
 			    .detail("Name", test->name)
 			    .detail("File", test->file)
-			    .detail("Line", test->line);
+			    .detail("Line", test->line)
+			    .detail("Rand", deterministicRandom()->randomInt(0, 100001));
 
-			state Error result = success();
-			state double start_now = now();
-			state double start_timer = timer();
+			Error result = success();
+			double start_now = now();
+			double start_timer = timer();
 
 			platform::createDirectory(self->testParams.getDataDir());
 			try {
-				wait(test->func(self->testParams));
+				co_await test->func(self->testParams);
 			} catch (Error& e) {
 				++self->testsFailed;
 				result = e;
@@ -235,8 +224,6 @@ struct UnitTestWorkload : TestWorkload {
 			    .detail("WallTime", wallTime)
 			    .detail("FlowTime", simTime);
 		}
-
-		return Void();
 	}
 };
 

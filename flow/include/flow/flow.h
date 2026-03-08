@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,9 +20,6 @@
 
 #ifndef FLOW_FLOW_H
 #define FLOW_FLOW_H
-#include "flow/ActorContext.h"
-#include "flow/Arena.h"
-#include "flow/FastRef.h"
 #pragma once
 
 #ifdef _MSC_VER
@@ -33,30 +30,23 @@
 #endif
 
 #include <algorithm>
-#include <array>
-#include <iosfwd>
-#include <functional>
-#include <memory>
 #include <mutex>
 #include <queue>
-#include <stack>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "flow/Arena.h"
 #include "flow/Buggify.h"
-#include "flow/CodeProbe.h"
 #include "flow/Deque.h"
 #include "flow/Error.h"
 #include "flow/FastAlloc.h"
+#include "flow/FastRef.h"
 #include "flow/FileIdentifier.h"
 #include "flow/IRandom.h"
-#include "flow/Platform.h"
-#include "flow/ThreadPrimitives.h"
-#include "flow/WriteOnlySet.h"
 #include "flow/network.h"
 #include "flow/serialize.h"
+
 
 #ifdef WITH_SWIFT
 #include <swift/bridging>
@@ -70,8 +60,6 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wnullability-completeness"
 #endif /* WITH_SWIFT */
-
-#include "pthread.h"
 
 #include <boost/version.hpp>
 
@@ -673,7 +661,8 @@ public:
 	explicit LineageReference(ActorLineage* ptr) : Reference<ActorLineage>(ptr), actorName_(""), allocated_(false) {}
 	LineageReference(const LineageReference& r) : Reference<ActorLineage>(r), actorName_(""), allocated_(false) {}
 	LineageReference(LineageReference&& r)
-	  : Reference<ActorLineage>(std::forward<LineageReference>(r)), actorName_(r.actorName_), allocated_(r.allocated_) {
+	  : Reference<ActorLineage>(r.getPtr()), actorName_(r.actorName_), allocated_(r.allocated_) {
+		r.setPtrUnsafe(nullptr);
 		r.actorName_ = "";
 		r.allocated_ = false;
 	}

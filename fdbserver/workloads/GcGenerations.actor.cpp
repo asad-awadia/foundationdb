@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -76,12 +76,12 @@ struct GcGenerationsWorkload : TestWorkload {
 		cloggedPairs.clear();
 	}
 
-	ACTOR Future<Void> clogRemoteDc(GcGenerationsWorkload* self, Database cx) {
-		Optional<ClusterConnectionString> csOptional = wait(getConnectionString(cx));
-		state std::vector<NetworkAddress> coordinators;
+	Future<Void> clogRemoteDc(GcGenerationsWorkload* self, Database cx) {
+		Optional<ClusterConnectionString> csOptional = co_await getConnectionString(cx);
+		std::vector<NetworkAddress> coordinators;
 		if (csOptional.present()) {
 			ClusterConnectionString cs = csOptional.get();
-			wait(store(coordinators, cs.tryResolveHostnames()));
+			co_await store(coordinators, cs.tryResolveHostnames());
 		}
 
 		auto isCoordinator = [](const std::vector<NetworkAddress>& coordinators, const IPAddress& ip) {
@@ -119,28 +119,31 @@ struct GcGenerationsWorkload : TestWorkload {
 		TraceEvent("PartitionRemoteDc")
 		    .detail("RemoteDc", g_simulator->remoteDcId)
 		    .detail("CloggedRemoteProcess", describe(remoteIps));
-		return Void();
 	}
 
-	ACTOR Future<Void> dbAvailable(GcGenerationsWorkload* self) {
+	Future<Void> dbAvailable(GcGenerationsWorkload* self) {
 		while (self->dbInfo->get().recoveryState < RecoveryState::ACCEPTING_COMMITS) {
-			wait(self->dbInfo->onChange());
+			co_await self->dbInfo->onChange();
 		}
-		return Void();
 	}
 
-	ACTOR Future<Void> generateMultipleTxnGenerations(GcGenerationsWorkload* self, Database cx) {
-		wait(self->clogRemoteDc(self, cx));
-		state int i = 0;
-		// state int generationCount = self->dbInfo->get().logSystemConfig.oldTLogs.size();
-		state int generationCount = 0;
-		// ASSERT(generationCount == 0);
+	Future<Void> generateMultipleTxnGenerations(GcGenerationsWorkload* self, Database cx) {
+		co_await self->clogRemoteDc(self, cx);
+		int i = 0;
+		int generationCount = 0;
 		for (; i < 6; ++i) {
-			wait(delay(30));
+			// Sometimes Cycle Setup can take a long time, so we need to extend
+			// connection failures injection for clogRemoteDc() to work properly.
+			// We also want to make sure connection failures are still active when we
+			// are triggering recoveries within this actor, so the assertion below
+			// is true.
+			extendConnectionFailures("GcGenerations", FLOW_KNOBS->SIM_SPEEDUP_AFTER_SECONDS);
+
+			co_await delay(30);
 			TraceEvent("WaitingForDbAvailable")
 			    .detail("Index", i)
 			    .detail("RecoveryState", self->dbInfo->get().recoveryState);
-			wait(self->dbAvailable(self));
+			co_await self->dbAvailable(self);
 			generationCount = self->dbInfo->get().logSystemConfig.oldTLogs.size();
 			TraceEvent("WaitingForDbAvailableDone")
 			    .detail("Index", i)
@@ -151,7 +154,7 @@ struct GcGenerationsWorkload : TestWorkload {
 			// Wait for recovery
 			while (self->dbInfo->get().logSystemConfig.oldTLogs.size() == generationCount ||
 			       self->dbInfo->get().recoveryState < RecoveryState::RECOVERY_TRANSACTION) {
-				wait(self->dbInfo->onChange());
+				co_await self->dbInfo->onChange();
 			}
 			TraceEvent("CurrentGenerations")
 			    .detail("PrevCount", generationCount)
@@ -161,10 +164,9 @@ struct GcGenerationsWorkload : TestWorkload {
 		}
 		TraceEvent("AfterMultipleRecovery")
 		    .detail("OldGenerationCount", self->dbInfo->get().logSystemConfig.oldTLogs.size());
-		return Void();
 	}
 
-	ACTOR Future<Void> generationReduced(GcGenerationsWorkload* self) {
+	Future<Void> generationReduced(GcGenerationsWorkload* self) {
 		TraceEvent("WaitForGenerationReduction")
 		    .detail("GenerationCount", self->dbInfo->get().logSystemConfig.oldTLogs.size())
 		    .detail("RecoveryState", self->dbInfo->get().recoveryState);
@@ -173,46 +175,41 @@ struct GcGenerationsWorkload : TestWorkload {
 			TraceEvent("WaitForGenerationReduction")
 			    .detail("GenerationCount", self->dbInfo->get().logSystemConfig.oldTLogs.size())
 			    .detail("RecoveryState", self->dbInfo->get().recoveryState);
-			wait(self->dbInfo->onChange());
+			co_await self->dbInfo->onChange();
 		}
 		TraceEvent("WaitForGenerationReduction")
 		    .detail("GenerationCount", self->dbInfo->get().logSystemConfig.oldTLogs.size())
 		    .detail("RecoveryState", self->dbInfo->get().recoveryState);
-		return Void();
 	}
 
-	ACTOR Future<Void> gcGenerationsTestClient(GcGenerationsWorkload* self, Database cx) {
+	Future<Void> gcGenerationsTestClient(GcGenerationsWorkload* self, Database cx) {
 		g_simulator->disableTLogRecoveryFinish = true;
 
-		wait(delay(self->startDelay));
+		co_await delay(self->startDelay);
 
 		TraceEvent("WaitingForDbAvailable").detail("RecoveryState", self->dbInfo->get().recoveryState);
 		while (self->dbInfo->get().recoveryState < RecoveryState::ACCEPTING_COMMITS) {
-			wait(self->dbInfo->onChange());
+			co_await self->dbInfo->onChange();
 		}
 
 		double startTime = now();
 		double workloadEnd = now() + self->testDuration;
 		TraceEvent("GcGenerations").detail("StartTime", startTime).detail("EndTime", workloadEnd);
-		// Sometimes Cycle Setup can take a long time, so we need to enable connection failures
-		// injection for clogRemoteDc() to work properly.
-		extendConnectionFailures("GcGenerations", FLOW_KNOBS->SIM_SPEEDUP_AFTER_SECONDS);
 
-		wait(self->generateMultipleTxnGenerations(self, cx));
+		co_await self->generateMultipleTxnGenerations(self, cx);
 		self->unclogAll();
 		disableConnectionFailures("GcGenerations");
 
-		wait(self->generationReduced(self));
+		co_await self->generationReduced(self);
 
 		g_simulator->disableTLogRecoveryFinish = false;
 
 		TraceEvent("WaitingForDbFullyRecovered").detail("RecoveryState", self->dbInfo->get().recoveryState);
 		while (self->dbInfo->get().recoveryState != RecoveryState::FULLY_RECOVERED) {
-			wait(self->dbInfo->onChange());
+			co_await self->dbInfo->onChange();
 		}
 
 		TraceEvent("GcGenerationsWorkloadFinish").log();
-		return Void();
 	}
 };
 

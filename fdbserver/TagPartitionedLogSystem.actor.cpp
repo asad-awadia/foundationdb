@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,10 +19,12 @@
  */
 
 #include "fdbserver/TagPartitionedLogSystem.actor.h"
-#include <boost/dynamic_bitset.hpp>
-#include "flow/UnitTest.h"
 
+#include <boost/dynamic_bitset.hpp>
 #include <utility>
+
+#include "fdbrpc/ReplicationUtils.h"
+#include "fdbserver/WaitFailure.h"
 
 #include "flow/actorcompiler.h" // This must be the last #include.
 
@@ -467,39 +469,43 @@ ACTOR Future<Void> TagPartitionedLogSystem::onError_internal(TagPartitionedLogSy
 	// Never returns normally, but throws an error if the subsystem stops working
 	loop {
 		std::vector<Future<Void>> failed;
+		std::vector<Future<Void>> routerFailed;
 		std::vector<Future<Void>> backupFailed(1, Never());
 		std::vector<Future<Void>> changes;
 
 		for (auto& it : self->tLogs) {
 			for (auto& t : it->logServers) {
 				if (t->get().present()) {
-					failed.push_back(
-					    waitFailureClient(t->get().interf().waitFailure,
-					                      SERVER_KNOBS->TLOG_TIMEOUT,
-					                      -SERVER_KNOBS->TLOG_TIMEOUT / SERVER_KNOBS->SECONDS_BEFORE_NO_FAILURE_DELAY,
-					                      /*trace=*/true));
+					failed.push_back(waitFailureClient(t->get().interf().waitFailure,
+					                                   /* failureReactionTime */ SERVER_KNOBS->TLOG_TIMEOUT,
+					                                   /* failureReactionSlope */ -SERVER_KNOBS->TLOG_TIMEOUT /
+					                                       SERVER_KNOBS->SECONDS_BEFORE_NO_FAILURE_DELAY,
+					                                   /* trace */ true,
+					                                   /* traceMsg */ "TLogFailed"_sr));
 				} else {
 					changes.push_back(t->onChange());
 				}
 			}
 			for (auto& t : it->logRouters) {
 				if (t->get().present()) {
-					failed.push_back(
-					    waitFailureClient(t->get().interf().waitFailure,
-					                      SERVER_KNOBS->TLOG_TIMEOUT,
-					                      -SERVER_KNOBS->TLOG_TIMEOUT / SERVER_KNOBS->SECONDS_BEFORE_NO_FAILURE_DELAY,
-					                      /*trace=*/true));
+					routerFailed.push_back(waitFailureClient(t->get().interf().waitFailure,
+					                                         /* failureReactionTime */ SERVER_KNOBS->TLOG_TIMEOUT,
+					                                         /* failureReactionSlope */ -SERVER_KNOBS->TLOG_TIMEOUT /
+					                                             SERVER_KNOBS->SECONDS_BEFORE_NO_FAILURE_DELAY,
+					                                         /* trace */ true,
+					                                         /* traceMsg */ "LogRouterFailed"_sr));
 				} else {
 					changes.push_back(t->onChange());
 				}
 			}
 			for (const auto& worker : it->backupWorkers) {
 				if (worker->get().present()) {
-					backupFailed.push_back(
-					    waitFailureClient(worker->get().interf().waitFailure,
-					                      SERVER_KNOBS->BACKUP_TIMEOUT,
-					                      -SERVER_KNOBS->BACKUP_TIMEOUT / SERVER_KNOBS->SECONDS_BEFORE_NO_FAILURE_DELAY,
-					                      /*trace=*/true));
+					backupFailed.push_back(waitFailureClient(worker->get().interf().waitFailure,
+					                                         /* failureReactionTime */ SERVER_KNOBS->BACKUP_TIMEOUT,
+					                                         /* failureReactionSlope */ -SERVER_KNOBS->BACKUP_TIMEOUT /
+					                                             SERVER_KNOBS->SECONDS_BEFORE_NO_FAILURE_DELAY,
+					                                         /* trace */ true,
+					                                         /* traceMsg */ "BackupWorkerFailed"_sr));
 				} else {
 					changes.push_back(worker->onChange());
 				}
@@ -507,15 +513,18 @@ ACTOR Future<Void> TagPartitionedLogSystem::onError_internal(TagPartitionedLogSy
 		}
 
 		if (!self->recoveryCompleteWrittenToCoreState.get()) {
+			failed.insert(failed.end(), routerFailed.begin(), routerFailed.end());
+			routerFailed.clear();
 			for (auto& old : self->oldLogData) {
 				for (auto& it : old.tLogs) {
 					for (auto& t : it->logRouters) {
 						if (t->get().present()) {
 							failed.push_back(waitFailureClient(t->get().interf().waitFailure,
-							                                   SERVER_KNOBS->TLOG_TIMEOUT,
-							                                   -SERVER_KNOBS->TLOG_TIMEOUT /
+							                                   /* failureReactionTime */ SERVER_KNOBS->TLOG_TIMEOUT,
+							                                   /* failureReactionSlope */ -SERVER_KNOBS->TLOG_TIMEOUT /
 							                                       SERVER_KNOBS->SECONDS_BEFORE_NO_FAILURE_DELAY,
-							                                   /*trace=*/true));
+							                                   /* trace */ true,
+							                                   /* traceMsg */ "OldLogRouterFailed"_sr));
 						} else {
 							changes.push_back(t->onChange());
 						}
@@ -524,16 +533,26 @@ ACTOR Future<Void> TagPartitionedLogSystem::onError_internal(TagPartitionedLogSy
 				// Monitor changes of backup workers for old epochs.
 				for (const auto& worker : old.tLogs[0]->backupWorkers) {
 					if (worker->get().present()) {
-						backupFailed.push_back(waitFailureClient(worker->get().interf().waitFailure,
-						                                         SERVER_KNOBS->BACKUP_TIMEOUT,
-						                                         -SERVER_KNOBS->BACKUP_TIMEOUT /
-						                                             SERVER_KNOBS->SECONDS_BEFORE_NO_FAILURE_DELAY,
-						                                         /*trace=*/true));
+						backupFailed.push_back(
+						    waitFailureClient(worker->get().interf().waitFailure,
+						                      /* failureReactionTime */ SERVER_KNOBS->BACKUP_TIMEOUT,
+						                      /* failureReactionSlope */ -SERVER_KNOBS->BACKUP_TIMEOUT /
+						                          SERVER_KNOBS->SECONDS_BEFORE_NO_FAILURE_DELAY,
+						                      /* trace */ true,
+						                      /* traceMsg */ "OldBackupWorkerFailed"_sr));
 					} else {
 						changes.push_back(worker->onChange());
 					}
 				}
 			}
+		}
+
+		if (SERVER_KNOBS->CC_RERECRUIT_LOG_ROUTER_ENABLED) {
+			// Don't monitor current generation log routers after full recovery.
+			// They are monitored and recruited by monitorAndRecruitLogRouters().
+			routerFailed.clear();
+		} else {
+			failed.insert(failed.end(), routerFailed.begin(), routerFailed.end());
 		}
 
 		if (self->hasRemoteServers && (!self->remoteRecovery.isReady() || self->remoteRecovery.isError())) {
@@ -544,8 +563,9 @@ ACTOR Future<Void> TagPartitionedLogSystem::onError_internal(TagPartitionedLogSy
 		changes.push_back(self->backupWorkerChanged.onTrigger());
 
 		ASSERT(failed.size() >= 1);
-		wait(quorum(changes, 1) || tagError<Void>(quorum(failed, 1), tlog_failed()) ||
-		     tagError<Void>(quorum(backupFailed, 1), backup_worker_failed()));
+		wait(quorum(changes, 1) ||
+		     tagError<Void>(traceAfter(quorum(failed, 1), "TPLSOnErrorLogSystemFailed"), tlog_failed()) ||
+		     tagError<Void>(traceAfter(quorum(backupFailed, 1), "TPLSOnErrorBackupFailed"), backup_worker_failed()));
 	}
 }
 
@@ -602,6 +622,9 @@ Future<Version> TagPartitionedLogSystem::push(const ILogSystem::PushVersionSet& 
 		const auto& tpcvMapRef = tpcvMap.get();
 		for (const auto& it : tLogs) {
 			if (!it->isLocal) {
+				continue;
+			}
+			if (it->logServers.size() == 0) {
 				continue;
 			}
 			for (size_t loc = 0; loc < it->logServers.size(); loc++) {
@@ -728,7 +751,7 @@ Reference<ILogSystem::IPeekCursor> TagPartitionedLogSystem::peekAll(UID dbgid,
 		}
 		if (log->isLocal && log->logServers.size() &&
 		    (log->locality == tagLocalitySpecial || log->locality == tag.locality || tag.locality == tagLocalityTxs ||
-		     tag.locality == tagLocalityLogRouter || (tag == cacheTag && log->locality != tagLocalitySatellite))) {
+		     tag.locality == tagLocalityLogRouter)) {
 			lastBegin = std::max(lastBegin, log->startVersion);
 			localSets.push_back(log);
 			if (log->locality != tagLocalitySatellite) {
@@ -780,7 +803,7 @@ Reference<ILogSystem::IPeekCursor> TagPartitionedLogSystem::peekAll(UID dbgid,
 		}
 		for (int i = 0; begin < lastBegin; i++) {
 			if (i == oldLogData.size()) {
-				if (tag.locality == tagLocalityTxs || tag == cacheTag) {
+				if (tag.locality == tagLocalityTxs) {
 					break;
 				}
 				TraceEvent("TLogPeekAllDead", dbgid)
@@ -803,8 +826,7 @@ Reference<ILogSystem::IPeekCursor> TagPartitionedLogSystem::peekAll(UID dbgid,
 				}
 				if (log->isLocal && log->logServers.size() &&
 				    (log->locality == tagLocalitySpecial || log->locality == tag.locality ||
-				     tag.locality == tagLocalityTxs || tag.locality == tagLocalityLogRouter ||
-				     (tag == cacheTag && log->locality != tagLocalitySatellite))) {
+				     tag.locality == tagLocalityTxs || tag.locality == tagLocalityLogRouter)) {
 					thisBegin = std::max(thisBegin, log->startVersion);
 					localOldSets.push_back(log);
 					if (log->locality != tagLocalitySatellite) {
@@ -1708,6 +1730,21 @@ ACTOR Future<Version> TagPartitionedLogSystem::getPoppedTxs(TagPartitionedLogSys
 
 Future<Version> TagPartitionedLogSystem::getTxsPoppedVersion() {
 	return getPoppedTxs(this);
+}
+
+void TagPartitionedLogSystem::updateLogRouter(int logSetIndex, int tagId, TLogInterface const& newLogRouter) {
+	ASSERT(tagId >= 0 && tagId < tLogs[logSetIndex]->logRouters.size());
+	auto& logSet = tLogs[logSetIndex];
+
+	logSet->logRouters[tagId]->set(OptionalInterface<TLogInterface>(newLogRouter));
+	logSystemConfigChanged.trigger();
+
+	TraceEvent("LogRouterUpdated", dbgid)
+	    .detail("LogSetIndex", logSetIndex)
+	    .detail("TagId", tagId)
+	    .detail("NewRouterID", newLogRouter.id())
+	    .detail("IsLocal", logSet->isLocal)
+	    .detail("Locality", logSet->locality);
 }
 
 ACTOR Future<Void> TagPartitionedLogSystem::confirmEpochLive_internal(Reference<LogSet> logSet, Optional<UID> debugID) {
@@ -2794,6 +2831,7 @@ ACTOR Future<Void> TagPartitionedLogSystem::recruitOldLogRouters(TagPartitionedL
 				    .detail("LogRouterTags", self->logRouterTags);
 				for (int i = 0; i < self->logRouterTags; i++) {
 					InitializeLogRouterRequest req;
+					req.reqId = deterministicRandom()->randomUniqueID();
 					req.recoveryCount = recoveryCount;
 					req.routerTag = Tag(tagLocalityLogRouter, i);
 					req.startVersion = lastStart;
@@ -2802,7 +2840,8 @@ ACTOR Future<Void> TagPartitionedLogSystem::recruitOldLogRouters(TagPartitionedL
 					req.locality = locality;
 					req.recoverAt = self->recoverAt.get();
 					req.knownLockedTLogIds = self->knownLockedTLogIds;
-					req.allowDropInSim = !forRemote;
+					req.allowDropInSim = SERVER_KNOBS->CC_RECOVERY_INIT_REQ_ALLOW_DROP_IN_SIM && !forRemote;
+					req.isReplacement = false;
 					auto reply = transformErrors(
 					    throwErrorOr(workers[nextRouter].logRouter.getReplyUnlessFailedFor(
 					        req, SERVER_KNOBS->TLOG_TIMEOUT, SERVER_KNOBS->MASTER_FAILURE_SLOPE_DURING_RECOVERY)),
@@ -2849,6 +2888,7 @@ ACTOR Future<Void> TagPartitionedLogSystem::recruitOldLogRouters(TagPartitionedL
 				    .detail("LogRouterTags", old.logRouterTags);
 				for (int i = 0; i < old.logRouterTags; i++) {
 					InitializeLogRouterRequest req;
+					req.reqId = deterministicRandom()->randomUniqueID();
 					req.recoveryCount = recoveryCount;
 					req.routerTag = Tag(tagLocalityLogRouter, i);
 					req.startVersion = lastStart;
@@ -2856,7 +2896,8 @@ ACTOR Future<Void> TagPartitionedLogSystem::recruitOldLogRouters(TagPartitionedL
 					req.tLogPolicy = tLogPolicy;
 					req.locality = locality;
 					req.recoverAt = old.recoverAt;
-					req.allowDropInSim = !forRemote;
+					req.allowDropInSim = SERVER_KNOBS->CC_RECOVERY_INIT_REQ_ALLOW_DROP_IN_SIM && !forRemote;
+					req.isReplacement = false;
 					auto reply = transformErrors(
 					    throwErrorOr(workers[nextRouter].logRouter.getReplyUnlessFailedFor(
 					        req, SERVER_KNOBS->TLOG_TIMEOUT, SERVER_KNOBS->MASTER_FAILURE_SLOPE_DURING_RECOVERY)),
@@ -3016,6 +3057,7 @@ ACTOR Future<Void> TagPartitionedLogSystem::newRemoteEpoch(TagPartitionedLogSyst
 	TraceEvent("LogRouterInitReqSent3").detail("Locality", remoteLocality).detail("LogRouterTags", self->logRouterTags);
 	for (int i = 0; i < self->logRouterTags; i++) {
 		InitializeLogRouterRequest req;
+		req.reqId = deterministicRandom()->randomUniqueID();
 		req.recoveryCount = recoveryCount;
 		req.routerTag = Tag(tagLocalityLogRouter, i);
 		req.startVersion = startVersion;
@@ -3023,6 +3065,7 @@ ACTOR Future<Void> TagPartitionedLogSystem::newRemoteEpoch(TagPartitionedLogSyst
 		req.tLogPolicy = logSet->tLogPolicy;
 		req.locality = remoteLocality;
 		req.allowDropInSim = false;
+		req.isReplacement = false;
 		TraceEvent("RemoteTLogRouterReplies", self->dbgid)
 		    .detail("WorkerID", remoteWorkers.logRouters[i % remoteWorkers.logRouters.size()].id());
 		logRouterInitializationReplies.push_back(transformErrors(

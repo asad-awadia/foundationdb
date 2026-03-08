@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -85,9 +85,6 @@ struct TestSpec {
 	// Disable the ability to bypass the MVC API, for
 	// cases when there are no external clients
 	bool disableClientBypass = false;
-	// Number of tenants (a random number in the [min,max] range)
-	int minTenants = 0;
-	int maxTenants = 0;
 
 	// Overridden knob values
 	using KnobKeyValues = std::vector<std::pair<std::string, std::string>>;

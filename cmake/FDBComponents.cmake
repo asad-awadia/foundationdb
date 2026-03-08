@@ -17,7 +17,9 @@ endif()
 ################################################################################
 
 if(USE_VALGRIND)
-  find_package(Valgrind REQUIRED)
+  find_package(valgrind REQUIRED)
+  add_library(valgrind INTERFACE)
+  target_include_directories(valgrind INTERFACE "${valgrind_INCLUDE_DIRS}")
 endif()
 
 ################################################################################
@@ -156,23 +158,73 @@ option(BUILD_SWIFT_BINDING "build swift binding" ON)
 if(BUILD_SWIFT_BINDING AND NOT WITH_C_BINDING)
   message(WARNING "Swift binding depends on C binding, but C binding is not enabled")
 endif()
-if(NOT BUILD_SWIFT_BINDING OR NOT BUILD_C_BINDING)
+
+if(NOT BUILD_SWIFT_BINDING OR NOT BUILD_C_BINDING OR OPEN_FOR_IDE)
   set(WITH_SWIFT_BINDING OFF)
 else()
-  if(NOT EXISTS "${CMAKE_SOURCE_DIR}/bindings/swift")
-    message(WARNING "Swift bindings directory not found at ${CMAKE_SOURCE_DIR}/bindings/swift, disabling Swift binding")
-    set(WITH_SWIFT_BINDING OFF)
-  else()
-    find_program(SWIFT_EXECUTABLE swift)
-    if(SWIFT_EXECUTABLE AND CMAKE_Swift_COMPILER)
-      set(WITH_SWIFT_BINDING ON)
+  find_program(SWIFT_EXECUTABLE swift)
+  if(SWIFT_EXECUTABLE AND CMAKE_Swift_COMPILER)
+    # Check Swift version - require 6.1 or higher
+    execute_process(
+      COMMAND ${SWIFT_EXECUTABLE} --version
+      OUTPUT_VARIABLE SWIFT_VERSION_OUTPUT
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    string(REGEX MATCH "Swift version ([0-9]+)\\.([0-9]+)" SWIFT_VERSION_MATCH "${SWIFT_VERSION_OUTPUT}")
+    if(SWIFT_VERSION_MATCH)
+      set(SWIFT_VERSION_MAJOR ${CMAKE_MATCH_1})
+      set(SWIFT_VERSION_MINOR ${CMAKE_MATCH_2})
+      set(SWIFT_VERSION "${SWIFT_VERSION_MAJOR}.${SWIFT_VERSION_MINOR}")
+      message(STATUS "Found Swift version ${SWIFT_VERSION}")
+
+      if(SWIFT_VERSION_MAJOR LESS 6 OR (SWIFT_VERSION_MAJOR EQUAL 6 AND SWIFT_VERSION_MINOR LESS 1))
+        message(STATUS "Swift bindings require Swift 6.1 or higher (found ${SWIFT_VERSION})")
+        set(WITH_SWIFT_BINDING OFF)
+      else()
+        set(WITH_SWIFT_BINDING ON)
+      endif()
     else()
+      message(STATUS "Could not determine Swift version")
       set(WITH_SWIFT_BINDING OFF)
     endif()
-    if (USE_SANITIZER)
-      set(WITH_SWIFT_BINDING OFF)
-    endif()
+  else()
+    set(WITH_SWIFT_BINDING OFF)
   endif()
+  if (USE_SANITIZER)
+    set(WITH_SWIFT_BINDING OFF)
+  endif()
+
+  # Swift bindings require Clang compiler
+  if(WITH_SWIFT_BINDING AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(STATUS "Swift bindings are not supported in non-Clang environment (current compiler: ${CMAKE_CXX_COMPILER_ID})")
+    set(WITH_SWIFT_BINDING OFF)
+  endif()
+
+  # Swift bindings on Linux require libc++ (Swift uses libc++ standard library)
+  if(WITH_SWIFT_BINDING AND NOT APPLE AND NOT USE_LIBCXX)
+    message(STATUS "Swift bindings on Linux require USE_LIBCXX=ON (Swift requires libc++ standard library)")
+    set(WITH_SWIFT_BINDING OFF)
+  endif()
+
+  if(NOT EXISTS "${CMAKE_SOURCE_DIR}/bindings/swift" AND WITH_SWIFT_BINDING)
+    message(STATUS "Swift bindings directory not found at ${CMAKE_SOURCE_DIR}/bindings/swift")
+    message(STATUS "Downloading Swift bindings from GitHub...")
+
+    # TODO: Make it download a release version if we are on release branch?
+    include(FetchContent)
+    FetchContent_Declare(
+      swift_bindings
+      GIT_REPOSITORY https://github.com/FoundationDB/fdb-swift-bindings.git
+      GIT_TAG        main
+      SOURCE_DIR     ${CMAKE_SOURCE_DIR}/bindings/swift
+      # Prevent automatic add_subdirectory by pointing to non-existent CMakeLists.txt location
+      SOURCE_SUBDIR  ".__none__"
+    )
+    # This will download but won't add to build due to SOURCE_SUBDIR trick
+    FetchContent_MakeAvailable(swift_bindings)
+    message(STATUS "Swift bindings downloaded successfully to ${CMAKE_SOURCE_DIR}/bindings/swift")
+  endif()
+
 endif()
 
 ################################################################################
@@ -204,6 +256,7 @@ set(WITH_ROCKSDB ON CACHE BOOL "Build with experimental RocksDB support")
 set(PORTABLE_ROCKSDB 1 CACHE STRING "Minimum CPU arch to support (i.e. skylake, haswell, etc., or 0 = current CPU, 1 = baseline CPU)")
 set(ROCKSDB_TOOLS OFF CACHE BOOL "Compile RocksDB tools")
 set(WITH_LIBURING OFF CACHE BOOL "Build with liburing enabled") # Set this to ON to include liburing
+# RocksDB version/commit configuration is in cmake/RocksDBVersion.cmake
 
 ################################################################################
 # TOML11
@@ -211,10 +264,11 @@ set(WITH_LIBURING OFF CACHE BOOL "Build with liburing enabled") # Set this to ON
 
 # TOML can download and install itself into the binary directory, so it should
 # always be available.
-find_package(toml11 QUIET)
+find_package(toml11 3.4.0)
 if(toml11_FOUND)
+  message(STATUS "Using TOML11 from system")
   add_library(toml11_target INTERFACE)
-  target_link_libraries(toml11_target INTERFACE toml11::toml11)
+  target_link_libraries(toml11_target INTERFACE toml11)
 else()
   include(ExternalProject)
   ExternalProject_add(toml11Project

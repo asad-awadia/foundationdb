@@ -6,10 +6,10 @@ import subprocess
 import sys
 import os
 
-from binary_download import FdbBinaryDownloader
-from local_cluster import LocalCluster
-from test_util import random_alphanum_string
-from fdb_version import CURRENT_VERSION, PREV_RELEASE_VERSION
+from fdb_test_runner.binary_download import FdbBinaryDownloader
+from fdb_test_runner.local_cluster import LocalCluster
+from fdb_test_runner.test_util import random_alphanum_string
+from fdb_test_runner.fdb_version import CURRENT_VERSION, PREV_RELEASE_VERSION
 
 TESTER_STATS_INTERVAL_SEC = 5
 DEFAULT_TEST_FILE = "CApiCorrectnessMultiThr.toml"
@@ -290,14 +290,18 @@ class FdbCShimTests:
                     expected_ret_code=1,
                 )
 
-                # Test calling a function that does not exist in the loaded library
-                self.run_c_shim_lib_tester(
-                    "7.0.0",
-                    test_env,
-                    call_set_path=True,
-                    api_version=700,
-                    expected_ret_code=IMPLIBSO_ERROR_CODE,
-                )
+                # In the future, if we add library methods that are not in old libraries, then
+                # put in a call here to a) specify an old library version, b) invoke the
+                # old method, and c) expect failure.
+                # This is commented out because currently we do not have such a method.
+                # There used to be one (openTenant) but we removed it.
+                # self.run_c_shim_lib_tester(
+                #   "7.0.0",
+                #   test_env,
+                #   call_set_path=True,
+                #   api_version=700,
+                #   expected_ret_code=IMPLIBSO_ERROR_CODE,
+                # )
 
 
 if __name__ == "__main__":

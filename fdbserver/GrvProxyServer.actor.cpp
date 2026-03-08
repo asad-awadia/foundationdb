@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,6 +34,7 @@
 #include "fdbserver/WaitFailure.h"
 #include "fdbserver/WorkerInterface.actor.h"
 #include "fdbrpc/sim_validation.h"
+#include "flow/Buggify.h"
 #include "flow/IRandom.h"
 #include "flow/Trace.h"
 #include "flow/flow.h"
@@ -361,7 +362,7 @@ ACTOR Future<Void> globalConfigRequestServer(GrvProxyData* grvProxyData, GrvProx
 	state Version cachedVersion = 0;
 	state RangeResult cachedData;
 
-	// Attempt to refresh the configuration database while the migration is
+	// Attempt to refresh the global configuration while the migration is
 	// ongoing. This is a small optimization to avoid waiting for the migration
 	// actor to complete.
 	refreshFuture = timeout(globalConfigRefresh(grvProxyData, &cachedVersion, &cachedData),
@@ -530,8 +531,8 @@ ACTOR Future<Void> queueGetReadVersionRequests(Reference<AsyncVar<ServerDBInfo> 
 			bool canBeQueued = true;
 			if (stats->txnRequestIn.getValue() - stats->txnRequestOut.getValue() >
 			        SERVER_KNOBS->START_TRANSACTION_MAX_QUEUE_SIZE ||
-			    (g_network->isSimulated() && !g_simulator->speedUpSimulation &&
-			     deterministicRandom()->random01() < 0.01)) {
+			    // Occasionally inject queue pressure in simulation to test queue overflow handling
+			    (g_network->isSimulated() && !g_simulator->speedUpSimulation && BUGGIFY_WITH_PROB(0.01))) {
 				// When the limit is hit, try to drop requests from the lower priority queues.
 				if (req.priority == TransactionPriority::BATCH) {
 					canBeQueued = false;

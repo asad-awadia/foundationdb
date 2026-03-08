@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,9 +27,12 @@
 #define RPCGENERICACTORS_ACTOR_H
 
 #include "flow/genericactors.actor.h"
+#include "flow/CodeProbe.h"
+#include "flow/Hostname.h"
+
 #include "fdbrpc/fdbrpc.h"
 #include "fdbrpc/WellKnownEndpoints.h"
-#include "flow/Hostname.h"
+
 #include "flow/actorcompiler.h" // This must be the last #include.
 
 // To avoid directly access INetworkConnection::net()->removeCachedDNS(), which will require heavy include budget, put

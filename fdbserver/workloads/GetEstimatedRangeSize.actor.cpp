@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@
 
 #include <cstring>
 
-#include "fdbrpc/TenantName.h"
 #include "fdbrpc/simulator.h"
 #include "fdbclient/FDBTypes.h"
 #include "fdbclient/SystemData.h"
@@ -36,17 +35,12 @@ struct GetEstimatedRangeSizeWorkload : TestWorkload {
 	int nodeCount;
 	double testDuration;
 	Key keyPrefix;
-	bool hasTenant;
-	Optional<TenantName> tenantName;
-	Optional<Reference<Tenant>> tenant;
 	bool checkOnly;
 
 	GetEstimatedRangeSizeWorkload(WorkloadContext const& wcx) : TestWorkload(wcx) {
 		testDuration = getOption(options, "testDuration"_sr, 10.0);
 		nodeCount = getOption(options, "nodeCount"_sr, 10000);
 		keyPrefix = unprintable(getOption(options, "keyPrefix"_sr, ""_sr).toString());
-		hasTenant = hasOption(options, "tenant"_sr);
-		tenantName = hasTenant ? getOption(options, "tenant"_sr, "DefaultNeverUsed"_sr) : Optional<TenantName>();
 		checkOnly = getOption(options, "checkOnly"_sr, false);
 	}
 
@@ -54,24 +48,19 @@ struct GetEstimatedRangeSizeWorkload : TestWorkload {
 		if (checkOnly) {
 			return Void();
 		}
-		// The following call to bulkSetup() assumes that we have a valid tenant.
-		ASSERT(hasTenant);
-		tenant = makeReference<Tenant>(cx, tenantName.get());
-		// Use default values for arguments between (and including) postSetupWarming and endNodeIdx params.
 		return bulkSetup(cx,
 		                 this,
 		                 nodeCount,
 		                 Promise<double>(),
-		                 true,
-		                 0.0,
-		                 1e12,
-		                 std::vector<uint64_t>(),
-		                 Promise<std::vector<std::pair<uint64_t, double>>>(),
-		                 0,
-		                 0.1,
-		                 0,
-		                 0,
-		                 { tenant.get() });
+		                 /*valuesInconsequential=*/true,
+		                 /*postSetupWarming=*/0.0,
+		                 /*maxKeyInsertRate=*/1e12,
+		                 /*insertionCountsToMeasure=*/std::vector<uint64_t>(),
+		                 /*ratesAtKeyCounts=*/Promise<std::vector<std::pair<uint64_t, double>>>(),
+		                 /*keySaveIncrement=*/0,
+		                 /*keyCheckInterval=*/0.1,
+		                 /*startNodeIndex=*/0,
+		                 /*endNodeIdx=*/0);
 	}
 
 	Future<Void> start(Database const& cx) override {
@@ -91,10 +80,9 @@ struct GetEstimatedRangeSizeWorkload : TestWorkload {
 	int fromValue(const ValueRef& v) { return testKeyToDouble(v, keyPrefix); }
 	Standalone<KeyValueRef> operator()(int n) { return KeyValueRef(key(n), value((n + 1) % nodeCount)); }
 
-	ACTOR static Future<Void> checkSize(GetEstimatedRangeSizeWorkload* self, Database cx) {
-		state int64_t size = wait(getSize(self, cx));
+	static Future<Void> checkSize(GetEstimatedRangeSizeWorkload* self, Database cx) {
+		int64_t size = co_await getSize(self, cx);
 		ASSERT(sizeIsAsExpected(self, size));
-		return Void();
 	}
 
 	static bool sizeIsAsExpected(GetEstimatedRangeSizeWorkload* self, int64_t size) {
@@ -104,24 +92,27 @@ struct GetEstimatedRangeSizeWorkload : TestWorkload {
 		return size > self->nodeCount * nodeSize / 2 && size < self->nodeCount * nodeSize * 5;
 	}
 
-	ACTOR static Future<int64_t> getSize(GetEstimatedRangeSizeWorkload* self, Database cx) {
-		state ReadYourWritesTransaction tr(cx, self->tenant);
-		state double totalDelay = 0.0;
-		TraceEvent(SevDebug, "GetSizeStart").detail("Tenant", self->tenant);
+	static Future<int64_t> getSize(GetEstimatedRangeSizeWorkload* self, Database cx) {
+		ReadYourWritesTransaction tr(cx);
+		double totalDelay = 0.0;
 
 		loop {
+			Error err;
 			try {
-				state int64_t size = wait(tr.getEstimatedRangeSizeBytes(normalKeys));
-				TraceEvent(SevDebug, "GetSizeResult").detail("Tenant", self->tenant).detail("Size", size);
+				int64_t size = co_await tr.getEstimatedRangeSizeBytes(normalKeys);
+				TraceEvent(SevDebug, "GetSizeResult").detail("Size", size);
 				if (!sizeIsAsExpected(self, size) && totalDelay < 300.0) {
 					totalDelay += 5.0;
-					wait(delay(5.0));
+					co_await delay(5.0);
 				} else {
-					return size;
+					co_return size;
 				}
 			} catch (Error& e) {
-				TraceEvent(SevDebug, "GetSizeError").errorUnsuppressed(e).detail("Tenant", self->tenant);
-				wait(tr.onError(e));
+				err = e;
+			}
+			if (err.isValid()) {
+				TraceEvent(SevDebug, "GetSizeError").errorUnsuppressed(err);
+				co_await tr.onError(err);
 			}
 		}
 	}

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,7 +21,6 @@
 #include "fdbclient/ClusterConnectionMemoryRecord.h"
 #include "fdbclient/ManagementAPI.actor.h"
 #include "fdbclient/NativeAPI.actor.h"
-#include "fdbclient/TenantManagement.actor.h"
 #include "fdbserver/TesterInterface.actor.h"
 #include "fdbclient/ReadYourWrites.h"
 #include "flow/ActorCollection.h"
@@ -95,7 +94,7 @@ struct WriteDuringReadWorkload : TestWorkload {
 		useExtraDB = g_network->isSimulated() && !g_simulator->extraDatabases.empty();
 		if (useExtraDB) {
 			ASSERT(g_simulator->extraDatabases.size() == 1);
-			extraDB = Database::createSimulatedExtraDatabase(g_simulator->extraDatabases[0], wcx.defaultTenant);
+			extraDB = Database::createSimulatedExtraDatabase(g_simulator->extraDatabases[0]);
 			useSystemKeys = false;
 		}
 
@@ -117,17 +116,7 @@ struct WriteDuringReadWorkload : TestWorkload {
 			    .detail("MaxClearSize", maxClearSize);
 	}
 
-	ACTOR Future<Void> setupImpl(WriteDuringReadWorkload* self, Database cx) {
-		// If we are operating in the default tenant but enable raw access, we should only write keys
-		// in the tenant's key-space.
-		if (self->useSystemKeys && cx->defaultTenant.present() && self->keyPrefix < systemKeys.begin) {
-			TenantMapEntry entry = wait(TenantAPI::getTenant(cx.getReference(), cx->defaultTenant.get()));
-			self->keyPrefix = entry.prefix.withSuffix(self->keyPrefix).toString();
-		}
-		return Void();
-	}
-
-	Future<Void> setup(Database const& cx) override { return setupImpl(this, cx); }
+	Future<Void> setup(Database const& cx) override { return Void(); }
 
 	Future<Void> start(Database const& cx) override {
 		if (clientId == 0)

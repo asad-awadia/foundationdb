@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1645,10 +1645,6 @@ public:
 	Future<SpringCleaningWorkPerformed> doClean();
 	void startReadThreads();
 
-	Future<EncryptionAtRestMode> encryptionMode() override {
-		return EncryptionAtRestMode(EncryptionAtRestMode::DISABLED);
-	}
-
 private:
 	KeyValueStoreType type;
 	UID logID;
@@ -2367,11 +2363,11 @@ ACTOR Future<Void> KVFileDump(std::string filename) {
 	const char* startKey = getenv("FDB_DUMP_STARTKEY");
 	const char* endKey = getenv("FDB_DUMP_ENDKEY");
 	const char* debugS = getenv("FDB_DUMP_DEBUG");
-	if (startKey != NULL)
+	if (startKey != nullptr)
 		k = StringRef(unprintable(std::string(startKey)));
-	if (endKey != NULL)
+	if (endKey != nullptr)
 		endk = StringRef(unprintable(std::string(endKey)));
-	if (debugS != NULL)
+	if (debugS != nullptr)
 		debug = true;
 
 	fprintf(stderr,
@@ -2384,7 +2380,7 @@ ACTOR Future<Void> KVFileDump(std::string filename) {
 		RangeResult kv = wait(store->readRange(KeyRangeRef(k, endk), 1000));
 		for (auto& one : kv) {
 			int size = 0;
-			const uint8_t* data = NULL;
+			const uint8_t* data = nullptr;
 
 			size = one.key.size();
 			data = one.key.begin();

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -105,7 +105,18 @@ public:
 			waitThread(threads[i]->handle);
 			delete threads[i];
 		}
-		ReferenceCounted<ThreadPool>::delref();
+		// There are two primary cases for calling stop():
+		// 1. Explicit stopped by an external caller.
+		//    The caller still holds a reference, so refcount is at least 2.
+		//    We only need to release the refcount we added above, so that
+		//    use delref_no_destroy() here is safe.
+		// 2. Implicit stopped by the final destruction, the backtrace is
+		//    ~Reference<ThreadPool>() -> ThreadPool::delref() -> ThreadPool::stop().
+		//    In this case, the refcount is 0 before invoking stop() and it
+		//    becomes 1 at this point. We should not invoke delref() here
+		//    as the destruction is handled by ThreadPool::delref() to avoid
+		//    double free error.
+		ReferenceCounted<ThreadPool>::delref_no_destroy();
 		return Void();
 	}
 

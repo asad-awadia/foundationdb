@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -196,14 +196,13 @@ struct WorkloadProcess {
 	}
 
 	ACTOR template <class Ret, class Fun>
-	Future<Ret> runActor(WorkloadProcess* self, Optional<TenantName> defaultTenant, Fun f) {
+	Future<Ret> runActor(WorkloadProcess* self, Fun f) {
 		state Optional<Error> err;
 		state Ret res;
 		state Future<Ret> fut;
 		state ISimulator::ProcessInfo* parent = g_simulator->getCurrentProcess();
 		wait(self->databaseOpened);
 		wait(g_simulator->onProcess(self->childProcess(), TaskPriority::DefaultYield));
-		self->cx->defaultTenant = defaultTenant;
 		try {
 			fut = f(self->cx);
 			Ret r = wait(fut);
@@ -245,17 +244,17 @@ Future<Void> ClientWorkload::initialized() {
 }
 
 Future<Void> ClientWorkload::setup(Database const& cx) {
-	return impl->runActor<Void>(impl, cx->defaultTenant, [this](Database const& db) { return impl->child->setup(db); });
+	return impl->runActor<Void>(impl, [this](Database const& db) { return impl->child->setup(db); });
 }
 Future<Void> ClientWorkload::start(Database const& cx) {
-	return impl->runActor<Void>(impl, cx->defaultTenant, [this](Database const& db) { return impl->child->start(db); });
+	return impl->runActor<Void>(impl, [this](Database const& db) { return impl->child->start(db); });
 }
 Future<bool> ClientWorkload::check(Database const& cx) {
-	return impl->runActor<bool>(impl, cx->defaultTenant, [this](Database const& db) { return impl->child->check(db); });
+	return impl->runActor<bool>(impl, [this](Database const& db) { return impl->child->check(db); });
 }
 Future<std::vector<PerfMetric>> ClientWorkload::getMetrics() {
-	return impl->runActor<std::vector<PerfMetric>>(
-	    impl, Optional<TenantName>(), [this](Database const& db) { return impl->child->getMetrics(); });
+	return impl->runActor<std::vector<PerfMetric>>(impl,
+	                                               [this](Database const& db) { return impl->child->getMetrics(); });
 }
 void ClientWorkload::getMetrics(std::vector<PerfMetric>& m) {
 	ASSERT(false);

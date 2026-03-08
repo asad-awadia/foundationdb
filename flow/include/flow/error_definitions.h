@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -78,7 +78,6 @@ ERROR( dd_not_found, 1053, "Data distributor not found")
 ERROR( wrong_connection_file, 1054, "Connection file mismatch")
 ERROR( version_already_compacted, 1055, "The requested changes have been compacted away")
 ERROR( local_config_changed, 1056, "Local configuration file has changed. Restart and apply these changes" )
-ERROR( failed_to_reach_quorum, 1057, "Failed to reach quorum from configuration database nodes. Retry sending these requests" )
 ERROR( unsupported_format_version, 1058, "Format version not supported" )
 ERROR( unknown_change_feed, 1059, "Change feed not found" )
 ERROR( change_feed_not_registered, 1060, "Change feed not registered" )
@@ -142,7 +141,7 @@ ERROR( audit_storage_failed, 1221, "Validate storage consistency operation faile
 ERROR( audit_storage_exceeded_request_limit, 1222, "Exceeded the max number of allowed concurrent audit storage requests" )
 ERROR( proxy_tag_throttled, 1223, "Exceeded maximum proxy tag throttling duration" )
 ERROR( key_value_store_deadline_exceeded, 1224, "Exceeded maximum time allowed to read or write.")
-ERROR( storage_quota_exceeded, 1225, "Exceeded the maximum storage quota allocated to the tenant.")
+// 1225 has been removed
 ERROR( audit_storage_error, 1226, "Found data corruption" )
 ERROR( master_failed, 1227, "Cluster recovery terminating because master has failed")
 ERROR( test_failed, 1228, "Test failed" )
@@ -166,6 +165,7 @@ ERROR( bulkload_manifest_decode_error, 1246, "Bulkload manifest string is failed
 ERROR( range_lock_reject, 1247, "Range lock is rejected" )
 ERROR( range_unlock_reject, 1248, "Range unlock is rejected" )
 ERROR( bulkload_dataset_not_cover_required_range, 1249, "Bulkload dataset does not cover the required range" )
+ERROR( bulkload_invalid_configuration, 1250, "BulkLoad requires cluster configuration with both shard_encode_location_metadata=1 and enable_read_lock_on_range=1" )
 
 // 15xx Platform errors
 ERROR( platform_error, 1500, "Platform error" )
@@ -226,9 +226,6 @@ ERROR( transaction_read_only, 2023, "Attempted to commit a transaction specified
 ERROR( invalid_cache_eviction_policy, 2024, "Invalid cache eviction policy, only random and lru are supported" )
 ERROR( network_cannot_be_restarted, 2025, "Network can only be started once" )
 ERROR( blocked_from_network_thread, 2026, "Detected a deadlock in a callback called from the network thread" )
-ERROR( invalid_config_db_range_read, 2027, "Invalid configuration database range read" )
-ERROR( invalid_config_db_key, 2028, "Invalid configuration database key provided" )
-ERROR( invalid_config_path, 2029, "Invalid configuration path" )
 ERROR( mapper_bad_index, 2030, "The index in K[] or V[] is not a valid number or out of range" )
 ERROR( mapper_no_such_key, 2031, "A mapped key is not set in database" )
 ERROR( mapper_bad_range_decriptor, 2032, "\"{...}\" must be the last element of the mapper tuple" )
@@ -277,37 +274,7 @@ ERROR( no_external_client_provided, 2123, "No external client library provided."
 ERROR( all_external_clients_failed, 2124, "All external clients have failed." )
 ERROR( incompatible_client, 2125, "None of the available clients match the protocol version of the cluster." )
 
-ERROR( tenant_name_required, 2130, "Tenant name must be specified to access data in the cluster" )
-ERROR( tenant_not_found, 2131, "Tenant does not exist" )
-ERROR( tenant_already_exists, 2132, "A tenant with the given name already exists" )
-ERROR( tenant_not_empty, 2133, "Cannot delete a non-empty tenant" )
-ERROR( invalid_tenant_name, 2134, "Tenant name cannot begin with \\xff" )
-ERROR( tenant_prefix_allocator_conflict, 2135, "The database already has keys stored at the prefix allocated for the tenant" )
-ERROR( tenants_disabled, 2136, "Tenants have been disabled in the cluster" )
-ERROR( illegal_tenant_access, 2138, "Illegal tenant access" )
-ERROR( invalid_tenant_group_name, 2139, "Tenant group name cannot begin with \\xff" )
-ERROR( invalid_tenant_configuration, 2140, "Tenant configuration is invalid" )
-ERROR( cluster_no_capacity, 2141, "Cluster does not have capacity to perform the specified operation" )
-ERROR( tenant_removed, 2142, "The tenant was removed" )
-ERROR( invalid_tenant_state, 2143, "Operation cannot be applied to tenant in its current state" )
-ERROR( tenant_locked, 2144, "Tenant is locked" )
-
-ERROR( invalid_cluster_name, 2160, "Data cluster name cannot begin with \\xff" )
-ERROR( invalid_metacluster_operation, 2161, "Metacluster operation performed on non-metacluster" )
-ERROR( cluster_already_exists, 2162, "A data cluster with the given name already exists" )
-ERROR( cluster_not_found, 2163, "Data cluster does not exist" )
-ERROR( cluster_not_empty, 2164, "Cluster must be empty" )
-ERROR( cluster_already_registered, 2165, "Data cluster is already registered with a metacluster" )
-ERROR( metacluster_no_capacity, 2166, "Metacluster does not have capacity to create new tenants" )
-ERROR( management_cluster_invalid_access, 2167, "Standard transactions cannot be run against the management cluster" )
-ERROR( tenant_creation_permanently_failed, 2168, "The tenant creation did not complete in a timely manner and has permanently failed" )
-ERROR( cluster_removed, 2169, "The cluster is being removed from the metacluster" )
-ERROR( cluster_restoring, 2170, "The cluster is being restored to the metacluster" )
-ERROR( invalid_data_cluster, 2171, "The data cluster being restored has no record of its metacluster" )
-ERROR( metacluster_mismatch, 2172, "The cluster does not have the expected name or is associated with a different metacluster" )
-ERROR( conflicting_restore, 2173, "Another restore is running for the same data cluster" )
-ERROR( invalid_metacluster_configuration, 2174, "Metacluster configuration is invalid" )
-ERROR( unsupported_metacluster_version, 2175, "Client is not compatible with the metacluster" )
+// 2130 to 2175 have been removed
 
 // 2200 - errors from bindings and official APIs
 ERROR( api_version_unset, 2200, "API version is not set" )
@@ -374,6 +341,10 @@ ERROR( blob_restore_invalid_manifest_url, 2386, "Invalid manifest URL" )
 ERROR( blob_restore_corrupted_manifest, 2387, "Corrupted manifest" )
 ERROR( blob_restore_missing_manifest, 2388, "Missing manifest" )
 ERROR( blob_migrator_replaced, 2389, "Blob migrator is replaced")
+ERROR( restore_bulkload_dataset_incomplete, 2390, "BulkDump dataset incomplete. Use --rangefile flag")
+ERROR( restore_bulkload_failed, 2391, "BulkLoad operation failed")
+ERROR( backup_bulkdump_timeout, 2392, "BulkDump operation timed out")
+ERROR( backup_bulkdump_failed, 2393, "BulkDump operation failed")
 
 ERROR( key_not_found, 2400, "Expected key is missing")
 ERROR( json_malformed, 2401, "JSON string was malformed")

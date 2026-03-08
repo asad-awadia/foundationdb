@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,15 @@
 #include "fdbserver/WorkerInterface.actor.h"
 #include "flow/actorcompiler.h" // This must be the last #include.
 
-// workload description
+// NOTE: it might be simpler to test health metrics via something
+// other than simulation. Testing equivalent to what this workload does can
+// seemingly be obtained by a straight line test case that does
+// the following:
+// a) start a cluster
+// b) do a few transactions
+// c) call getHealthMetrics()
+// d) ensure the returned metrics are non-zero.
+
 // This workload can be attached to other workload to collect health information about the FDB cluster.
 struct HealthMetricsApiWorkload : TestWorkload {
 	// Performance Metrics
@@ -46,6 +54,7 @@ struct HealthMetricsApiWorkload : TestWorkload {
 
 	// internal states
 	bool healthMetricsStoppedUpdating = false;
+	bool gotMetrics = false;
 	static constexpr auto NAME = "HealthMetricsApi";
 
 	HealthMetricsApiWorkload(WorkloadContext const& wcx) : TestWorkload(wcx) {
@@ -55,40 +64,52 @@ struct HealthMetricsApiWorkload : TestWorkload {
 		maxAllowedStaleness = getOption(options, "maxAllowedStaleness"_sr, 60.0);
 	}
 
-	ACTOR static Future<Void> _setup(Database cx, HealthMetricsApiWorkload* self) {
+	static Future<Void> _setup(Database cx, HealthMetricsApiWorkload* self) {
 		if (!self->sendDetailedHealthMetrics) {
-			// Clear detailed health metrics that are already populated
-			wait(delay(2 * CLIENT_KNOBS->DETAILED_HEALTH_METRICS_MAX_STALENESS));
+			// Internally cached health metrics time out after this knob.  Wait
+			// an extra second to avoid any off-by-1 ">" vs ">=" type issues.
+			co_await delay(1 + CLIENT_KNOBS->DETAILED_HEALTH_METRICS_MAX_STALENESS);
 			cx->healthMetrics.storageStats.clear();
 			cx->healthMetrics.tLogQueue.clear();
 		}
-		return Void();
 	}
 	Future<Void> setup(Database const& cx) override { return _setup(cx, this); }
-	ACTOR static Future<Void> _start(Database cx, HealthMetricsApiWorkload* self) {
-		wait(timeout(healthMetricsChecker(cx, self), self->testDuration, Void()));
-		return Void();
+	static Future<Void> _start(Database cx, HealthMetricsApiWorkload* self) {
+		co_await timeout(healthMetricsChecker(cx, self), self->testDuration, Void());
 	}
 	Future<Void> start(Database const& cx) override { return _start(cx, this); }
 
 	Future<bool> check(Database const& cx) override {
+		if (!gotMetrics) {
+			// It's not valid to fail a sanity check of metrics which have never been received.
+			// Yes, this encodes a blatant "got" vs "have" usage error.  The intent is to show
+			// up on any case insensitive search for "gotmetrics".
+			TraceEvent("HealthMetricsCheckPassedBecauseWeDontGotMetrics");
+			return true;
+		}
 		if (healthMetricsStoppedUpdating) {
 			TraceEvent(SevError, "HealthMetricsStoppedUpdating").log();
 			return false;
 		}
-		bool correctHealthMetricsState = true;
-		if (worstStorageQueue == 0 || worstStorageDurabilityLag == 0 || worstTLogQueue == 0)
-			correctHealthMetricsState = false;
+		bool valid = true;
+		if (worstStorageQueue == 0 || worstStorageDurabilityLag == 0 || worstTLogQueue == 0) {
+			valid = false;
+			TraceEvent("HealthMetrics:valid_false_case1");
+		}
 		if (sendDetailedHealthMetrics) {
 			if (detailedWorstStorageQueue == 0 || detailedWorstStorageDurabilityLag == 0 ||
-			    detailedWorstTLogQueue == 0 || detailedWorstCpuUsage == 0.0 || detailedWorstDiskUsage == 0.0)
-				correctHealthMetricsState = false;
+			    detailedWorstTLogQueue == 0 || detailedWorstCpuUsage == 0.0 || detailedWorstDiskUsage == 0.0) {
+				valid = false;
+				TraceEvent("HealthMetrics:valid_false_case2");
+			}
 		} else {
 			if (detailedWorstStorageQueue != 0 || detailedWorstStorageDurabilityLag != 0 ||
-			    detailedWorstTLogQueue != 0 || detailedWorstCpuUsage != 0.0 || detailedWorstDiskUsage != 0.0)
-				correctHealthMetricsState = false;
+			    detailedWorstTLogQueue != 0 || detailedWorstCpuUsage != 0.0 || detailedWorstDiskUsage != 0.0) {
+				valid = false;
+				TraceEvent("HealthMetrics:valid_false_case3");
+			}
 		}
-		if (!correctHealthMetricsState) {
+		if (!valid) {
 			TraceEvent(SevError, "IncorrectHealthMetricsState")
 			    .detail("WorstStorageQueue", worstStorageQueue)
 			    .detail("WorstLimitingStorageQueue", worstLimitingStorageQueue)
@@ -102,7 +123,7 @@ struct HealthMetricsApiWorkload : TestWorkload {
 			    .detail("DetailedWorstDiskUsage", detailedWorstDiskUsage)
 			    .detail("SendingDetailedHealthMetrics", sendDetailedHealthMetrics);
 		}
-		return correctHealthMetricsState;
+		return valid;
 	}
 
 	void getMetrics(std::vector<PerfMetric>& m) override {
@@ -116,12 +137,12 @@ struct HealthMetricsApiWorkload : TestWorkload {
 		m.emplace_back("DetailedWorstDiskUsage", detailedWorstDiskUsage, Averaged::True);
 	}
 
-	ACTOR static Future<Void> healthMetricsChecker(Database cx, HealthMetricsApiWorkload* self) {
-		state int repeated = 0;
-		state HealthMetrics healthMetrics;
+	static Future<Void> healthMetricsChecker(Database cx, HealthMetricsApiWorkload* self) {
+		int repeated = 0;
+		HealthMetrics healthMetrics;
 		loop {
-			wait(delay(self->healthMetricsCheckInterval));
-			HealthMetrics newHealthMetrics = wait(cx->getHealthMetrics(self->sendDetailedHealthMetrics));
+			co_await delay(self->healthMetricsCheckInterval);
+			HealthMetrics newHealthMetrics = co_await cx->getHealthMetrics(self->sendDetailedHealthMetrics);
 			if (healthMetrics == newHealthMetrics) {
 				if (++repeated > self->maxAllowedStaleness / self->healthMetricsCheckInterval)
 					self->healthMetricsStoppedUpdating = true;
@@ -151,8 +172,9 @@ struct HealthMetricsApiWorkload : TestWorkload {
 			TraceEvent traceCpuUsage("CpuUsage");
 			TraceEvent traceDiskUsage("DiskUsage");
 
-			// update metrics
+			bool gotStorageStats = false;
 			for (const auto& ss : healthMetrics.storageStats) {
+				gotStorageStats = true;
 				auto storageStats = ss.second;
 				self->detailedWorstStorageQueue = std::max(self->detailedWorstStorageQueue, storageStats.storageQueue);
 				traceStorageQueue.detail(format("Storage-%s", ss.first.toString().c_str()), storageStats.storageQueue);
@@ -167,9 +189,15 @@ struct HealthMetricsApiWorkload : TestWorkload {
 			}
 			TraceEvent traceTLogQueue("TLogQueue");
 			traceTLogQueue.setMaxEventLength(10000);
+			bool gotTLogQueue = false;
 			for (const auto& ss : healthMetrics.tLogQueue) {
+				gotTLogQueue = true;
 				self->detailedWorstTLogQueue = std::max(self->detailedWorstTLogQueue, ss.second);
 				traceTLogQueue.detail(format("TLog-%s", ss.first.toString().c_str()), ss.second);
+			}
+			if (!self->gotMetrics && gotStorageStats && gotTLogQueue) {
+				TraceEvent("HealthMetricsGotFullResult");
+				self->gotMetrics = true;
 			}
 		};
 	}

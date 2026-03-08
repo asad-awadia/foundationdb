@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,14 +35,12 @@
 
 #include <boost/unordered_map.hpp>
 
-#include "fdbrpc/TokenSign.h"
 #include "fdbrpc/fdbrpc.h"
 #include "fdbrpc/FailureMonitor.h"
 #include "fdbrpc/HealthMonitor.h"
 #include "fdbrpc/JsonWebKeySet.h"
 #include "fdbrpc/genericactors.actor.h"
 #include "fdbrpc/IPAllowList.h"
-#include "fdbrpc/TokenCache.h"
 #include "fdbrpc/simulator.h"
 #include "flow/ActorCollection.h"
 #include "flow/Error.h"
@@ -601,7 +599,7 @@ struct ConnectPacket {
 		serializer(ar, connectPacketLength);
 		if (connectPacketLength > sizeof(ConnectPacket) - sizeof(connectPacketLength)) {
 			ASSERT(!g_network->isSimulated());
-			TraceEvent("SerializationFailed").backtrace();
+			TraceEvent("SerializationFailed").detail("Classname", typeid(Ar).name()).backtrace();
 			throw serialization_failed();
 		}
 
@@ -1159,8 +1157,8 @@ void Peer::onIncomingConnection(Reference<Peer> self, Reference<IConnection> con
 }
 
 TransportData::~TransportData() {
-	for (auto& p : peers) {
-		p.second->connect.cancel();
+	for (auto& [_peerAddress, peer] : peers) {
+		peer->connect.cancel();
 	}
 }
 
@@ -1820,8 +1818,8 @@ FlowTransport::FlowTransport(uint64_t transportId, int maxWellKnownEndpoints, IP
   : self(new TransportData(transportId, maxWellKnownEndpoints, allowList)) {
 	self->multiVersionCleanup = multiVersionCleanupWorker(self);
 	if (g_network->isSimulated()) {
-		for (auto const& p : g_simulator->authKeys) {
-			self->publicKeys.emplace(p.first, p.second.toPublic());
+		for (const auto& [keyName, key] : g_simulator->authKeys) {
+			self->publicKeys.emplace(keyName, key.toPublic());
 		}
 	}
 }
@@ -2176,7 +2174,6 @@ void FlowTransport::createInstance(bool isClient,
                                    uint64_t transportId,
                                    int maxWellKnownEndpoints,
                                    IPAllowList const* allowList) {
-	TokenCache::createInstance();
 	g_network->setGlobal(INetwork::enFlowTransport,
 	                     (flowGlobalType) new FlowTransport(transportId, maxWellKnownEndpoints, allowList));
 	g_network->setGlobal(INetwork::enNetworkAddressFunc, (flowGlobalType)&FlowTransport::getGlobalLocalAddress);

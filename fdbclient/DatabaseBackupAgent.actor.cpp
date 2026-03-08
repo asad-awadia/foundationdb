@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -243,8 +243,14 @@ struct BackupRangeTaskFunc : TaskFuncBase {
 		// retrieve kvData
 		state PromiseStream<RangeResultWithVersion> results;
 
-		state Future<Void> rc = readCommitted(
-		    taskBucket->src, results, lock, range, Terminator::True, AccessSystemKeys::True, LockAware::True);
+		state Future<Void> rc = readCommitted(taskBucket->src,
+		                                      results,
+		                                      lock,
+		                                      range,
+		                                      Terminator::True,
+		                                      AccessSystemKeys::True,
+		                                      LockAware::True,
+		                                      ReadLowPriority(CLIENT_KNOBS->BACKUP_READS_USE_LOW_PRIORITY));
 		state Key rangeBegin = range.begin;
 		state Key rangeEnd;
 		state bool endOfStream = false;
@@ -476,12 +482,12 @@ struct BackupRangeTaskFunc : TaskFuncBase {
 		state Key nextKey = task->params[BackupAgentBase::keyBeginKey];
 
 		std::vector<Future<Key>> addTaskVector;
-		for (int idx = 0; idx < keys.size(); ++idx) {
-			if (nextKey != keys[idx]) {
+		for (const auto& splitKey : keys) {
+			if (nextKey != splitKey) {
 				addTaskVector.push_back(
-				    addTask(tr, taskBucket, task, nextKey, keys[idx], TaskCompletionKey::joinWith(onDone)));
+				    addTask(tr, taskBucket, task, nextKey, splitKey, TaskCompletionKey::joinWith(onDone)));
 			}
-			nextKey = keys[idx];
+			nextKey = splitKey;
 		}
 
 		if (nextKey != task->params[BackupAgentBase::keyEndKey]) {
@@ -882,7 +888,7 @@ struct CopyLogRangeTaskFunc : TaskFuncBase {
 		state std::vector<Future<Void>> rc;
 		state std::vector<Reference<FlowLock>> locks;
 		state Version nextVersion = beginVersion;
-		state double breakTime = timer_monotonic() + CLIENT_KNOBS->COPY_LOG_TASK_DURATION_NANOS;
+		state double breakTime = timer_monotonic() + CLIENT_KNOBS->COPY_LOG_TASK_DURATION_SECONDS;
 		state int rangeN = 0;
 
 		loop {
@@ -903,7 +909,8 @@ struct CopyLogRangeTaskFunc : TaskFuncBase {
 				                           decodeBKMutationLogKey,
 				                           Terminator::True,
 				                           AccessSystemKeys::True,
-				                           LockAware::True));
+				                           LockAware::True,
+				                           ReadLowPriority(CLIENT_KNOBS->BACKUP_READS_USE_LOW_PRIORITY)));
 			}
 
 			// copy the range
@@ -915,7 +922,7 @@ struct CopyLogRangeTaskFunc : TaskFuncBase {
 				nextVersion = nextVersionBr.get();
 				// cancel prefetch
 				TraceEvent(SevInfo, "CopyLogRangeTaskFuncAborted")
-				    .detail("DurationNanos", CLIENT_KNOBS->COPY_LOG_TASK_DURATION_NANOS)
+				    .detail("DurationSeconds", CLIENT_KNOBS->COPY_LOG_TASK_DURATION_SECONDS)
 				    .detail("RangeN", rangeN)
 				    .detail("BytesWritten", Params.bytesWritten().getOrDefault(task));
 				for (int j = results.size(); --j >= rangeN;)
@@ -1613,7 +1620,8 @@ struct OldCopyLogRangeTaskFunc : TaskFuncBase {
 			                           decodeBKMutationLogKey,
 			                           Terminator::True,
 			                           AccessSystemKeys::True,
-			                           LockAware::True));
+			                           LockAware::True,
+			                           ReadLowPriority(CLIENT_KNOBS->BACKUP_READS_USE_LOW_PRIORITY)));
 			dump.push_back(dumpData(cx, task, results[i], lock.getPtr(), taskBucket));
 		}
 
@@ -2426,8 +2434,6 @@ void checkAtomicSwitchOverConfig(StatusObjectReader srcStatus, StatusObjectReade
 
 class DatabaseBackupAgentImpl {
 public:
-	static constexpr int MAX_RESTORABLE_FILE_METASECTION_BYTES = 1024 * 8;
-
 	ACTOR static Future<Void> waitUpgradeToLatestDrVersion(DatabaseBackupAgent* backupAgent, Database cx, Key tagName) {
 		state UID logUid = wait(backupAgent->getLogUid(cx, tagName));
 		state Key drVersionKey = backupAgent->config.get(BinaryWriter::toValue(logUid, Unversioned()))

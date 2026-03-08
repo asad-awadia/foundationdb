@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@
 
 package fdb
 
-// #define FDB_API_VERSION 740
+// #define FDB_API_VERSION 800
 // #include <foundationdb/fdb_c.h>
 // #include <stdlib.h>
 import "C"
@@ -121,7 +121,7 @@ func (opt NetworkOptions) setOpt(code int, param []byte) error {
 // other functions in the fdb package.
 // This function is safe to be called from multiple goroutines.
 //
-// Currently, this package supports API versions 200 through 740.
+// Currently, this package supports API versions 200 through 800.
 //
 // Warning: When using the multi-version client API, setting an API version that
 // is not supported by a particular client library will prevent that client from
@@ -129,7 +129,7 @@ func (opt NetworkOptions) setOpt(code int, param []byte) error {
 // the API version of your application after upgrading your client until the
 // cluster has also been upgraded.
 func APIVersion(version int) error {
-	headerVersion := 740
+	headerVersion := 800
 
 	networkMutex.Lock()
 	defer networkMutex.Unlock()

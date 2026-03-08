@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -218,8 +218,6 @@ static const KeyRange persistTagMessagesKeys = prefixRange("TagMsg/"_sr);
 static const KeyRange persistTagMessageRefsKeys = prefixRange("TagMsgRef/"_sr);
 static const KeyRange persistTagPoppedKeys = prefixRange("TagPop/"_sr);
 
-static const KeyRef persistEncryptionAtRestModeKey = "encryptionAtRestMode"_sr;
-
 static Key persistTagMessagesKey(UID id, Tag tag, Version version) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(persistTagMessagesKeys.begin);
@@ -309,8 +307,6 @@ struct TLogData : NonCopyable {
 
 	UID dbgid;
 	UID workerID;
-
-	Optional<EncryptionAtRestMode> encryptionAtRestMode;
 
 	IKeyValueStore* persistentData; // Durable data on disk that were spilled.
 	IDiskQueue* rawPersistentQueue; // The physical queue the persistentQueue below stores its data. Ideally, log
@@ -522,7 +518,9 @@ struct LogData : NonCopyable, public ReferenceCounted<LogData> {
 	Version minKnownCommittedVersion;
 	Version queuePoppedVersion; // The disk queue has been popped up until the location which represents this version.
 	Version minPoppedTagVersion;
-	Tag minPoppedTag; // The tag that makes tLog hold its data and cause tLog's disk queue increasing.
+	Tag minPoppedTag; // The tag (locality >= 0) that makes tLog hold its data and cause tLog's disk queue increasing.
+	Version minSysPopTagVersion;
+	Tag minSysPopTag; // The system locality tag (locality < 0) with the minimum popped version.
 
 	// For each version above knownCommittedVersion, track:
 	// <Version, PrevVersion (that the sequencer provided), TLogs that the version has been sent to (the tLogs
@@ -567,7 +565,7 @@ struct LogData : NonCopyable, public ReferenceCounted<LogData> {
 
 	CounterCollection cc;
 	Counter bytesInput;
-	Counter tempTagMessageCount;
+	Counter tagMessageCount;
 	Counter bytesDurable;
 	Counter blockingPeeks;
 	Counter blockingPeekTimeouts;
@@ -664,17 +662,18 @@ struct LogData : NonCopyable, public ReferenceCounted<LogData> {
 	                 std::string context)
 	  : initialized(false), queueCommittingVersion(0), knownCommittedVersion(0), durableKnownCommittedVersion(0),
 	    minKnownCommittedVersion(0), queuePoppedVersion(0), minPoppedTagVersion(0), minPoppedTag(invalidTag),
-	    unpoppedRecoveredTagCount(0), cc("TLog", interf.id().toString()), bytesInput("BytesInput", cc),
-	    tempTagMessageCount("TempTagMessageCount", cc), bytesDurable("BytesDurable", cc),
-	    blockingPeeks("BlockingPeeks", cc), blockingPeekTimeouts("BlockingPeekTimeouts", cc),
-	    emptyPeeks("EmptyPeeks", cc), nonEmptyPeeks("NonEmptyPeeks", cc),
-	    persistentDataUpdateBatches("PersistentDataUpdateBatches", cc), dirtyTagsProcessed("DirtyTagsProcessed", cc),
-	    logId(interf.id()), protocolVersion(protocolVersion), newPersistentDataVersion(invalidVersion),
-	    tLogData(tLogData), unrecoveredBefore(1), recoveredAt(1), recoveryTxnVersion(1),
-	    logSystem(new AsyncVar<Reference<ILogSystem>>()), remoteTag(remoteTag), isPrimary(isPrimary),
-	    logRouterTags(logRouterTags), logRouterPoppedVersion(0), logRouterPopToVersion(0), locality(tagLocalityInvalid),
-	    recruitmentID(recruitmentID), logSpillType(logSpillType), allTags(tags.begin(), tags.end()),
-	    terminated(tLogData->terminated.getFuture()), execOpCommitInProgress(false), txsTags(txsTags) {
+	    minSysPopTagVersion(0), minSysPopTag(invalidTag), unpoppedRecoveredTagCount(0),
+	    cc("TLog", interf.id().toString()), bytesInput("BytesInput", cc), tagMessageCount("tagMessageCount", cc),
+	    bytesDurable("BytesDurable", cc), blockingPeeks("BlockingPeeks", cc),
+	    blockingPeekTimeouts("BlockingPeekTimeouts", cc), emptyPeeks("EmptyPeeks", cc),
+	    nonEmptyPeeks("NonEmptyPeeks", cc), persistentDataUpdateBatches("PersistentDataUpdateBatches", cc),
+	    dirtyTagsProcessed("DirtyTagsProcessed", cc), logId(interf.id()), protocolVersion(protocolVersion),
+	    newPersistentDataVersion(invalidVersion), tLogData(tLogData), unrecoveredBefore(1), recoveredAt(1),
+	    recoveryTxnVersion(1), logSystem(new AsyncVar<Reference<ILogSystem>>()), remoteTag(remoteTag),
+	    isPrimary(isPrimary), logRouterTags(logRouterTags), logRouterPoppedVersion(0), logRouterPopToVersion(0),
+	    locality(tagLocalityInvalid), recruitmentID(recruitmentID), logSpillType(logSpillType),
+	    allTags(tags.begin(), tags.end()), terminated(tLogData->terminated.getFuture()), execOpCommitInProgress(false),
+	    txsTags(txsTags) {
 		startRole(Role::TRANSACTION_LOG,
 		          interf.id(),
 		          tLogData->workerID,
@@ -699,6 +698,9 @@ struct LogData : NonCopyable, public ReferenceCounted<LogData> {
 		// for why the TLog thinks it can't throw away data.
 		specialCounter(cc, "MinPoppedTagLocality", [this]() { return this->minPoppedTag.locality; });
 		specialCounter(cc, "MinPoppedTagId", [this]() { return this->minPoppedTag.id; });
+		specialCounter(cc, "MinSysPopTagVersion", [this]() { return this->minSysPopTagVersion; });
+		specialCounter(cc, "MinSysPopTagLocality", [this]() { return this->minSysPopTag.locality; });
+		specialCounter(cc, "MinSysPopTagId", [this]() { return this->minSysPopTag.id; });
 		specialCounter(cc, "SharedBytesInput", [tLogData]() { return tLogData->bytesInput; });
 		specialCounter(cc, "SharedBytesDurable", [tLogData]() { return tLogData->bytesDurable; });
 		specialCounter(cc, "SharedOverheadBytesInput", [tLogData]() { return tLogData->overheadBytesInput; });
@@ -707,6 +709,7 @@ struct LogData : NonCopyable, public ReferenceCounted<LogData> {
 		specialCounter(cc, "PeekMemoryRequestsStalled", [tLogData]() { return tLogData->peekMemoryLimiter.waiters(); });
 		specialCounter(cc, "Generation", [this]() { return this->recoveryCount; });
 		specialCounter(cc, "ActivePeekStreams", [tLogData]() { return tLogData->activePeekStreams; });
+		specialCounter(cc, "UnknownCommittedVersionCount", [this]() { return this->unknownCommittedVersions.size(); });
 	}
 
 	~LogData() {
@@ -983,6 +986,7 @@ ACTOR Future<Void> popDiskQueue(TLogData* self, Reference<LogData> logData) {
 		minVersion = locationIter->key;
 	}
 	logData->minPoppedTagVersion = std::numeric_limits<Version>::max();
+	logData->minSysPopTagVersion = std::numeric_limits<Version>::max();
 
 	for (int tagLocality = 0; tagLocality < logData->tag_data.size(); tagLocality++) {
 		for (int tagId = 0; tagId < logData->tag_data[tagLocality].size(); tagId++) {
@@ -992,10 +996,18 @@ ACTOR Future<Void> popDiskQueue(TLogData* self, Reference<LogData> logData) {
 					minLocation = std::min(minLocation, tagData->poppedLocation);
 					minVersion = std::min(minVersion, tagData->popped);
 				}
-				if ((!tagData->nothingPersistent || tagData->versionMessages.size()) &&
-				    tagData->popped < logData->minPoppedTagVersion) {
-					logData->minPoppedTagVersion = tagData->popped;
-					logData->minPoppedTag = tagData->tag;
+				if ((!tagData->nothingPersistent || tagData->versionMessages.size())) {
+					if (tagData->tag.locality >= 0) {
+						if (tagData->popped < logData->minPoppedTagVersion) {
+							logData->minPoppedTagVersion = tagData->popped;
+							logData->minPoppedTag = tagData->tag;
+						}
+					} else {
+						if (tagData->popped < logData->minSysPopTagVersion) {
+							logData->minSysPopTagVersion = tagData->popped;
+							logData->minSysPopTag = tagData->tag;
+						}
+					}
 				}
 			}
 		}
@@ -1392,29 +1404,6 @@ ACTOR Future<Void> updateStorage(TLogData* self) {
 
 	state FlowLock::Releaser commitLockReleaser;
 
-	// FIXME: This policy for calculating the cache pop version could end up popping recent data in the remote DC after
-	// two consecutive recoveries.
-	// It also does not protect against spilling the cache tag directly, so it is theoretically possible to spill this
-	// tag; which is not intended to ever happen.
-	Optional<Version> cachePopVersion;
-	for (auto& it : self->id_data) {
-		if (!it.second->stopped()) {
-			if (it.second->version.get() - it.second->unrecoveredBefore >
-			    SERVER_KNOBS->MAX_VERSIONS_IN_FLIGHT + SERVER_KNOBS->MAX_CACHE_VERSIONS) {
-				cachePopVersion = it.second->version.get() - SERVER_KNOBS->MAX_CACHE_VERSIONS;
-			}
-			break;
-		}
-	}
-
-	if (cachePopVersion.present()) {
-		state std::vector<Future<Void>> cachePopFutures;
-		for (auto& it : self->id_data) {
-			cachePopFutures.push_back(tLogPop(self, TLogPopRequest(cachePopVersion.get(), 0, cacheTag), it.second));
-		}
-		wait(waitForAll(cachePopFutures));
-	}
-
 	if (logData->stopped()) {
 		if (self->bytesInput - self->bytesDurable >= self->targetVolatileBytes) {
 			while (logData->persistentDataDurableVersion != logData->version.get()) {
@@ -1541,7 +1530,7 @@ void commitMessages(TLogData* self,
 	if (!taggedMessages.size()) {
 		return;
 	}
-	logData->tempTagMessageCount += taggedMessages.size();
+	logData->tagMessageCount += taggedMessages.size();
 
 	int msgSize = 0;
 	for (auto& i : taggedMessages) {
@@ -1646,6 +1635,13 @@ void commitMessages(TLogData* self,
 void commitMessages(TLogData* self, Reference<LogData> logData, Version version, Arena arena, StringRef messages) {
 	ArenaReader rd(arena, messages, Unversioned());
 	self->tempTagMessages.clear();
+	if (SERVER_KNOBS->ENABLE_TLOG_TEMP_TAG_MESSAGES_RESERVE) {
+		// Estimate message count to reserve capacity and avoid reallocations
+		size_t estimatedMsgCount = std::max(size_t(messages.size() / 150), size_t(10));
+		estimatedMsgCount = std::min(estimatedMsgCount, size_t(5000));
+		self->tempTagMessages.reserve(estimatedMsgCount);
+	}
+
 	while (!rd.empty()) {
 		TagsAndMessage tagsAndMsg;
 		tagsAndMsg.loadFromArena(&rd, nullptr);
@@ -2560,25 +2556,6 @@ ACTOR Future<Void> initPersistentState(TLogData* self, Reference<LogData> logDat
 	return Void();
 }
 
-ACTOR Future<EncryptionAtRestMode> getEncryptionAtRestMode(TLogData* self) {
-	loop {
-		state GetEncryptionAtRestModeRequest req(self->dbgid);
-		try {
-			choose {
-				when(wait(self->dbInfo->onChange())) {}
-				when(GetEncryptionAtRestModeResponse resp = wait(brokenPromiseToNever(
-				         self->dbInfo->get().clusterInterface.getEncryptionAtRestMode.getReply(req)))) {
-					TraceEvent("GetEncryptionAtRestMode", self->dbgid).detail("Mode", resp.mode);
-					return (EncryptionAtRestMode::Mode)resp.mode;
-				}
-			}
-		} catch (Error& e) {
-			TraceEvent("GetEncryptionAtRestError", self->dbgid).error(e);
-			throw;
-		}
-	}
-}
-
 // send stopped promise instead of LogData* to avoid reference cycles
 ACTOR Future<Void> rejoinClusterController(TLogData* self,
                                            TLogInterface tli,
@@ -2812,32 +2789,6 @@ ACTOR Future<Void> tLogEnablePopReq(TLogEnablePopRequest enablePopReq, TLogData*
 	return Void();
 }
 
-ACTOR Future<Void> checkUpdateEncryptionAtRestMode(TLogData* self) {
-	EncryptionAtRestMode encryptionAtRestMode = wait(getEncryptionAtRestMode(self));
-
-	if (self->encryptionAtRestMode.present()) {
-		// Ensure the TLog encryptionAtRestMode status matches with the cluster config, if not, kill the TLog process.
-		// Approach prevents a fake TLog process joining the cluster.
-		if (self->encryptionAtRestMode.get() != encryptionAtRestMode) {
-			TraceEvent("EncryptionAtRestMismatch", self->dbgid)
-			    .detail("Expected", encryptionAtRestMode.toString())
-			    .detail("Present", self->encryptionAtRestMode.get().toString());
-			ASSERT(false);
-		}
-	} else {
-		self->encryptionAtRestMode = Optional<EncryptionAtRestMode>(encryptionAtRestMode);
-		wait(self->persistentDataCommitLock.take());
-		state FlowLock::Releaser commitLockReleaser(self->persistentDataCommitLock);
-		self->persistentData->set(
-		    KeyValueRef(persistEncryptionAtRestModeKey, self->encryptionAtRestMode.get().toValue()));
-		wait(self->persistentData->commit());
-		TraceEvent("PersistEncryptionAtRestMode", self->dbgid)
-		    .detail("Mode", self->encryptionAtRestMode.get().toString());
-	}
-
-	return Void();
-}
-
 ACTOR Future<Void> serveTLogInterface(TLogData* self,
                                       TLogInterface tli,
                                       Reference<LogData> logData,
@@ -2996,6 +2947,8 @@ ACTOR Future<Void> pullAsyncData(TLogData* self,
 		// When we just processed some data, we reset the warning start time.
 		state double lastPullAsyncDataWarningTime = now();
 		loop {
+			double waitTime = std::max(
+			    0.0, lastPullAsyncDataWarningTime + SERVER_KNOBS->TLOG_PULL_ASYNC_DATA_WARNING_TIMEOUT_SECS - now());
 			choose {
 				when(wait(r ? r->getMore(TaskPriority::TLogCommit) : Never())) {
 					break;
@@ -3008,8 +2961,7 @@ ACTOR Future<Void> pullAsyncData(TLogData* self,
 					}
 					dbInfoChange = logData->logSystem->onChange();
 				}
-				when(wait(delay(lastPullAsyncDataWarningTime + SERVER_KNOBS->TLOG_PULL_ASYNC_DATA_WARNING_TIMEOUT_SECS -
-				                now()))) {
+				when(wait(delay(waitTime))) {
 					TraceEvent(SevWarn, "TLogPullAsyncDataSlow", logData->logId)
 					    .detail("Elapsed", now() - startTime)
 					    .detail("Version", logData->version.get());
@@ -3244,7 +3196,6 @@ ACTOR Future<Void> restorePersistentState(TLogData* self,
 	state IKeyValueStore* storage = self->persistentData;
 	state Future<Optional<Value>> fFormat = storage->readValue(persistFormat.key);
 	state Future<Optional<Value>> fRecoveryLocation = storage->readValue(persistRecoveryLocationKey);
-	state Future<Optional<Value>> fEncryptionAtRestMode = storage->readValue(persistEncryptionAtRestModeKey);
 	state Future<RangeResult> fVers = storage->readRange(persistCurrentVersionKeys);
 	state Future<RangeResult> fKnownCommitted = storage->readRange(persistKnownCommittedVersionKeys);
 	state Future<RangeResult> fLocality = storage->readRange(persistLocalityKeys);
@@ -3256,7 +3207,7 @@ ACTOR Future<Void> restorePersistentState(TLogData* self,
 
 	// FIXME: metadata in queue?
 
-	wait(waitForAll(std::vector{ fFormat, fRecoveryLocation, fEncryptionAtRestMode }));
+	wait(waitForAll(std::vector{ fFormat, fRecoveryLocation }));
 	wait(waitForAll(std::vector{ fVers,
 	                             fKnownCommitted,
 	                             fLocality,
@@ -3265,12 +3216,6 @@ ACTOR Future<Void> restorePersistentState(TLogData* self,
 	                             fRecoverCounts,
 	                             fProtocolVersions,
 	                             fTLogSpillTypes }));
-
-	if (fEncryptionAtRestMode.get().present()) {
-		self->encryptionAtRestMode =
-		    Optional<EncryptionAtRestMode>(EncryptionAtRestMode::fromValue(fEncryptionAtRestMode.get()));
-		TraceEvent("PersistEncryptionAtRestModeRead").detail("Mode", self->encryptionAtRestMode.get().toString());
-	}
 
 	if (fFormat.get().present() && !persistFormatReadableRange.contains(fFormat.get().get())) {
 		// FIXME: remove when we no longer need to test upgrades from 4.X releases
@@ -3858,7 +3803,6 @@ ACTOR Future<Void> tLog(IKeyValueStore* persistentData,
 
 		self.sharedActors.send(commitQueue(&self));
 		self.sharedActors.send(updateStorageLoop(&self));
-		self.sharedActors.send(checkUpdateEncryptionAtRestMode(&self));
 		self.sharedActors.send(traceRole(Role::SHARED_TRANSACTION_LOG, tlogId));
 		state Future<Void> activeSharedChange = Void();
 
@@ -3933,12 +3877,15 @@ struct DequeAllocator : std::allocator<T> {
 	DequeAllocator(DequeAllocator<U> const& u) : std::allocator<T>(u) {}
 
 	T* allocate(std::size_t n) {
+		// Intentionally count allocated bytes for all allocator rebinds, including deque internals that use pointer
+		// types. NOLINTNEXTLINE(bugprone-sizeof-expression)
 		DequeAllocatorStats::allocatedBytes += n * sizeof(T);
 		// fprintf(stderr, "Allocating %lld objects for %lld bytes (total allocated: %lld)\n", n, n * sizeof(T),
 		// DequeAllocatorStats::allocatedBytes);
 		return std::allocator<T>::allocate(n);
 	}
 	void deallocate(T* p, std::size_t n) {
+		// NOLINTNEXTLINE(bugprone-sizeof-expression)
 		DequeAllocatorStats::allocatedBytes -= n * sizeof(T);
 		// fprintf(stderr, "Deallocating %lld objects for %lld bytes (total allocated: %lld)\n", n, n * sizeof(T),
 		// DequeAllocatorStats::allocatedBytes);

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -182,36 +182,6 @@ std::map<std::string, std::string> configForToken(std::string const& mode) {
 				return out;
 			}
 			out[p + key] = format("%d", type);
-		}
-
-		if (key == "tenant_mode") {
-			TenantMode tenantMode;
-			if (value == "disabled") {
-				tenantMode = TenantMode::DISABLED;
-			} else if (value == "optional_experimental") {
-				tenantMode = TenantMode::OPTIONAL_TENANT;
-			} else if (value == "required_experimental") {
-				tenantMode = TenantMode::REQUIRED;
-			} else {
-				printf("Error: Only disabled|optional_experimental|required_experimental are valid for tenant_mode.\n");
-				return out;
-			}
-			out[p + key] = format("%d", tenantMode);
-		}
-
-		if (key == "encryption_at_rest_mode") {
-			EncryptionAtRestMode mode;
-			if (value == "disabled") {
-				mode = EncryptionAtRestMode::DISABLED;
-			} else if (value == "domain_aware") {
-				mode = EncryptionAtRestMode::DOMAIN_AWARE;
-			} else if (value == "cluster_aware") {
-				mode = EncryptionAtRestMode::CLUSTER_AWARE;
-			} else {
-				printf("Error: Only disabled|domain_aware|cluster_aware are valid for encryption_at_rest_mode.\n");
-				return out;
-			}
-			out[p + key] = format("%d", mode);
 		}
 
 		if (key == "exclude") {
@@ -532,168 +502,6 @@ ACTOR Future<Void> enableBackupWorker(Database cx) {
 		TraceEvent("BackupWorkerEnableFailed").detail("Result", res);
 		throw operation_failed();
 	}
-	return Void();
-}
-
-/*
-    - Validates encryption and tenant mode configurations
-    - During cluster creation (configure new) we allow the following:
-        - If encryption mode is disabled/cluster_aware then any tenant mode is allowed
-        - If the encryption mode is domain_aware then the only allowed tenant mode is required
-    - During cluster configuration changes the following is allowed:
-        - Encryption mode cannot be changed (can only be set during creation)
-        - If the encryption mode is disabled/cluster_aware then any tenant mode changes are allowed
-        - If the encryption mode is domain_aware then tenant mode changes are not allowed (as the only supported mode is
-          required)
-*/
-bool isEncryptionAtRestModeConfigValid(Optional<DatabaseConfiguration> oldConfiguration,
-                                       std::map<std::string, std::string> newConfig,
-                                       bool creating) {
-	EncryptionAtRestMode encryptMode;
-	TenantMode tenantMode;
-	if (creating) {
-		if (newConfig.count(encryptionAtRestModeConfKey.toString()) != 0) {
-			encryptMode = EncryptionAtRestMode::fromValueRef(
-			    ValueRef(newConfig.find(encryptionAtRestModeConfKey.toString())->second));
-			// check if the tenant mode is being set during configure new (otherwise assume tenants are disabled)
-			if (newConfig.count(tenantModeConfKey.toString()) != 0) {
-				tenantMode = TenantMode::fromValue(ValueRef(newConfig.find(tenantModeConfKey.toString())->second));
-			}
-		}
-	} else {
-		ASSERT(oldConfiguration.present());
-		encryptMode = oldConfiguration.get().encryptionAtRestMode;
-		if (newConfig.count(tenantModeConfKey.toString()) != 0) {
-			tenantMode = TenantMode::fromValue(ValueRef(newConfig.find(tenantModeConfKey.toString())->second));
-		} else {
-			// Tenant mode and encryption mode didn't change
-			return true;
-		}
-	}
-	TraceEvent(SevDebug, "EncryptAndTenantModes")
-	    .detail("EncryptMode", encryptMode.toString())
-	    .detail("TenantMode", tenantMode.toString());
-
-	if (encryptMode.mode == EncryptionAtRestMode::DOMAIN_AWARE && tenantMode != TenantMode::REQUIRED) {
-		// For domain aware encryption only the required tenant mode is currently supported
-		TraceEvent(SevWarnAlways, "InvalidEncryptAndTenantConfiguration")
-		    .detail("EncryptMode", encryptMode.toString())
-		    .detail("TenantMode", tenantMode.toString());
-		return false;
-	}
-
-	return true;
-}
-
-bool isTenantModeModeConfigValid(DatabaseConfiguration oldConfiguration, DatabaseConfiguration newConfiguration) {
-	TenantMode oldTenantMode = oldConfiguration.tenantMode;
-	TenantMode newTenantMode = newConfiguration.tenantMode;
-	TraceEvent(SevDebug, "TenantModes")
-	    .detail("OldTenantMode", oldTenantMode.toString())
-	    .detail("NewTenantMode", newTenantMode.toString());
-	if (oldTenantMode != TenantMode::REQUIRED && newTenantMode == TenantMode::REQUIRED) {
-		// TODO: Changing from optional/disabled to required tenant mode should be allowed if there is no non-tenant
-		// data present
-		TraceEvent(SevWarnAlways, "InvalidTenantConfiguration")
-		    .detail("OldTenantMode", oldTenantMode.toString())
-		    .detail("NewTenantMode", newTenantMode.toString());
-		return false;
-	}
-	return true;
-}
-
-TEST_CASE("/ManagementAPI/ChangeConfig/TenantMode") {
-	DatabaseConfiguration oldConfig;
-	DatabaseConfiguration newConfig;
-	std::vector<TenantMode> tenantModes = { TenantMode::DISABLED, TenantMode::OPTIONAL_TENANT, TenantMode::REQUIRED };
-	// required tenant mode can change to any other tenant mode
-	oldConfig.tenantMode = TenantMode::REQUIRED;
-	newConfig.tenantMode = deterministicRandom()->randomChoice(tenantModes);
-	ASSERT(isTenantModeModeConfigValid(oldConfig, newConfig));
-	// optional/disabled tenant mode can switch to optional/disabled tenant mode
-	oldConfig.tenantMode = deterministicRandom()->coinflip() ? TenantMode::DISABLED : TenantMode::OPTIONAL_TENANT;
-	newConfig.tenantMode = deterministicRandom()->coinflip() ? TenantMode::DISABLED : TenantMode::OPTIONAL_TENANT;
-	ASSERT(isTenantModeModeConfigValid(oldConfig, newConfig));
-	// optional/disabled tenant mode CANNOT switch to required tenant mode
-	oldConfig.tenantMode = deterministicRandom()->coinflip() ? TenantMode::DISABLED : TenantMode::OPTIONAL_TENANT;
-	newConfig.tenantMode = TenantMode::REQUIRED;
-	ASSERT(!isTenantModeModeConfigValid(oldConfig, newConfig));
-
-	return Void();
-}
-
-// unit test for changing encryption/tenant mode config options
-TEST_CASE("/ManagementAPI/ChangeConfig/TenantAndEncryptMode") {
-	std::map<std::string, std::string> newConfig;
-	std::string encryptModeKey = encryptionAtRestModeConfKey.toString();
-	std::string tenantModeKey = tenantModeConfKey.toString();
-	std::vector<TenantMode> tenantModes = { TenantMode::DISABLED, TenantMode::OPTIONAL_TENANT, TenantMode::REQUIRED };
-	std::vector<EncryptionAtRestMode> encryptionModes = { EncryptionAtRestMode::DISABLED,
-		                                                  EncryptionAtRestMode::CLUSTER_AWARE,
-		                                                  EncryptionAtRestMode::DOMAIN_AWARE };
-	// configure new test cases
-
-	// encryption disabled checks
-	newConfig[encryptModeKey] = std::to_string(EncryptionAtRestMode::DISABLED);
-	newConfig[tenantModeKey] = std::to_string(deterministicRandom()->randomChoice(tenantModes));
-	ASSERT(isEncryptionAtRestModeConfigValid(Optional<DatabaseConfiguration>(), newConfig, true));
-
-	// cluster aware encryption checks
-	newConfig[encryptModeKey] = std::to_string(EncryptionAtRestMode::CLUSTER_AWARE);
-	newConfig[tenantModeKey] = std::to_string(deterministicRandom()->randomChoice(tenantModes));
-	ASSERT(isEncryptionAtRestModeConfigValid(Optional<DatabaseConfiguration>(), newConfig, true));
-
-	// domain aware encryption checks
-	newConfig[encryptModeKey] = std::to_string(EncryptionAtRestMode::DOMAIN_AWARE);
-	newConfig[tenantModeKey] =
-	    std::to_string(deterministicRandom()->coinflip() ? TenantMode::DISABLED : TenantMode::OPTIONAL_TENANT);
-	ASSERT(!isEncryptionAtRestModeConfigValid(Optional<DatabaseConfiguration>(), newConfig, true));
-	newConfig[tenantModeKey] = std::to_string(TenantMode::REQUIRED);
-	ASSERT(isEncryptionAtRestModeConfigValid(Optional<DatabaseConfiguration>(), newConfig, true));
-
-	// no encrypt mode present
-	newConfig.erase(encryptModeKey);
-	newConfig[tenantModeKey] = std::to_string(deterministicRandom()->randomChoice(tenantModes));
-	ASSERT(isEncryptionAtRestModeConfigValid(Optional<DatabaseConfiguration>(), newConfig, true));
-
-	// no tenant mode present
-	newConfig.erase(tenantModeKey);
-	newConfig[encryptModeKey] = std::to_string(EncryptionAtRestMode::DOMAIN_AWARE);
-	ASSERT(!isEncryptionAtRestModeConfigValid(Optional<DatabaseConfiguration>(), newConfig, true));
-	newConfig[encryptModeKey] = std::to_string(EncryptionAtRestMode::CLUSTER_AWARE);
-	ASSERT(isEncryptionAtRestModeConfigValid(Optional<DatabaseConfiguration>(), newConfig, true));
-
-	// change config test cases
-	DatabaseConfiguration oldConfig;
-
-	// encryption disabled checks
-	oldConfig.encryptionAtRestMode = EncryptionAtRestMode::DISABLED;
-	oldConfig.tenantMode = deterministicRandom()->randomChoice(tenantModes);
-	newConfig[tenantModeKey] = std::to_string(deterministicRandom()->randomChoice(tenantModes));
-	ASSERT(isEncryptionAtRestModeConfigValid(oldConfig, newConfig, false));
-
-	// domain aware encryption checks
-	oldConfig.encryptionAtRestMode = EncryptionAtRestMode::DOMAIN_AWARE;
-	oldConfig.tenantMode = TenantMode::REQUIRED;
-	newConfig[tenantModeKey] =
-	    std::to_string(deterministicRandom()->coinflip() ? TenantMode::DISABLED : TenantMode::OPTIONAL_TENANT);
-	ASSERT(!isEncryptionAtRestModeConfigValid(oldConfig, newConfig, false));
-	newConfig[tenantModeKey] = std::to_string(TenantMode::REQUIRED);
-	ASSERT(isEncryptionAtRestModeConfigValid(oldConfig, newConfig, false));
-
-	// cluster aware encryption checks
-	oldConfig.encryptionAtRestMode = EncryptionAtRestMode::CLUSTER_AWARE;
-	// required tenant mode can switch to any other tenant mode with cluster aware encryption
-	oldConfig.tenantMode = deterministicRandom()->randomChoice(tenantModes);
-	newConfig[tenantModeKey] = std::to_string(deterministicRandom()->randomChoice(tenantModes));
-	ASSERT(isEncryptionAtRestModeConfigValid(oldConfig, newConfig, false));
-
-	// no tenant mode present
-	newConfig.erase(tenantModeKey);
-	oldConfig.tenantMode = deterministicRandom()->randomChoice(tenantModes);
-	oldConfig.encryptionAtRestMode = deterministicRandom()->randomChoice(encryptionModes);
-	ASSERT(isEncryptionAtRestModeConfigValid(oldConfig, newConfig, false));
-
 	return Void();
 }
 
@@ -1106,32 +914,6 @@ ACTOR Future<Optional<ClusterConnectionString>> getClusterConnectionStringFromSt
 	}
 }
 
-ACTOR Future<Void> verifyConfigurationDatabaseAlive(Database cx) {
-	state Backoff backoff;
-	state Reference<ISingleThreadTransaction> configTr;
-	loop {
-		try {
-			// Attempt to read a random value from the configuration
-			// database to make sure it is online.
-			configTr = ISingleThreadTransaction::create(ISingleThreadTransaction::Type::PAXOS_CONFIG, cx);
-			Tuple tuple;
-			tuple.appendNull(); // config class
-			tuple << "test"_sr;
-			Optional<Value> serializedValue = wait(configTr->get(tuple.pack()));
-			TraceEvent("ChangeQuorumCheckerNewCoordinatorsOnline").log();
-			return Void();
-		} catch (Error& e) {
-			TraceEvent("ChangeQuorumCheckerNewCoordinatorsError").error(e);
-			if (e.code() == error_code_coordinators_changed) {
-				wait(backoff.onError());
-				configTr->reset();
-			} else {
-				wait(configTr->onError(e));
-			}
-		}
-	}
-}
-
 ACTOR Future<Void> resetPreviousCoordinatorsKey(Database cx) {
 	loop {
 		// When the change coordinators transaction succeeds, it uses the
@@ -1139,8 +921,7 @@ ACTOR Future<Void> resetPreviousCoordinatorsKey(Database cx) {
 		// This causes the underlying transaction to not be committed. In order
 		// to make sure we clear the previous coordinators key, we have to use
 		// a new transaction here.
-		state Reference<ISingleThreadTransaction> clearTr =
-		    ISingleThreadTransaction::create(ISingleThreadTransaction::Type::RYW, cx);
+		state Reference<ReadYourWritesTransaction> clearTr = makeReference<ReadYourWritesTransaction>(cx);
 		try {
 			clearTr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 			clearTr->clear(previousCoordinatorsKey);
@@ -1156,8 +937,7 @@ ACTOR Future<Void> resetPreviousCoordinatorsKey(Database cx) {
 
 ACTOR Future<Optional<CoordinatorsResult>> changeQuorumChecker(Transaction* tr,
                                                                ClusterConnectionString* conn,
-                                                               std::string newName,
-                                                               bool disableConfigDB) {
+                                                               std::string newName) {
 	TraceEvent("ChangeQuorumCheckerStart").detail("NewConnectionString", conn->toString());
 	state Optional<ClusterConnectionString> clusterConnectionStringOptional =
 	    wait(getClusterConnectionStringFromStorageServer(tr));
@@ -1190,18 +970,10 @@ ACTOR Future<Optional<CoordinatorsResult>> changeQuorumChecker(Transaction* tr,
 	std::sort(old.coords.begin(), old.coords.end());
 	if (conn->hostnames == old.hostnames && conn->coords == old.coords && old.clusterKeyName() == newName) {
 		connectionStrings.clear();
-		if (g_network->isSimulated() && g_simulator->configDBType == ConfigDBType::DISABLED) {
-			disableConfigDB = true;
-		}
-		if (!disableConfigDB) {
-			wait(verifyConfigurationDatabaseAlive(tr->getDatabase()));
-		}
 		if (BUGGIFY_WITH_PROB(0.1)) {
 			// Introduce a random delay in simulation to allow processes to be
-			// killed before previousCoordinatorKeys has been reset. This will
-			// help test scenarios where the previous configuration database
-			// state has been transferred to the new coordinators but the
-			// broadcaster thinks it has not been transferred.
+			// killed before previousCoordinatorKeys has been reset. This helps
+			// exercise coordinator change edge cases around key cleanup.
 			wait(delay(deterministicRandom()->random01() * 10));
 		}
 		wait(resetPreviousCoordinatorsKey(tr->getDatabase()));
@@ -1244,7 +1016,7 @@ ACTOR Future<Optional<CoordinatorsResult>> changeQuorumChecker(Transaction* tr,
 	}
 
 	std::vector<Future<Optional<LeaderInfo>>> leaderServers;
-	ClientCoordinators coord(Reference<ClusterConnectionMemoryRecord>(new ClusterConnectionMemoryRecord(*conn)));
+	ClientCoordinators coord(makeReference<ClusterConnectionMemoryRecord>(*conn));
 
 	leaderServers.reserve(coord.clientLeaderServers.size());
 	for (int i = 0; i < coord.clientLeaderServers.size(); i++) {
@@ -1295,12 +1067,11 @@ ACTOR Future<CoordinatorsResult> changeQuorum(Database cx, Reference<IQuorumChan
 			state std::vector<NetworkAddress> oldCoordinators = wait(oldClusterConnectionString.tryResolveHostnames());
 			state CoordinatorsResult result = CoordinatorsResult::SUCCESS;
 			if (!desiredCoordinators.size()) {
-				std::vector<NetworkAddress> _desiredCoordinators = wait(
-				    change->getDesiredCoordinators(&tr,
-				                                   oldCoordinators,
-				                                   Reference<ClusterConnectionMemoryRecord>(
-				                                       new ClusterConnectionMemoryRecord(oldClusterConnectionString)),
-				                                   result));
+				std::vector<NetworkAddress> _desiredCoordinators = wait(change->getDesiredCoordinators(
+				    &tr,
+				    oldCoordinators,
+				    makeReference<ClusterConnectionMemoryRecord>(oldClusterConnectionString),
+				    result));
 				desiredCoordinators = _desiredCoordinators;
 			}
 
@@ -2384,16 +2155,16 @@ ACTOR Future<bool> checkForExcludingServersTxActor(ReadYourWritesTransaction* tr
 		Optional<Standalone<StringRef>> value = wait(tr->get(logsKey));
 		ASSERT(value.present());
 		auto logs = decodeLogsValue(value.get());
-		for (auto const& log : logs.first) {
-			if (log.second == NetworkAddress() || addressExcluded(*exclusions, log.second)) {
+		for (const auto& [_logId, logAddress] : logs.first) {
+			if (logAddress == NetworkAddress() || addressExcluded(*exclusions, logAddress)) {
 				ok = false;
-				inProgressExclusion->insert(log.second);
+				inProgressExclusion->insert(logAddress);
 			}
 		}
-		for (auto const& log : logs.second) {
-			if (log.second == NetworkAddress() || addressExcluded(*exclusions, log.second)) {
+		for (const auto& [_logId, logAddress] : logs.second) {
+			if (logAddress == NetworkAddress() || addressExcluded(*exclusions, logAddress)) {
 				ok = false;
-				inProgressExclusion->insert(log.second);
+				inProgressExclusion->insert(logAddress);
 			}
 		}
 	}
@@ -2765,6 +2536,26 @@ ACTOR Future<int> setBulkLoadMode(Database cx, int mode) {
 	}
 }
 
+ACTOR Future<int> getBulkLoadMode(Database cx) {
+	state Transaction tr(cx);
+	loop {
+		try {
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
+			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+			state int oldMode = 0;
+			Optional<Value> oldModeValue = wait(tr.get(bulkLoadModeKey));
+			if (oldModeValue.present()) {
+				BinaryReader rd(oldModeValue.get(), Unversioned());
+				rd >> oldMode;
+			}
+			return oldMode;
+		} catch (Error& e) {
+			wait(tr.onError(e));
+		}
+	}
+}
+
 ACTOR Future<Void> setBulkLoadSubmissionTransaction(Transaction* tr, BulkLoadTaskState bulkLoadTask) {
 	ASSERT(normalKeys.contains(bulkLoadTask.getRange()) &&
 	       (bulkLoadTask.phase == BulkLoadPhase::Submitted ||
@@ -3040,11 +2831,15 @@ ACTOR Future<Void> cancelBulkLoadJob(Database cx, UID jobId) {
 }
 
 // TODO(Zhe): clear bulkload task metadata within the input range
-ACTOR Future<Void> submitBulkLoadJob(Database cx, BulkLoadJobState jobState) {
+ACTOR Future<Void> submitBulkLoadJob(Database cx, BulkLoadJobState jobState, bool lockAware) {
 	ASSERT(jobState.getPhase() == BulkLoadJobPhase::Submitted);
+
 	state Transaction tr(cx);
 	loop {
 		try {
+			if (lockAware) {
+				tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			}
 			// There is at most one bulkLoad job or bulkDump job at a time globally
 			Optional<BulkDumpState> aliveBulkDumpJob = wait(getSubmittedBulkDumpJob(&tr));
 			if (aliveBulkDumpJob.present()) {
@@ -3109,13 +2904,16 @@ ACTOR Future<Void> submitBulkLoadJob(Database cx, BulkLoadJobState jobState) {
 	return Void();
 }
 
-ACTOR Future<Optional<BulkLoadJobState>> getRunningBulkLoadJob(Database cx) {
+ACTOR Future<Optional<BulkLoadJobState>> getRunningBulkLoadJob(Database cx, bool lockAware) {
 	state RangeResult rangeResult;
 	state Transaction tr(cx);
 	state Key beginKey = normalKeys.begin;
 	state Key endKey = normalKeys.end;
 	while (beginKey < endKey) {
 		try {
+			if (lockAware) {
+				tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			}
 			rangeResult.clear();
 			wait(store(rangeResult, krmGetRanges(&tr, bulkLoadJobPrefix, KeyRangeRef(beginKey, endKey))));
 			for (int i = 0; i < rangeResult.size() - 1; i++) {

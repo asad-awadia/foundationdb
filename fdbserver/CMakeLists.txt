@@ -8,13 +8,10 @@ endif()
 
 
 if(WITH_ROCKSDB)
+  find_package(LZ4 REQUIRED)
   include(CompileRocksDB)
-  # CompileRocksDB sets `lz4_LIBRARIES` to be the shared lib, we want to link
-  # statically, so find the static library here.
-  find_library(lz4_STATIC_LIBRARIES
-    NAMES liblz4.a REQUIRED)
   if(WITH_LIBURING)
-    find_package(uring)
+    find_package(uring REQUIRED)
   endif()
 endif()
 
@@ -50,7 +47,6 @@ if (WITH_SWIFT)
       "${CMAKE_BINARY_DIR}/fdbserver/include"
       "${CMAKE_SOURCE_DIR}/fdbrpc/include"
       "${CMAKE_BINARY_DIR}/fdbrpc/include"
-      "${CMAKE_SOURCE_DIR}/metacluster/include"
       "${CMAKE_SOURCE_DIR}/contrib/md5/include"
       "${CMAKE_SOURCE_DIR}/contrib/libb64/include"
       "${CMAKE_SOURCE_DIR}/contrib/sqlite"
@@ -114,11 +110,9 @@ if (WITH_SWIFT)
   target_link_options(fdbserver_swift PUBLIC "$<TARGET_OBJECTS:fdbclient_swift>")
   target_link_options(fdbserver PRIVATE "$<TARGET_OBJECTS:fdbclient_swift>")
   # This dependency ensures that fdbserver depends on fdbclient_swift at link time.
-  set_source_files_properties(IConfigConsumer.cpp PROPERTIES OBJECT_DEPENDS "${CMAKE_BINARY_DIR}/lib/libfdbclient_swift.a")
 
   target_link_options(fdbserver PRIVATE "$<TARGET_OBJECTS:fdbserver_swift>")
   # This dependency ensures that fdbserver depends on fdbserver_swift at link time.
-  set_source_files_properties(IConfigConsumer.cpp PROPERTIES OBJECT_DEPENDS "${CMAKE_BINARY_DIR}/lib/libfdbserver_swift.a")
 
   swift_get_linker_search_paths(SWIFT_LINK_PATHS)
   target_link_directories(fdbserver PRIVATE "${SWIFT_LINK_PATHS}")
@@ -142,14 +136,14 @@ if (WITH_ROCKSDB)
   add_dependencies(fdbserver rocksdb)
   if(WITH_LIBURING)
     target_include_directories(fdbserver PRIVATE ${ROCKSDB_INCLUDE_DIR} ${uring_INCLUDE_DIR})
-    target_link_libraries(fdbserver PRIVATE fdbclient metacluster sqlite ${ROCKSDB_LIBRARIES} ${uring_LIBRARIES} ${lz4_STATIC_LIBRARIES})
+    target_link_libraries(fdbserver PRIVATE fdbclient sqlite ${ROCKSDB_LIBRARIES} ${uring_LIBRARIES} ${LZ4_LIBRARY})
     target_compile_definitions(fdbserver PRIVATE BOOST_ASIO_HAS_IO_URING=1 BOOST_ASIO_DISABLE_EPOLL=1)
   else()
     target_include_directories(fdbserver PRIVATE ${ROCKSDB_INCLUDE_DIR})
-    target_link_libraries(fdbserver PRIVATE fdbclient metacluster sqlite ${ROCKSDB_LIBRARIES} ${lz4_STATIC_LIBRARIES})
+    target_link_libraries(fdbserver PRIVATE fdbclient sqlite ${ROCKSDB_LIBRARIES} ${LZ4_LIBRARY})
   endif()
 else()
-  target_link_libraries(fdbserver PRIVATE fdbclient metacluster sqlite)
+  target_link_libraries(fdbserver PRIVATE fdbclient sqlite)
 endif()
 
 if(USE_JEMALLOC)
@@ -179,3 +173,5 @@ if(NOT OPEN_FOR_IDE)
     fdb_install(PROGRAMS ${CMAKE_BINARY_DIR}/packages/bin/fdbserver DESTINATION sbin COMPONENT server)
   endif()
 endif()
+
+target_link_libraries(fdbserver PUBLIC fdbctl)

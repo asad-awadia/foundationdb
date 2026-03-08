@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -58,7 +58,6 @@ struct WorkloadContext {
 	int64_t sharedRandomNumber;
 	Reference<AsyncVar<struct ServerDBInfo> const> dbInfo;
 	Reference<IClusterConnectionRecord> ccr;
-	Optional<TenantName> defaultTenant;
 	std::vector<KeyRange> rangesToCheck; // for urgent consistency checker
 
 	WorkloadContext();
@@ -336,6 +335,7 @@ public:
 	Standalone<VectorRef<VectorRef<KeyValueRef>>> options;
 	int timeout;
 	double databasePingDelay;
+	double maxDDRunTime = 0; // Maximum Data Distributor run time before considered stuck (0 = use default)
 	bool runConsistencyCheck;
 	bool runConsistencyCheckOnCache;
 	bool runConsistencyCheckOnTSS;
@@ -359,15 +359,14 @@ public:
 	std::vector<std::string> disabledFailureInjectionWorkloads;
 };
 
-ACTOR Future<DistributedTestResults> runWorkload(Database cx,
-                                                 std::vector<TesterInterface> testers,
-                                                 TestSpec spec,
-                                                 Optional<TenantName> defaultTenant);
+Future<DistributedTestResults> runWorkload(Database const& cx,
+                                           std::vector<TesterInterface> const& testers,
+                                           TestSpec const& spec);
 
 void logMetrics(std::vector<PerfMetric> metrics);
 
-ACTOR Future<Void> poisson(double* last, double meanInterval);
-ACTOR Future<Void> uniform(double* last, double meanInterval);
+Future<Void> poisson(double* last, double meanInterval);
+Future<Void> uniform(double* last, double meanInterval);
 
 void emplaceIndex(uint8_t* data, int offset, int64_t index);
 Key doubleToTestKey(double p);
@@ -385,7 +384,8 @@ Future<Void> quietDatabase(Database const& cx,
                            int64_t maxStorageServerQueueGate = 5e6,
                            int64_t maxDataDistributionQueueSize = 0,
                            int64_t maxPoppedVersionLag = 30e6,
-                           int64_t maxVersionOffset = 1e6);
+                           int64_t maxVersionOffset = 1e6,
+                           double maxDDRunTime = 0);
 
 /**
  * A utility function for testing error situations. It succeeds if the given test

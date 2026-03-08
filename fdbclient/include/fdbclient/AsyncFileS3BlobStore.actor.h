@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -274,9 +274,9 @@ private:
 
 		// Make a new part to write to
 		if (startNew)
-			f->m_parts.push_back(Reference<Part>(new Part(f->m_parts.size() + 1,
-			                                              f->m_bstore->knobs.multipart_min_part_size,
-			                                              f->m_bstore->knobs.enable_object_integrity_check)));
+			f->m_parts.push_back(makeReference<Part>(f->m_parts.size() + 1,
+			                                         f->m_bstore->knobs.multipart_min_part_size,
+			                                         f->m_bstore->knobs.enable_object_integrity_check));
 
 		return Void();
 	}

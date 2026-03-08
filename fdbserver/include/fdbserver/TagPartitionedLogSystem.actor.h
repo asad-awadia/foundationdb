@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,16 +26,9 @@
 
 #pragma once
 
-#include "fdbclient/SystemData.h"
 #include "fdbrpc/Replication.h"
-#include "fdbrpc/ReplicationUtils.h"
-#include "fdbrpc/simulator.h"
 #include "fdbserver/DBCoreState.h"
-#include "fdbserver/Knobs.h"
 #include "fdbserver/LogSystem.h"
-#include "fdbserver/RecoveryState.h"
-#include "fdbserver/ServerDBInfo.h"
-#include "fdbserver/WaitFailure.h"
 #include "flow/ActorCollection.h"
 
 #include "flow/actorcompiler.h" // This must be the last #include.
@@ -327,6 +320,8 @@ struct TagPartitionedLogSystem final : ILogSystem, ReferenceCounted<TagPartition
 	Standalone<StringRef> getLogsValue() const final;
 
 	Future<Void> onLogSystemConfigChange() final;
+
+	void updateLogRouter(int logSetIndex, int tagId, TLogInterface const& newLogRouter) final;
 
 	Version getEnd() const final;
 

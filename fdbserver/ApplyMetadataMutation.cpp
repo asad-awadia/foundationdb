@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,11 +20,9 @@
 
 #include "fdbclient/BackupAgent.actor.h"
 #include "fdbclient/KeyBackedTypes.actor.h" // for key backed map codecs for tss mapping
-#include "fdbclient/MetaclusterRegistration.h"
 #include "fdbclient/MutationList.h"
 #include "fdbclient/Notified.h"
 #include "fdbclient/SystemData.h"
-#include "fdbclient/Tenant.h"
 #include "fdbserver/AccumulativeChecksumUtil.h"
 #include "fdbserver/ApplyMetadataMutation.h"
 #include "fdbserver/IKeyValueStore.h"
@@ -63,7 +61,7 @@ public:
 	                           const VectorRef<MutationRef>& mutations_,
 	                           IKeyValueStore* txnStateStore_)
 	  : spanContext(spanContext_), dbgid(dbgid_), arena(arena_), mutations(mutations_), txnStateStore(txnStateStore_),
-	    confChange(dummyConfChange), encryptMode(EncryptionAtRestMode::DISABLED), epoch(Optional<LogEpoch>()) {}
+	    confChange(dummyConfChange), epoch(Optional<LogEpoch>()) {}
 
 	ApplyMetadataMutationsImpl(const SpanContext& spanContext_,
 	                           Arena& arena_,
@@ -71,56 +69,36 @@ public:
 	                           ProxyCommitData& proxyCommitData_,
 	                           Reference<ILogSystem> logSystem_,
 	                           LogPushData* toCommit_,
-	                           const std::unordered_map<EncryptCipherDomainId, Reference<BlobCipherKey>>* cipherKeys_,
-	                           EncryptionAtRestMode encryptMode,
 	                           bool& confChange_,
 	                           Version version,
 	                           Version popVersion_,
 	                           bool initialCommit_,
 	                           bool provisionalCommitProxy_)
 	  : spanContext(spanContext_), dbgid(proxyCommitData_.dbgid), arena(arena_), mutations(mutations_),
-	    txnStateStore(proxyCommitData_.txnStateStore), toCommit(toCommit_), cipherKeys(cipherKeys_),
-	    encryptMode(encryptMode), confChange(confChange_), logSystem(logSystem_), version(version),
-	    popVersion(popVersion_), vecBackupKeys(&proxyCommitData_.vecBackupKeys), keyInfo(&proxyCommitData_.keyInfo),
-	    cacheInfo(&proxyCommitData_.cacheInfo),
+	    txnStateStore(proxyCommitData_.txnStateStore), toCommit(toCommit_), confChange(confChange_),
+	    logSystem(logSystem_), version(version), popVersion(popVersion_),
+	    vecBackupKeys(&proxyCommitData_.vecBackupKeys), keyInfo(&proxyCommitData_.keyInfo),
 	    uid_applyMutationsData(proxyCommitData_.firstProxy ? &proxyCommitData_.uid_applyMutationsData : nullptr),
 	    commit(proxyCommitData_.commit), cx(proxyCommitData_.cx), committedVersion(&proxyCommitData_.committedVersion),
 	    storageCache(&proxyCommitData_.storageCache), tag_popped(&proxyCommitData_.tag_popped),
-	    tssMapping(&proxyCommitData_.tssMapping), tenantMap(&proxyCommitData_.tenantMap),
-	    tenantNameIndex(&proxyCommitData_.tenantNameIndex), lockedTenants(&proxyCommitData_.lockedTenants),
-	    initialCommit(initialCommit_), provisionalCommitProxy(provisionalCommitProxy_),
+	    tssMapping(&proxyCommitData_.tssMapping), initialCommit(initialCommit_),
+	    provisionalCommitProxy(provisionalCommitProxy_),
 	    accumulativeChecksumIndex(getCommitProxyAccumulativeChecksumIndex(proxyCommitData_.commitProxyIndex)),
 	    acsBuilder(proxyCommitData_.acsBuilder), epoch(proxyCommitData_.epoch), rangeLock(proxyCommitData_.rangeLock) {
-		if (encryptMode.isEncryptionEnabled()) {
-			ASSERT(cipherKeys != nullptr);
-			ASSERT(cipherKeys->contains(SYSTEM_KEYSPACE_ENCRYPT_DOMAIN_ID));
-			if (FLOW_KNOBS->ENCRYPT_HEADER_AUTH_TOKEN_ENABLED) {
-				ASSERT(cipherKeys->contains(ENCRYPT_HEADER_DOMAIN_ID));
-			}
-		}
+
 		// If commit proxy, epoch must be set
 		ASSERT(toCommit == nullptr || epoch.present());
 	}
 
 	ApplyMetadataMutationsImpl(const SpanContext& spanContext_,
 	                           ResolverData& resolverData_,
-	                           const VectorRef<MutationRef>& mutations_,
-	                           const std::unordered_map<EncryptCipherDomainId, Reference<BlobCipherKey>>* cipherKeys_,
-	                           EncryptionAtRestMode encryptMode)
+	                           const VectorRef<MutationRef>& mutations_)
 	  : spanContext(spanContext_), dbgid(resolverData_.dbgid), arena(resolverData_.arena), mutations(mutations_),
-	    cipherKeys(cipherKeys_), encryptMode(encryptMode), txnStateStore(resolverData_.txnStateStore),
-	    toCommit(resolverData_.toCommit), confChange(resolverData_.confChanges), logSystem(resolverData_.logSystem),
-	    popVersion(resolverData_.popVersion), keyInfo(resolverData_.keyInfo), storageCache(resolverData_.storageCache),
+	    txnStateStore(resolverData_.txnStateStore), toCommit(resolverData_.toCommit),
+	    confChange(resolverData_.confChanges), logSystem(resolverData_.logSystem), popVersion(resolverData_.popVersion),
+	    keyInfo(resolverData_.keyInfo), storageCache(resolverData_.storageCache),
 	    initialCommit(resolverData_.initialCommit), forResolver(true),
-	    accumulativeChecksumIndex(resolverAccumulativeChecksumIndex), epoch(Optional<LogEpoch>()) {
-		if (encryptMode.isEncryptionEnabled()) {
-			ASSERT(cipherKeys != nullptr);
-			ASSERT(cipherKeys->contains(SYSTEM_KEYSPACE_ENCRYPT_DOMAIN_ID));
-			if (FLOW_KNOBS->ENCRYPT_HEADER_AUTH_TOKEN_ENABLED) {
-				ASSERT(cipherKeys->contains(ENCRYPT_HEADER_DOMAIN_ID));
-			}
-		}
-	}
+	    accumulativeChecksumIndex(resolverAccumulativeChecksumIndex), epoch(Optional<LogEpoch>()) {}
 
 private:
 	// The following variables are incoming parameters
@@ -139,9 +117,6 @@ private:
 	// non-null if these mutations were part of a new commit handled by this commit proxy
 	LogPushData* toCommit = nullptr;
 
-	// Cipher keys used to encrypt to be committed mutations
-	const std::unordered_map<EncryptCipherDomainId, Reference<BlobCipherKey>>* cipherKeys = nullptr;
-
 	// Flag indicates if the configure is changed
 	bool& confChange;
 
@@ -150,7 +125,6 @@ private:
 	Version popVersion = 0;
 	KeyRangeMap<std::set<Key>>* vecBackupKeys = nullptr;
 	KeyRangeMap<ServerCacheInfo>* keyInfo = nullptr;
-	KeyRangeMap<bool>* cacheInfo = nullptr;
 	std::map<Key, ApplyMutationsData>* uid_applyMutationsData = nullptr;
 	PublicRequestStream<CommitTransactionRequest> commit = PublicRequestStream<CommitTransactionRequest>();
 	Database cx = Database();
@@ -158,11 +132,6 @@ private:
 	std::map<UID, Reference<StorageInfo>>* storageCache = nullptr;
 	std::map<Tag, Version>* tag_popped = nullptr;
 	std::unordered_map<UID, StorageServerInterface>* tssMapping = nullptr;
-
-	std::map<int64_t, TenantName>* tenantMap = nullptr;
-	std::unordered_map<TenantName, int64_t>* tenantNameIndex = nullptr;
-	std::set<int64_t>* lockedTenants = nullptr;
-	EncryptionAtRestMode encryptMode;
 
 	// true if the mutations were already written to the txnStateStore as part of recovery
 	bool initialCommit = false;
@@ -183,8 +152,6 @@ private:
 private:
 	// The following variables are used internally
 
-	std::map<KeyRef, MutationRef> cachedRangeInfo;
-
 	// Testing Storage Server removal (clearing serverTagKey) needs to read tss server list value to determine it is a
 	// tss + find partner's tag to send the private mutation. Since the removeStorageServer transaction clears both the
 	// storage list and server tag, we have to enforce ordering, processing the server tag first, and postpone the
@@ -201,17 +168,7 @@ private:
 	bool dummyConfChange = false;
 
 private:
-	void writeMutation(const MutationRef& m) {
-		if (!encryptMode.isEncryptionEnabled()) {
-			toCommit->writeTypedMessage(m);
-		} else {
-			ASSERT(cipherKeys != nullptr);
-			Arena arena;
-			CODE_PROBE(!forResolver, "encrypting metadata mutations", probe::decoration::rare);
-			CODE_PROBE(forResolver, "encrypting resolver mutations", probe::decoration::rare);
-			toCommit->writeTypedMessage(m.encryptMetadata(*cipherKeys, arena, BlobCipherMetrics::TLOG));
-		}
-	}
+	void writeMutation(const MutationRef& m) { toCommit->writeTypedMessage(m); }
 
 	void checkSetRangeLockPrefix(const MutationRef& m) {
 		if (!m.param1.startsWith(rangeLockPrefix)) {
@@ -219,8 +176,7 @@ private:
 		} else if (rangeLock == nullptr) {
 			TraceEvent(SevWarnAlways, "MutationHasRangeLockPrefixButFeatureIsOff")
 			    .detail("Mutation", m.toString())
-			    .detail("FeatureFlag", SERVER_KNOBS->ENABLE_READ_LOCK_ON_RANGE)
-			    .detail("Encription", encryptMode.isEncryptionEnabled());
+			    .detail("FeatureFlag", SERVER_KNOBS->ENABLE_READ_LOCK_ON_RANGE);
 			return;
 		}
 		ASSERT(!initialCommit);
@@ -369,50 +325,6 @@ private:
 				}
 			}
 		}
-	}
-
-	void checkSetStorageCachePrefix(MutationRef m) {
-		if (!m.param1.startsWith(storageCachePrefix))
-			return;
-		if (cacheInfo || forResolver) {
-			KeyRef k = m.param1.removePrefix(storageCachePrefix);
-
-			// Create a private mutation for storage servers
-			// This is done to make the storage servers aware of the cached key-ranges
-			if (toCommit) {
-				MutationRef privatized = m;
-				privatized.clearChecksumAndAccumulativeIndex();
-				privatized.param1 = m.param1.withPrefix(systemKeys.begin, arena);
-				//TraceEvent(SevDebug, "SendingPrivateMutation", dbgid).detail("Original", m.toString()).detail("Privatized", privatized.toString());
-				cachedRangeInfo[k] = privatized;
-			}
-			if (cacheInfo && k != allKeys.end) {
-				KeyRef end = cacheInfo->rangeContaining(k).end();
-				std::vector<uint16_t> serverIndices;
-				decodeStorageCacheValue(m.param2, serverIndices);
-				cacheInfo->insert(KeyRangeRef(k, end), serverIndices.size() > 0);
-			}
-		}
-		if (!initialCommit)
-			txnStateStore->set(KeyValueRef(m.param1, m.param2));
-	}
-
-	void checkSetCacheKeysPrefix(MutationRef m) {
-		if (!m.param1.startsWith(cacheKeysPrefix) || toCommit == nullptr) {
-			return;
-		}
-		// Create a private mutation for cache servers
-		// This is done to make the cache servers aware of the cached key-ranges
-		MutationRef privatized = m;
-		privatized.clearChecksumAndAccumulativeIndex();
-		privatized.param1 = m.param1.withPrefix(systemKeys.begin, arena);
-		TraceEvent(SevDebug, "SendingPrivatized_CacheTag", dbgid).detail("M", privatized);
-		if (acsBuilder != nullptr) {
-			updateMutationWithAcsAndAddMutationToAcsBuilder(
-			    acsBuilder, privatized, cacheTag, accumulativeChecksumIndex, epoch.get(), version, dbgid);
-		}
-		toCommit->addTag(cacheTag);
-		writeMutation(privatized);
 	}
 
 	void checkSetConfigKeys(MutationRef m) {
@@ -584,7 +496,6 @@ private:
 		    commit,
 		    committedVersion,
 		    p.keyVersion,
-		    tenantMap,
 		    provisionalCommitProxy);
 	}
 
@@ -641,46 +552,6 @@ private:
 		    .detail("LogRangeEnd", logRangeEnd);
 	}
 
-	void checkSetConstructKeys(MutationRef m) {
-		if (!SERVER_KNOBS->GENERATE_DATA_ENABLED) {
-			return;
-		}
-		if (!m.param1.startsWith(globalKeysPrefix)) {
-			return;
-		}
-		if (!toCommit) {
-			return;
-		}
-
-		if (m.param1.startsWith(constructDataKey)) {
-			uint64_t valSize, keyCount, seed;
-			Standalone<StringRef> prefix;
-			std::tie(prefix, valSize, keyCount, seed) = decodeConstructKeys(m.param2);
-			if (prefix.size() == 0 || keyCount >= UINT16_MAX || valSize >= CLIENT_KNOBS->VALUE_SIZE_LIMIT) {
-				return;
-			}
-			uint8_t keyBuf[prefix.size() + sizeof(uint16_t)];
-			uint8_t* keyPos = prefix.copyTo(keyBuf);
-			*keyPos = '\xff';
-			StringRef keyEnd(keyBuf, keyPos - keyBuf + 1);
-			std::set<Tag> allTags;
-			for (auto it : keyInfo->intersectingRanges(KeyRangeRef(prefix, keyEnd))) {
-				auto& r = it.value();
-				for (auto info : r.src_info) {
-					allTags.insert(info->tag);
-				}
-				for (auto info : r.dest_info) {
-					allTags.insert(info->tag);
-				}
-			}
-			toCommit->addTags(allTags);
-			TraceEvent(SevInfo, "ConstructDataRequest")
-			    .detail("Prefix", prefix)
-			    .detail("KeyCount", keyCount)
-			    .detail("ValSize", valSize);
-		}
-	}
-
 	void checkSetGlobalKeys(MutationRef m) {
 		if (!m.param1.startsWith(globalKeysPrefix)) {
 			return;
@@ -705,7 +576,6 @@ private:
 				allTags.insert(decodeServerTagValue(kv.value));
 			}
 		}
-		allTags.insert(cacheTag);
 
 		if (m.param1 == lastEpochEndKey) {
 			toCommit->addTags(allTags);
@@ -809,109 +679,6 @@ private:
 		if (!initialCommit)
 			txnStateStore->set(KeyValueRef(m.param1, m.param2));
 		CODE_PROBE(true, "Snapshot created, setting writeRecoveryKey in txnStateStore", probe::decoration::rare);
-	}
-
-	void checkSetTenantMapPrefix(MutationRef m) {
-		KeyRef prefix = TenantMetadata::tenantMap().subspace.begin;
-		if (m.param1.startsWith(prefix)) {
-			TenantMapEntry tenantEntry;
-			if (initialCommit) {
-				CODE_PROBE(true, "Recovering tenant from txn state store");
-				TenantMapEntryTxnStateStore txnStateStoreEntry = TenantMapEntryTxnStateStore::decode(m.param2);
-				tenantEntry.setId(txnStateStoreEntry.id);
-				tenantEntry.tenantName = txnStateStoreEntry.tenantName;
-				tenantEntry.tenantLockState = txnStateStoreEntry.tenantLockState;
-			} else {
-				tenantEntry = TenantMapEntry::decode(m.param2);
-			}
-
-			if (tenantMap) {
-				ASSERT(version != invalidVersion);
-
-				TraceEvent("CommitProxyInsertTenant", dbgid)
-				    .detail("Tenant", tenantEntry.tenantName)
-				    .detail("Id", tenantEntry.id)
-				    .detail("Version", version);
-
-				(*tenantMap)[tenantEntry.id] = tenantEntry.tenantName;
-				if (tenantNameIndex) {
-					(*tenantNameIndex)[tenantEntry.tenantName] = tenantEntry.id;
-				}
-			}
-			if (lockedTenants) {
-				if (tenantEntry.tenantLockState == TenantAPI::TenantLockState::UNLOCKED) {
-					CODE_PROBE(true, "ApplyMetadataMutation unlock tenant");
-					lockedTenants->erase(tenantEntry.id);
-				} else {
-					CODE_PROBE(true, "ApplyMetadataMutation lock tenant");
-					lockedTenants->insert(tenantEntry.id);
-				}
-			}
-
-			if (!initialCommit) {
-				txnStateStore->set(KeyValueRef(m.param1, tenantEntry.toTxnStateStoreEntry().encode()));
-			}
-
-			// For now, this goes to all storage servers.
-			// Eventually, we can have each SS store tenants that apply only to the data stored on it.
-			if (toCommit) {
-				std::set<Tag> allTags;
-				auto allServers = txnStateStore->readRange(serverTagKeys).get();
-				for (auto& kv : allServers) {
-					allTags.insert(decodeServerTagValue(kv.value));
-				}
-
-				toCommit->addTags(allTags);
-
-				MutationRef privatized = m;
-				privatized.clearChecksumAndAccumulativeIndex();
-				privatized.param1 = m.param1.withPrefix(systemKeys.begin, arena);
-
-				if (acsBuilder != nullptr) {
-					updateMutationWithAcsAndAddMutationToAcsBuilder(
-					    acsBuilder, privatized, allTags, accumulativeChecksumIndex, epoch.get(), version, dbgid);
-				}
-				writeMutation(privatized);
-			}
-
-			CODE_PROBE(true, "Tenant added to map");
-		}
-	}
-
-	template <bool Versioned>
-	void reportMetaclusterRegistration(ValueRef value) {
-		MetaclusterRegistrationEntryImpl<Versioned> entry = MetaclusterRegistrationEntryImpl<Versioned>::decode(value);
-
-		TraceEvent("SetMetaclusterRegistration", dbgid)
-		    .detail("ClusterType", entry.clusterType)
-		    .detail("MetaclusterID", entry.metaclusterId)
-		    .detail("MetaclusterName", entry.metaclusterName)
-		    .detail("ClusterID", entry.id)
-		    .detail("ClusterName", entry.name)
-		    .detail("MetaclusterVersion", entry.version);
-	}
-
-	void checkSetMetaclusterRegistration(MutationRef m) {
-		if (m.param1 == metacluster::metadata::metaclusterRegistration().key) {
-			if (MetaclusterRegistrationEntry::allowUnsupportedRegistrationWrites) {
-				reportMetaclusterRegistration<false>(m.param2);
-			} else {
-				CODE_PROBE(true, "Writing metacluster registration with version validation");
-				reportMetaclusterRegistration<true>(m.param2);
-			}
-
-			Optional<Value> value =
-			    txnStateStore->readValue(metacluster::metadata::unversionedMetaclusterRegistration().key).get();
-			if (!initialCommit) {
-				txnStateStore->set(KeyValueRef(m.param1, m.param2));
-			}
-
-			if (!value.present() || value.get() != m.param2) {
-				confChange = true;
-			}
-
-			CODE_PROBE(true, "Metacluster registration set");
-		}
 	}
 
 	void checkClearRangeLockPrefix(KeyRangeRef range) {
@@ -1318,103 +1085,6 @@ private:
 		confChange = true;
 	}
 
-	void checkClearTenantMapPrefix(KeyRangeRef range) {
-		KeyRangeRef subspace = TenantMetadata::tenantMap().subspace;
-		if (subspace.intersects(range)) {
-			if (tenantMap && tenantNameIndex) {
-				ASSERT(version != invalidVersion);
-
-				Optional<int64_t> startId = 0;
-				Optional<int64_t> endId;
-
-				if (range.begin > subspace.begin) {
-					startId = TenantIdCodec::lowerBound(range.begin.removePrefix(subspace.begin));
-				}
-				if (range.end.startsWith(subspace.begin)) {
-					endId = TenantIdCodec::lowerBound(range.end.removePrefix(subspace.begin));
-				}
-
-				TraceEvent("CommitProxyEraseTenants", dbgid)
-				    .detail("BeginTenant", startId)
-				    .detail("EndTenant", endId)
-				    .detail("Version", version);
-
-				auto startItr = startId.present() ? tenantMap->lower_bound(startId.get()) : tenantMap->end();
-				auto endItr = endId.present() ? tenantMap->lower_bound(endId.get()) : tenantMap->end();
-
-				auto itr = startItr;
-				while (itr != endItr) {
-					tenantNameIndex->erase(itr->second);
-					itr++;
-				}
-
-				tenantMap->erase(startItr, endItr);
-
-				if (lockedTenants) {
-					auto startItr = startId.present()
-					                    ? std::lower_bound(lockedTenants->begin(), lockedTenants->end(), startId.get())
-					                    : lockedTenants->end();
-					auto endItr = endId.present()
-					                  ? std::lower_bound(lockedTenants->begin(), lockedTenants->end(), endId.get())
-					                  : lockedTenants->end();
-					CODE_PROBE(startItr != endItr, "Deleting locked tenant");
-					lockedTenants->erase(startItr, endItr);
-				}
-			}
-
-			if (!initialCommit) {
-				txnStateStore->clear(range);
-			}
-
-			// For now, this goes to all storage servers.
-			// Eventually, we can have each SS store tenants that apply only to the data stored on it.
-			if (toCommit) {
-				std::set<Tag> allTags;
-				auto allServers = txnStateStore->readRange(serverTagKeys).get();
-				for (auto& kv : allServers) {
-					allTags.insert(decodeServerTagValue(kv.value));
-				}
-
-				toCommit->addTags(allTags);
-
-				MutationRef privatized;
-				privatized.clearChecksumAndAccumulativeIndex();
-				privatized.type = MutationRef::ClearRange;
-				privatized.param1 = systemKeys.begin.withSuffix(std::max(range.begin, subspace.begin), arena);
-				if (range.end < subspace.end) {
-					privatized.param2 = systemKeys.begin.withSuffix(range.end, arena);
-				} else {
-					privatized.param2 = systemKeys.begin.withSuffix(subspace.begin).withSuffix("\xff\xff"_sr, arena);
-				}
-				if (acsBuilder != nullptr) {
-					updateMutationWithAcsAndAddMutationToAcsBuilder(
-					    acsBuilder, privatized, allTags, accumulativeChecksumIndex, epoch.get(), version, dbgid);
-				}
-				writeMutation(privatized);
-			}
-
-			CODE_PROBE(true, "Tenant cleared from map");
-		}
-	}
-
-	void checkClearMetaclusterRegistration(KeyRangeRef range) {
-		if (range.contains(metacluster::metadata::metaclusterRegistration().key)) {
-			TraceEvent("ClearMetaclusterRegistration", dbgid);
-
-			Optional<Value> value =
-			    txnStateStore->readValue(metacluster::metadata::metaclusterRegistration().key).get();
-			if (!initialCommit) {
-				txnStateStore->clear(singleKeyRange(metacluster::metadata::metaclusterRegistration().key));
-			}
-
-			if (value.present()) {
-				confChange = true;
-			}
-
-			CODE_PROBE(true, "Metacluster registration cleared");
-		}
-	}
-
 	void checkClearMiscRangeKeys(KeyRangeRef range) {
 		if (initialCommit) {
 			return;
@@ -1442,85 +1112,6 @@ private:
 		}
 	}
 
-	// If we accumulated private mutations for cached key-ranges, we also need to
-	// tag them with the relevant storage servers. This is done to make the storage
-	// servers aware of the cached key-ranges
-	// NOTE: we are assuming non-colliding cached key-ranges
-
-	// TODO Note that, we are currently not handling the case when cached key-ranges move out
-	// to different storage servers. This would require some checking when keys in the keyServersPrefix change.
-	// For the first implementation, we could just send the entire map to every storage server. Revisit!
-	void tagStorageServersForCachedKeyRanges() {
-		if (cachedRangeInfo.size() == 0 || !toCommit) {
-			return;
-		}
-
-		std::map<KeyRef, MutationRef>::iterator itr;
-		KeyRef keyBegin, keyEnd;
-		std::vector<uint16_t> serverIndices;
-		MutationRef mutationBegin, mutationEnd;
-
-		for (itr = cachedRangeInfo.begin(); itr != cachedRangeInfo.end(); ++itr) {
-			// first figure out the begin and end keys for the cached-range,
-			// the begin and end mutations can be in any order
-			decodeStorageCacheValue(itr->second.param2, serverIndices);
-			// serverIndices count should be greater than zero for beginKey mutations
-			if (serverIndices.size() > 0) {
-				keyBegin = itr->first;
-				mutationBegin = itr->second;
-				++itr;
-				if (itr != cachedRangeInfo.end()) {
-					keyEnd = itr->first;
-					mutationEnd = itr->second;
-				} else {
-					//TraceEvent(SevDebug, "EndKeyNotFound", dbgid).detail("KeyBegin", keyBegin.toString());
-					break;
-				}
-			} else {
-				keyEnd = itr->first;
-				mutationEnd = itr->second;
-				++itr;
-				if (itr != cachedRangeInfo.end()) {
-					keyBegin = itr->first;
-					mutationBegin = itr->second;
-				} else {
-					//TraceEvent(SevDebug, "BeginKeyNotFound", dbgid).detail("KeyEnd", keyEnd.toString());
-					break;
-				}
-			}
-
-			// Now get all the storage server tags for the cached key-ranges
-			std::set<Tag> allTags;
-			auto ranges = keyInfo->intersectingRanges(KeyRangeRef(keyBegin, keyEnd));
-			for (auto it : ranges) {
-				auto& r = it.value();
-				for (auto info : r.src_info) {
-					allTags.insert(info->tag);
-				}
-				for (auto info : r.dest_info) {
-					allTags.insert(info->tag);
-				}
-			}
-
-			// Add the tags to both begin and end mutations
-			TraceEvent(SevDebug, "SendingPrivatized_CachedKeyRange", dbgid)
-			    .detail("MBegin", mutationBegin)
-			    .detail("MEnd", mutationEnd);
-			if (acsBuilder != nullptr) {
-				updateMutationWithAcsAndAddMutationToAcsBuilder(
-				    acsBuilder, mutationBegin, allTags, accumulativeChecksumIndex, epoch.get(), version, dbgid);
-			}
-			toCommit->addTags(allTags);
-			writeMutation(mutationBegin);
-			if (acsBuilder != nullptr) {
-				updateMutationWithAcsAndAddMutationToAcsBuilder(
-				    acsBuilder, mutationEnd, allTags, accumulativeChecksumIndex, epoch.get(), version, dbgid);
-			}
-			toCommit->addTags(allTags);
-			writeMutation(mutationEnd);
-		}
-	}
-
 public:
 	void apply() {
 		for (auto const& m : mutations) {
@@ -1534,8 +1125,6 @@ public:
 				checkSetServerKeysPrefix(m);
 				checkSetCheckpointKeys(m);
 				checkSetServerTagsPrefix(m);
-				checkSetStorageCachePrefix(m);
-				checkSetCacheKeysPrefix(m);
 				checkSetConfigKeys(m);
 				checkSetServerListPrefix(m);
 				checkSetTSSMappingKeys(m);
@@ -1543,13 +1132,10 @@ public:
 				checkSetApplyMutationsEndRange(m);
 				checkSetApplyMutationsKeyVersionMapRange(m);
 				checkSetLogRangesRange(m);
-				checkSetConstructKeys(m);
 				checkSetGlobalKeys(m);
 				checkSetWriteRecoverKey(m);
 				checkSetMinRequiredCommitVersionKey(m);
 				checkSetVersionEpochKey(m);
-				checkSetTenantMapPrefix(m);
-				checkSetMetaclusterRegistration(m);
 				checkSetOtherKeys(m);
 			} else if (m.type == MutationRef::ClearRange && isSystemKey(m.param2)) {
 				KeyRangeRef range(m.param1, m.param2);
@@ -1567,8 +1153,6 @@ public:
 				checkClearTssMappingKeys(m, range);
 				checkClearTssQuarantineKeys(m, range);
 				checkClearVersionEpochKeys(m, range);
-				checkClearTenantMapPrefix(range);
-				checkClearMetaclusterRegistration(range);
 				checkClearMiscRangeKeys(range);
 			}
 		}
@@ -1583,8 +1167,6 @@ public:
 			    decodeServerListValue(txnStateStore->readValue(serverListKeyFor(tssPair.second)).get().get());
 			(*tssMapping)[tssPair.first] = tssi;
 		}
-
-		tagStorageServersForCachedKeyRanges();
 	}
 };
 
@@ -1596,8 +1178,6 @@ void applyMetadataMutations(SpanContext const& spanContext,
                             Reference<ILogSystem> logSystem,
                             const VectorRef<MutationRef>& mutations,
                             LogPushData* toCommit,
-                            const std::unordered_map<EncryptCipherDomainId, Reference<BlobCipherKey>>* pCipherKeys,
-                            EncryptionAtRestMode encryptMode,
                             bool& confChange,
                             Version version,
                             Version popVersion,
@@ -1609,8 +1189,6 @@ void applyMetadataMutations(SpanContext const& spanContext,
 	                           proxyCommitData,
 	                           logSystem,
 	                           toCommit,
-	                           pCipherKeys,
-	                           encryptMode,
 	                           confChange,
 	                           version,
 	                           popVersion,
@@ -1621,10 +1199,8 @@ void applyMetadataMutations(SpanContext const& spanContext,
 
 void applyMetadataMutations(SpanContext const& spanContext,
                             ResolverData& resolverData,
-                            const VectorRef<MutationRef>& mutations,
-                            const std::unordered_map<EncryptCipherDomainId, Reference<BlobCipherKey>>* pCipherKeys,
-                            EncryptionAtRestMode encryptMode) {
-	ApplyMetadataMutationsImpl(spanContext, resolverData, mutations, pCipherKeys, encryptMode).apply();
+                            const VectorRef<MutationRef>& mutations) {
+	ApplyMetadataMutationsImpl(spanContext, resolverData, mutations).apply();
 }
 
 void applyMetadataMutations(SpanContext const& spanContext,
@@ -1633,4 +1209,34 @@ void applyMetadataMutations(SpanContext const& spanContext,
                             const VectorRef<MutationRef>& mutations,
                             IKeyValueStore* txnStateStore) {
 	ApplyMetadataMutationsImpl(spanContext, dbgid, arena, mutations, txnStateStore).apply();
+}
+
+bool containsMetadataMutation(const VectorRef<MutationRef>& mutations) {
+	for (auto const& m : mutations) {
+		if (m.type == MutationRef::SetValue && isSystemKey(m.param1)) {
+			if (m.param1.startsWith(globalKeysPrefix) || (m.param1.startsWith(configKeysPrefix)) ||
+			    (m.param1.startsWith(serverListPrefix)) || (m.param1.startsWith(serverTagPrefix)) ||
+			    (m.param1.startsWith(tssMappingKeys.begin)) || (m.param1.startsWith(tssQuarantineKeys.begin)) ||
+			    (m.param1.startsWith(applyMutationsEndRange.begin)) ||
+			    (m.param1.startsWith(applyMutationsKeyVersionMapRange.begin)) ||
+			    (m.param1.startsWith(logRangesRange.begin)) || (m.param1.startsWith(serverKeysPrefix)) ||
+			    (m.param1.startsWith(keyServersPrefix))) {
+				return true;
+			}
+		} else if (m.type == MutationRef::ClearRange && isSystemKey(m.param2)) {
+			KeyRangeRef range(m.param1, m.param2);
+			if ((keyServersKeys.intersects(range)) || (configKeys.intersects(range)) ||
+			    (serverListKeys.intersects(range)) || (tagLocalityListKeys.intersects(range)) ||
+			    (serverTagKeys.intersects(range)) || (serverTagHistoryKeys.intersects(range)) ||
+			    (range.intersects(applyMutationsEndRange)) || (range.intersects(applyMutationsKeyVersionMapRange)) ||
+			    (range.intersects(logRangesRange)) || (tssMappingKeys.intersects(range)) ||
+			    (tssQuarantineKeys.intersects(range)) || (range.contains(previousCoordinatorsKey)) ||
+			    (range.contains(coordinatorsKey)) || (range.contains(databaseLockedKey)) ||
+			    (range.contains(metadataVersionKey)) || (range.contains(mustContainSystemMutationsKey)) ||
+			    (range.contains(writeRecoveryKey)) || (range.intersects(testOnlyTxnStateStorePrefixRange))) {
+				return true;
+			}
+		}
+	}
+	return false;
 }

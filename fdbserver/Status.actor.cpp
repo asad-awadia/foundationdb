@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@
  */
 
 #include <cinttypes>
-#include "fdbclient/EncryptKeyProxyInterface.h"
 #include "fdbclient/json_spirit/json_spirit_value.h"
 #include "flow/genericactors.actor.h"
 #include "fmt/format.h"
@@ -29,7 +28,6 @@
 #include "flow/ITrace.h"
 #include "flow/ProtocolVersion.h"
 #include "flow/Trace.h"
-#include "fdbclient/MetaclusterRegistration.h"
 #include "fdbclient/NativeAPI.actor.h"
 #include "fdbclient/SystemData.h"
 #include "fdbclient/ReadYourWrites.h"
@@ -848,10 +846,6 @@ ACTOR static Future<JsonBuilderObject> processStatusFetcher(
 
 	if (db->get().consistencyScan.present()) {
 		roles.addRole("consistency_scan", db->get().consistencyScan.get());
-	}
-
-	if (db->get().client.encryptKeyProxy.present()) {
-		roles.addRole("encrypt_key_proxy", db->get().client.encryptKeyProxy.get());
 	}
 
 	for (auto& tLogSet : db->get().logSystemConfig.tLogs) {
@@ -2123,7 +2117,6 @@ ACTOR static Future<JsonBuilderObject> workloadStatusFetcher(
     WorkerDetails rkWorker,
     JsonBuilderObject* qos,
     JsonBuilderObject* data_overlay,
-    JsonBuilderObject* tenants,
     std::set<std::string>* incomplete_reasons,
     Future<ErrorOr<std::vector<StorageServerStatusInfo>>> storageServerFuture) {
 	state JsonBuilderObject statusObj;
@@ -2205,10 +2198,6 @@ ACTOR static Future<JsonBuilderObject> workloadStatusFetcher(
 		transactions["committed"] = txnCommitOutSuccess.getStatus();
 
 		statusObj["transactions"] = transactions;
-
-		if (commitProxyStats.size() > 0) {
-			(*tenants)["num_tenants"] = commitProxyStats[0].getUint64("NumTenants");
-		}
 	} catch (Error& e) {
 		if (e.code() == error_code_actor_cancelled)
 			throw;
@@ -2843,27 +2832,6 @@ ACTOR Future<std::pair<Optional<StorageWiggleMetrics>, Optional<StorageWiggleMet
 	}
 }
 
-ACTOR Future<KMSHealthStatus> getKMSHealthStatus(Reference<const AsyncVar<ServerDBInfo>> db) {
-	state KMSHealthStatus unhealthy;
-	unhealthy.canConnectToEKP = false;
-	unhealthy.canConnectToKms = false;
-	unhealthy.lastUpdatedTS = now();
-	try {
-		if (!db->get().client.encryptKeyProxy.present()) {
-			return unhealthy;
-		}
-		KMSHealthStatus reply = wait(timeoutError(
-		    db->get().client.encryptKeyProxy.get().getHealthStatus.getReply(EncryptKeyProxyHealthStatusRequest()),
-		    FLOW_KNOBS->EKP_HEALTH_CHECK_REQUEST_TIMEOUT));
-		return reply;
-	} catch (Error& e) {
-		if (e.code() != error_code_timed_out) {
-			throw;
-		}
-		return unhealthy;
-	}
-}
-
 // read storageWigglerStats through Read-only tx, then convert it to JSON field
 ACTOR Future<JsonBuilderObject> storageWigglerStatsFetcher(Optional<DataDistributorInterface> ddWorker,
                                                            DatabaseConfiguration conf,
@@ -2928,9 +2896,6 @@ ACTOR Future<StatusReply> clusterGetStatus(
     Version datacenterVersionDifference,
     Version dcLogServerVersionDifference,
     Version dcStorageServerVersionDifference,
-    ConfigBroadcaster const* configBroadcaster,
-    Optional<UnversionedMetaclusterRegistrationEntry> metaclusterRegistration,
-    metacluster::MetaclusterMetrics metaclusterMetrics,
     std::unordered_map<NetworkAddress, double> excludedDegradedServers) {
 
 	state double tStart = timer();
@@ -2946,34 +2911,6 @@ ACTOR Future<StatusReply> clusterGetStatus(
 	try {
 
 		state JsonBuilderObject statusObj;
-
-		// Get EKP Health
-		if (db->get().client.encryptKeyProxy.present()) {
-			KMSHealthStatus status = wait(getKMSHealthStatus(db));
-
-			// encryption-at-rest status
-			JsonBuilderObject earStatusObj;
-			earStatusObj["ekp_is_healthy"] = status.canConnectToEKP;
-			statusObj["encryption_at_rest"] = earStatusObj;
-
-			JsonBuilderObject kmsStatusObj;
-			kmsStatusObj["kms_is_healthy"] = status.canConnectToKms;
-			if (status.canConnectToEKP) {
-				kmsStatusObj["kms_connector_type"] = status.kmsConnectorType;
-				kmsStatusObj["kms_stable"] = status.kmsStable;
-				JsonBuilderArray kmsUrlsArr;
-				for (const auto& url : status.restKMSUrls) {
-					kmsUrlsArr.push_back(url);
-				}
-				kmsStatusObj["kms_urls"] = kmsUrlsArr;
-			}
-			statusObj["kms"] = kmsStatusObj;
-
-			// TODO: In this scenario we should see if we can fetch any status fields that don't depend on encryption
-			if (!status.canConnectToKms || !status.canConnectToEKP) {
-				return StatusReply(statusObj.getJson());
-			}
-		}
 
 		// Get the master Worker interface
 		Optional<WorkerDetails> _mWorker = getWorker(workers, db->get().master.address());
@@ -3116,7 +3053,6 @@ ACTOR Future<StatusReply> clusterGetStatus(
 
 		state JsonBuilderObject qos;
 		state JsonBuilderObject dataOverlay;
-		state JsonBuilderObject tenants;
 		state JsonBuilderObject metacluster;
 		state JsonBuilderObject storageWiggler;
 		state std::unordered_set<UID> wiggleServers;
@@ -3203,15 +3139,8 @@ ACTOR Future<StatusReply> clusterGetStatus(
 			state Future<Optional<Value>> primaryDCFO = getActivePrimaryDC(cx, &fullyReplicatedRegions, &messages);
 			state std::vector<Future<JsonBuilderObject>> futures2;
 			futures2.push_back(dataStatusFetcher(ddWorker, configuration.get(), &minStorageReplicasRemaining));
-			futures2.push_back(workloadStatusFetcher(db,
-			                                         workers,
-			                                         mWorker,
-			                                         rkWorker,
-			                                         &qos,
-			                                         &dataOverlay,
-			                                         &tenants,
-			                                         &status_incomplete_reasons,
-			                                         storageServerFuture));
+			futures2.push_back(workloadStatusFetcher(
+			    db, workers, mWorker, rkWorker, &qos, &dataOverlay, &status_incomplete_reasons, storageServerFuture));
 			futures2.push_back(layerStatusFetcher(cx, &messages, &status_incomplete_reasons));
 			futures2.push_back(lockedStatusFetcher(cx, &messages, &status_incomplete_reasons));
 			futures2.push_back(
@@ -3291,43 +3220,9 @@ ACTOR Future<StatusReply> clusterGetStatus(
 				statusObj["workload"] = workerStatuses[1];
 
 			statusObj["layers"] = workerStatuses[2];
-			if (configBroadcaster) {
-				// TODO: Read from coordinators for more up-to-date config database status?
-				statusObj["configuration_database"] = configBroadcaster->getStatus();
-			}
-
 			// Add qos section if it was populated
 			if (!qos.empty())
 				statusObj["qos"] = qos;
-
-			// Metacluster metadata
-			if (metaclusterRegistration.present()) {
-				metacluster["cluster_type"] = clusterTypeToString(metaclusterRegistration.get().clusterType);
-				metacluster["metacluster_name"] = metaclusterRegistration.get().metaclusterName;
-				metacluster["metacluster_id"] = metaclusterRegistration.get().metaclusterId.toString();
-				if (metaclusterRegistration.get().clusterType == ClusterType::METACLUSTER_DATA) {
-					metacluster["data_cluster_name"] = metaclusterRegistration.get().name;
-					metacluster["data_cluster_id"] = metaclusterRegistration.get().id.toString();
-				} else if (!metaclusterMetrics.error.present()) { // clusterType == ClusterType::METACLUSTER_MANAGEMENT
-					metacluster["num_data_clusters"] = metaclusterMetrics.numDataClusters;
-					tenants["num_tenants"] = metaclusterMetrics.numTenants;
-					tenants["tenant_group_capacity"] = metaclusterMetrics.tenantGroupCapacity;
-					tenants["tenant_groups_allocated"] = metaclusterMetrics.tenantGroupsAllocated;
-				} else {
-					CODE_PROBE(true, "Failed to fetch metacluster metrics", probe::decoration::rare);
-					messages.push_back(JsonString::makeMessage(
-					    "metacluster_metrics_missing",
-					    fmt::format("Failed to fetch metacluster metrics: {}.", metaclusterMetrics.error.get())
-					        .c_str()));
-				}
-
-			} else {
-				metacluster["cluster_type"] = clusterTypeToString(ClusterType::STANDALONE);
-			}
-			statusObj["metacluster"] = metacluster;
-
-			if (!tenants.empty())
-				statusObj["tenants"] = tenants;
 
 			statusObj["version_epoch"] = versionEpochStatus;
 

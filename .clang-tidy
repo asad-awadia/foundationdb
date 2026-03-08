@@ -1,0 +1,8 @@
+---
+Checks: >
+  -*,
+  bugprone-sizeof-expression,
+  bugprone-suspicious-string-compare,
+  bugprone-use-after-move,
+  performance-for-range-copy
+...

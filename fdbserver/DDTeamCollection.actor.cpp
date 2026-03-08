@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -2715,7 +2715,6 @@ public:
 			isr.seedTag = invalidTag;
 			isr.reqId = deterministicRandom()->randomUniqueID();
 			isr.interfaceId = interfaceId;
-			isr.encryptMode = self->configuration.encryptionAtRestMode;
 
 			// if tss, wait for pair ss to finish and add its id to isr. If pair fails, don't recruit tss
 			state bool doRecruit = true;
@@ -4853,8 +4852,7 @@ Reference<TCTeamInfo> DDTeamCollection::buildLargeTeam(int teamSize) {
 	for (auto& it : serverIds) {
 		candidateTeam.push_back(server_info[it]);
 	}
-	Optional<Reference<TCTenantInfo>> no_tenant = {};
-	auto teamInfo = makeReference<TCTeamInfo>(candidateTeam, no_tenant);
+	auto teamInfo = makeReference<TCTeamInfo>(candidateTeam);
 	teamInfo->tracker = teamTracker(teamInfo, IsBadTeam::False, IsRedundantTeam::False);
 	largeTeams.push_back(teamInfo);
 	return teamInfo;
@@ -4863,8 +4861,7 @@ Reference<TCTeamInfo> DDTeamCollection::buildLargeTeam(int teamSize) {
 void DDTeamCollection::addTeam(const std::vector<Reference<TCServerInfo>>& newTeamServers,
                                IsInitialTeam isInitialTeam,
                                IsRedundantTeam redundantTeam) {
-	Optional<Reference<TCTenantInfo>> no_tenant = {};
-	auto teamInfo = makeReference<TCTeamInfo>(newTeamServers, no_tenant);
+	auto teamInfo = makeReference<TCTeamInfo>(newTeamServers);
 
 	// Move satisfiesPolicy to the end for performance benefit
 	auto badTeam = IsBadTeam{ redundantTeam || !satisfiesPolicy(teamInfo->getServers()) ||

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -548,6 +548,7 @@ void StorageServerMetrics::getSplitPoints(SplitRangeRequest req, Optional<KeyRef
 	if (prefix.present()) {
 		range = range.withPrefix(prefix.get(), req.arena);
 	}
+
 	std::vector<KeyRef> points = getSplitPoints(range, req.chunkSize, prefix);
 
 	reply.splitPoints.append_deep(reply.splitPoints.arena(), points.data(), points.size());

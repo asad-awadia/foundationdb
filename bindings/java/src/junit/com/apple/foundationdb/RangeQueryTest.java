@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -79,31 +79,6 @@ class RangeQueryTest {
 			@Override
 			public Executor getExecutor() {
 				throw new UnsupportedOperationException("Unimplemented method 'getExecutor'");
-			}
-
-			@Override
-			public Tenant openTenant(Tuple tenantName) {
-				throw new UnsupportedOperationException("Unimplemented method 'openTenant'");
-			}
-
-			@Override
-			public Tenant openTenant(byte[] tenantName, Executor e) {
-				throw new UnsupportedOperationException("Unimplemented method 'openTenant'");
-			}
-
-			@Override
-			public Tenant openTenant(Tuple tenantName, Executor e) {
-				throw new UnsupportedOperationException("Unimplemented method 'openTenant'");
-			}
-
-			@Override
-			public Tenant openTenant(byte[] tenantName, Executor e, EventKeeper eventKeeper) {
-				throw new UnsupportedOperationException("Unimplemented method 'openTenant'");
-			}
-
-			@Override
-			public Tenant openTenant(Tuple tenantName, Executor e, EventKeeper eventKeeper) {
-				throw new UnsupportedOperationException("Unimplemented method 'openTenant'");
 			}
 
 			@Override

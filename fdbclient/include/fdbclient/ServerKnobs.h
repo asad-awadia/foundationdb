@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,10 +20,8 @@
 
 #pragma once
 
-#include "flow/BooleanParam.h"
 #include "flow/Knobs.h"
 #include "flow/swift_support.h"
-#include "fdbrpc/fdbrpc.h"
 #include "fdbrpc/Locality.h"
 #include "fdbclient/ClientKnobs.h"
 
@@ -97,6 +95,7 @@ public:
 	int CONCURRENT_LOG_ROUTER_READS;
 	int LOG_ROUTER_PEEK_FROM_SATELLITES_PREFERRED; // 0==peek from primary, non-zero==peek from satellites
 	double LOG_ROUTER_PEEK_SWITCH_DC_TIME;
+	double LOG_ROUTER_REPLACEMENT_GRACE_PERIOD; // Grace period for replacement log routers to appear in ServerDBInfo
 	double DISK_QUEUE_ADAPTER_MIN_SWITCH_TIME;
 	double DISK_QUEUE_ADAPTER_MAX_SWITCH_TIME;
 	int64_t TLOG_SPILL_REFERENCE_MAX_PEEK_MEMORY_BYTES;
@@ -106,7 +105,6 @@ public:
 	int64_t DISK_QUEUE_FILE_SHRINK_BYTES; // When we shrink the disk queue, by how many bytes should it shrink?
 	int64_t DISK_QUEUE_MAX_TRUNCATE_BYTES; // A truncate larger than this will cause the file to be replaced instead.
 	double TLOG_DEGRADED_DURATION;
-	int64_t MAX_CACHE_VERSIONS;
 	double TXS_POPPED_MAX_DELAY;
 	double TLOG_MAX_CREATE_DURATION;
 	int PEEK_LOGGING_AMOUNT;
@@ -123,6 +121,7 @@ public:
 	double PUSH_STATS_SLOW_AMOUNT;
 	double PUSH_STATS_SLOW_RATIO;
 	int TLOG_POP_BATCH_SIZE;
+	bool ENABLE_TLOG_TEMP_TAG_MESSAGES_RESERVE;
 	double BLOCKING_PEEK_TIMEOUT;
 	bool PEEK_BATCHING_EMPTY_MSG;
 	double PEEK_BATCHING_EMPTY_MSG_INTERVAL;
@@ -346,18 +345,7 @@ public:
 	int DD_STORAGE_WIGGLE_STUCK_THRESHOLD; // How many times bestTeamStuck accumulate will pause storage wiggle
 	int64_t
 	    DD_STORAGE_WIGGLE_MIN_SS_AGE_SEC; // Minimal age of a correct-configured server before it's chosen to be wiggled
-	bool DD_TENANT_AWARENESS_ENABLED;
-	bool STORAGE_QUOTA_ENABLED; // Whether storage quota enforcement for tenant groups and all the relevant storage
-	                            // usage / quota monitors are enabled.
-	int TENANT_CACHE_LIST_REFRESH_INTERVAL; // How often the TenantCache is refreshed
-	int TENANT_CACHE_STORAGE_USAGE_REFRESH_INTERVAL; // How often the storage bytes used by each tenant is refreshed
-	                                                 // in the TenantCache
-	int TENANT_CACHE_STORAGE_QUOTA_REFRESH_INTERVAL; // How often the storage quota allocated to each tenant is
-	                                                 // refreshed in the TenantCache
-	int TENANT_CACHE_STORAGE_USAGE_TRACE_INTERVAL; // The minimum interval between consecutive trace events logging the
-	                                               // storage bytes used by a tenant group
-	int CP_FETCH_TENANTS_OVER_STORAGE_QUOTA_INTERVAL; // How often the commit proxies send requests to the data
-	                                                  // distributor to fetch the list of tenants over storage quota
+
 	bool ENABLE_STORAGE_QUEUE_AWARE_TEAM_SELECTION; // Experimental! Enable to avoid moving data to a team which has a
 	                                                // long storage queue
 	double DD_LONG_STORAGE_QUEUE_TEAM_MAJORITY_PERCENTILE; // p% amount teams which have longer queues (team queue size
@@ -371,6 +359,7 @@ public:
 	int64_t REBALANCE_STORAGE_QUEUE_SHARD_PER_KSEC_MIN;
 	bool DD_ENABLE_REBALANCE_STORAGE_QUEUE_WITH_LIGHT_WRITE_SHARD; // Enable to allow storage queue rebalancer to move
 	                                                               // light-traffic shards out of the overloading server
+
 	double DD_WAIT_TSS_DATA_MOVE_DELAY;
 	bool DD_VALIDATE_SERVER_TEAM_COUNT_AFTER_BUILD_TEAM; // Enable to validate server team count per server after build
 	                                                     // team
@@ -414,6 +403,8 @@ public:
 	double DD_FIX_WRONG_REPLICAS_DELAY; // the amount of time between attempts to increase the replication factor of
 	                                    // under replicated shards
 	int BULKLOAD_FILE_BYTES_MAX; // the maximum bytes of files to inject by bulk loading
+	double BULKLOAD_DOWNLOAD_RETRY_DELAY; // seconds to wait between retries when downloading bulk load files
+	int BULKLOAD_DOWNLOAD_MAX_RETRIES; // maximum number of retries when downloading bulk load files
 	int BULKLOAD_BYTE_SAMPLE_BATCH_KEY_COUNT; // the maximum key count that can be successively sampled when bulkload
 	double DD_BULKLOAD_SHARD_BOUNDARY_CHANGE_DELAY_SEC; // seconds to delay shard boundary change when blocked by bulk
 	                                                    // loading
@@ -519,6 +510,8 @@ public:
 	int64_t ROCKSDB_BLOCK_CACHE_SIZE;
 	double ROCKSDB_CACHE_HIGH_PRI_POOL_RATIO;
 	bool ROCKSDB_CACHE_INDEX_AND_FILTER_BLOCKS;
+	int ROCKSDB_INDEX_BLOCK_RESTART_INTERVAL;
+	int ROCKSDB_INDEX_TYPE;
 	double ROCKSDB_METRICS_DELAY;
 	double ROCKSDB_READ_VALUE_TIMEOUT;
 	double ROCKSDB_READ_VALUE_PREFIX_TIMEOUT;
@@ -595,6 +588,7 @@ public:
 	int ROCKSDB_WAL_RECOVERY_MODE;
 	int ROCKSDB_TARGET_FILE_SIZE_BASE;
 	int ROCKSDB_TARGET_FILE_SIZE_MULTIPLIER;
+	double ROCKSDB_MAX_BYTES_FOR_LEVEL_MULTIPLIER;
 	bool ROCKSDB_USE_DIRECT_READS;
 	bool ROCKSDB_USE_DIRECT_IO_FLUSH_COMPACTION;
 	int ROCKSDB_MAX_OPEN_FILES;
@@ -637,12 +631,15 @@ public:
 	int64_t SHARDED_ROCKSDB_MAX_WRITE_BUFFER_NUMBER;
 	int SHARDED_ROCKSDB_TARGET_FILE_SIZE_BASE;
 	int SHARDED_ROCKSDB_TARGET_FILE_SIZE_MULTIPLIER;
+	double SHARDED_ROCKSDB_MAX_BYTES_FOR_LEVEL_MULTIPLIER;
 	bool SHARDED_ROCKSDB_SUGGEST_COMPACT_CLEAR_RANGE;
 	int SHARDED_ROCKSDB_COMPACT_ON_RANGE_DELETION_THRESHOLD;
 	int SHARDED_ROCKSDB_MAX_BACKGROUND_JOBS;
 	int64_t SHARDED_ROCKSDB_BLOCK_CACHE_SIZE;
 	double SHARDED_ROCKSDB_CACHE_HIGH_PRI_POOL_RATIO;
 	bool SHARDED_ROCKSDB_CACHE_INDEX_AND_FILTER_BLOCKS;
+	int SHARDED_ROCKSDB_INDEX_BLOCK_RESTART_INTERVAL;
+	int SHARDED_ROCKSDB_INDEX_TYPE;
 	int64_t SHARDED_ROCKSDB_WRITE_RATE_LIMITER_BYTES_PER_SEC;
 	int64_t SHARDED_ROCKSDB_RATE_LIMITER_MODE;
 	int SHARDED_ROCKSDB_BACKGROUND_PARALLELISM;
@@ -685,7 +682,7 @@ public:
 	double TAG_THROTTLE_MAX_EMPTY_QUEUE_BUDGET;
 	int START_TRANSACTION_MAX_QUEUE_SIZE;
 	int KEY_LOCATION_MAX_QUEUE_SIZE;
-	int TENANT_ID_REQUEST_MAX_QUEUE_SIZE;
+
 	double COMMIT_PROXY_LIVENESS_TIMEOUT;
 	double COMMIT_PROXY_MAX_LIVENESS_TIMEOUT;
 
@@ -761,7 +758,6 @@ public:
 
 	// Backup Worker
 	double BACKUP_TIMEOUT; // master's reaction time for backup failure
-	double BACKUP_NOOP_POP_DELAY;
 	int BACKUP_FILE_BLOCK_BYTES;
 	int64_t BACKUP_WORKER_LOCK_BYTES;
 	double BACKUP_UPLOAD_DELAY;
@@ -862,6 +858,14 @@ public:
 	bool CC_GRAY_FAILURE_STATUS_JSON; // When enabled, returns gray failure information in machine readable status json.
 	double CC_THROTTLE_SINGLETON_RERECRUIT_INTERVAL; // The interval to prevent re-recruiting the same singleton if a
 	                                                 // recruiting fight between two cluster controllers occurs.
+	bool
+	    CC_RECOVERY_INIT_REQ_ALLOW_DROP_IN_SIM; // This knob only affects simulation i.e. knob is ignored if isSimulated
+	                                            // is false.
+	                                            // If CC_RECOVERY_INIT_REQ_ALLOW_DROP_IN_SIM is true, we allow init
+	                                            // requests to be dropped in simulation (as means to fault inject) for
+	                                            // testing purposes.
+	                                            // If CC_RECOVERY_INIT_REQ_ALLOW_DROP_IN_SIM is false,
+	                                            // we do not allow init requests to be dropped in simulation.
 	double CC_RECOVERY_INIT_REQ_TIMEOUT; // Base timeout (seconds) for transaction system initialization during
 	                                     // recovery. Only applies to initializing_transaction_servers phase.
 	double CC_RECOVERY_INIT_REQ_GROWTH_FACTOR; // Base of the exponential backoff calculation. The timeout is calculated
@@ -886,8 +890,14 @@ public:
 	int DBINFO_SEND_AMOUNT;
 	double DBINFO_BATCH_DELAY;
 	double SINGLETON_RECRUIT_BME_DELAY;
+	// TODO: document what this means.  Actually, document a lot of these settings.
 	bool RECORD_RECOVER_AT_IN_CSTATE;
 	bool TRACK_TLOG_RECOVERY;
+	double CC_RERECRUIT_LOG_ROUTER_TIMEOUT;
+	// If enabled, Cluster Controller will rerecruit log router if it detects the log router has failed to avoid
+	// recoveries. Note this feature only covers the period when the cluster is in fully_recovered state. Before that
+	// state, log router failures will trigger a new recovery.
+	bool CC_RERECRUIT_LOG_ROUTER_ENABLED;
 
 	// Move Keys
 	double SHARD_READY_DELAY;
@@ -1015,11 +1025,6 @@ public:
 	double HOT_SHARD_THROTTLING_EXPIRE_AFTER;
 	int64_t HOT_SHARD_THROTTLING_TRACKED;
 	double HOT_SHARD_MONITOR_FREQUENCY;
-
-	// allow generating synthetic data for test clusters
-	bool GENERATE_DATA_ENABLED;
-	// maximum number of synthetic mutations per transaction
-	int GENERATE_DATA_PER_VERSION_MAX;
 
 	double MAX_TRANSACTIONS_PER_BYTE;
 
@@ -1175,6 +1180,7 @@ public:
 	int PHYSICAL_SHARD_MOVE_LOG_SEVERITY;
 	int FETCH_SHARD_BUFFER_BYTE_LIMIT;
 	int FETCH_SHARD_UPDATES_BYTE_LIMIT;
+	bool TRACK_READ_LATENCIES_PER_TYPE;
 
 	// Wait Failure
 	int MAX_OUTSTANDING_WAIT_FAILURE_REQUESTS;
@@ -1283,7 +1289,6 @@ public:
 	double FASTRESTORE_VB_LAUNCH_DELAY;
 	int64_t FASTRESTORE_ROLE_LOGGING_DELAY;
 	int64_t FASTRESTORE_UPDATE_PROCESS_STATS_INTERVAL; // How quickly to update process metrics for restore
-	int64_t FASTRESTORE_ATOMICOP_WEIGHT; // workload amplication factor for atomic op
 	int64_t FASTRESTORE_MONITOR_LEADER_DELAY;
 	int64_t FASTRESTORE_STRAGGLER_THRESHOLD_SECONDS;
 	bool FASTRESTORE_TRACK_REQUEST_LATENCY; // true to track reply latency of each request in a request batch

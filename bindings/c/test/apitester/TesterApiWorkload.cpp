@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -243,28 +243,9 @@ void ApiWorkload::populateTenantData(TTaskFct cont, std::optional<int> tenantId)
 	}
 }
 
-void ApiWorkload::createTenants(TTaskFct cont) {
-	execTransaction(
-	    [this](auto ctx) {
-		    auto futures = std::make_shared<std::vector<fdb::Future>>();
-		    for (auto tenant : tenants) {
-			    futures->push_back(fdb::Tenant::getTenant(ctx->tx(), tenant));
-		    }
-		    ctx->continueAfterAll(*futures, [this, ctx, futures]() {
-			    for (int i = 0; i < futures->size(); ++i) {
-				    if (!(*futures)[i].get<fdb::future_var::ValueRef>()) {
-					    fdb::Tenant::createTenant(ctx->tx(), tenants[i]);
-				    }
-			    }
-			    ctx->commit();
-		    });
-	    },
-	    [this, cont]() { schedule(cont); });
-}
-
 void ApiWorkload::createTenantsIfNecessary(TTaskFct cont) {
 	if (tenants.size() > 0) {
-		createTenants(cont);
+		ASSERT(false);
 	} else {
 		schedule(cont);
 	}

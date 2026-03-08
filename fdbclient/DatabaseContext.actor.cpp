@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,7 +43,6 @@
 #include "fdbclient/FDBTypes.h"
 #include "fdbrpc/FailureMonitor.h"
 #include "fdbrpc/MultiInterface.h"
-#include "fdbrpc/TenantInfo.h"
 
 #include "fdbclient/ActorLineageProfiler.h"
 #include "fdbclient/AnnotateActor.h"
@@ -69,8 +68,6 @@
 #include "fdbclient/SpecialKeySpace.actor.h"
 #include "fdbclient/StorageServerInterface.h"
 #include "fdbclient/SystemData.h"
-#include "fdbclient/Tenant.h"
-#include "fdbclient/TenantSpecialKeys.actor.h"
 #include "fdbclient/TransactionLineage.h"
 #include "fdbclient/versions.h"
 #include "fdbrpc/WellKnownEndpoints.h"
@@ -112,28 +109,28 @@
 #endif
 #include "flow/actorcompiler.h" // This must be the last #include.
 
-Reference<WatchMetadata> DatabaseContext::getWatchMetadata(int64_t tenantId, KeyRef key) const {
-	const auto it = watchMap.find(std::make_pair(tenantId, key));
+Reference<WatchMetadata> DatabaseContext::getWatchMetadata(KeyRef key) const {
+	const auto it = watchMap.find(WatchMapKey(key));
 	if (it == watchMap.end())
 		return Reference<WatchMetadata>();
 	return it->second;
 }
 
 void DatabaseContext::setWatchMetadata(Reference<WatchMetadata> metadata) {
-	const WatchMapKey key(metadata->parameters->tenant.tenantId, metadata->parameters->key);
+	const WatchMapKey key(metadata->parameters->key);
 	watchMap[key] = metadata;
 	// NOTE Here we do *NOT* update/reset the reference count for the key, see the source code in getWatchFuture.
 	// Basically the reference count could be increased, or the same watch is refreshed, or the watch might be cancelled
 }
 
-int32_t DatabaseContext::increaseWatchRefCount(const int64_t tenantID, KeyRef key, const Version& version) {
-	const WatchMapKey mapKey(tenantID, key);
+int32_t DatabaseContext::increaseWatchRefCount(KeyRef key, const Version& version) {
+	const WatchMapKey mapKey(key);
 	watchCounterMap[mapKey].insert(version);
 	return watchCounterMap[mapKey].size();
 }
 
-int32_t DatabaseContext::decreaseWatchRefCount(const int64_t tenantID, KeyRef key, const Version& version) {
-	const WatchMapKey mapKey(tenantID, key);
+int32_t DatabaseContext::decreaseWatchRefCount(KeyRef key, const Version& version) {
+	const WatchMapKey mapKey(key);
 	auto mapKeyIter = watchCounterMap.find(mapKey);
 	if (mapKeyIter == std::end(watchCounterMap)) {
 		// Key does not exist. The metadata might be removed by deleteWatchMetadata already.
@@ -151,19 +148,19 @@ int32_t DatabaseContext::decreaseWatchRefCount(const int64_t tenantID, KeyRef ke
 
 	const auto count = versionSet.size();
 	// The metadata might be deleted somewhere else, before calling this decreaseWatchRefCount
-	if (auto metadata = getWatchMetadata(tenantID, key); metadata.isValid() && versionSet.size() == 0) {
+	if (auto metadata = getWatchMetadata(key); metadata.isValid() && versionSet.size() == 0) {
 		// It is a *must* to cancel the watchFutureSS manually. watchFutureSS waits for watchStorageServerResp, which
 		// holds a reference to the metadata. If the ACTOR is not cancelled, it indirectly holds a Future waiting for
 		// itself.
 		metadata->watchFutureSS.cancel();
-		deleteWatchMetadata(tenantID, key);
+		deleteWatchMetadata(key);
 	}
 
 	return count;
 }
 
-void DatabaseContext::deleteWatchMetadata(int64_t tenantId, KeyRef key, bool removeReferenceCount) {
-	const WatchMapKey mapKey(tenantId, key);
+void DatabaseContext::deleteWatchMetadata(KeyRef key, bool removeReferenceCount) {
+	const WatchMapKey mapKey(key);
 	watchMap.erase(mapKey);
 	if (removeReferenceCount) {
 		watchCounterMap.erase(mapKey);
@@ -983,142 +980,6 @@ Reference<LocationInfo> addCaches(const Reference<LocationInfo>& loc,
 	return makeReference<LocationInfo>(interfaces, true);
 }
 
-// FIXME: describe what this is supposed to be doing.
-ACTOR Future<Void> updateCachedRanges(DatabaseContext* self, std::map<UID, StorageServerInterface>* cacheServers) {
-	state Transaction tr;
-	state Value trueValue = storageCacheValue(std::vector<uint16_t>{ 0 });
-	state Value falseValue = storageCacheValue(std::vector<uint16_t>{});
-	try {
-		loop {
-			// Need to make sure that we eventually destroy tr. We can't rely on getting cancelled to do this because of
-			// the cyclic reference to self.
-			tr = Transaction();
-			wait(delay(0)); // Give ourselves the chance to get cancelled if self was destroyed
-			wait(brokenPromiseToNever(self->updateCache.onTrigger())); // brokenPromiseToNever because self might get
-			                                                           // destroyed elsewhere while we're waiting here.
-			tr = Transaction(Database(Reference<DatabaseContext>::addRef(self)));
-			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
-			tr.setOption(FDBTransactionOptions::READ_LOCK_AWARE);
-			try {
-				RangeResult range = wait(tr.getRange(storageCacheKeys, CLIENT_KNOBS->TOO_MANY));
-				ASSERT(!range.more);
-				std::vector<Reference<ReferencedInterface<StorageServerInterface>>> cacheInterfaces;
-				cacheInterfaces.reserve(cacheServers->size());
-				for (const auto& p : *cacheServers) {
-					cacheInterfaces.push_back(makeReference<ReferencedInterface<StorageServerInterface>>(p.second));
-				}
-				bool currCached = false;
-				KeyRef begin, end;
-				for (const auto& kv : range) {
-					// These booleans have to flip consistently
-					ASSERT(currCached == (kv.value == falseValue));
-					if (kv.value == trueValue) {
-						begin = kv.key.substr(storageCacheKeys.begin.size());
-						currCached = true;
-					} else {
-						currCached = false;
-						end = kv.key.substr(storageCacheKeys.begin.size());
-						KeyRangeRef cachedRange{ begin, end };
-						auto ranges = self->locationCache.containedRanges(cachedRange);
-						KeyRef containedRangesBegin, containedRangesEnd, prevKey;
-						if (!ranges.empty()) {
-							containedRangesBegin = ranges.begin().range().begin;
-						}
-						for (auto iter = ranges.begin(); iter != ranges.end(); ++iter) {
-							containedRangesEnd = iter->range().end;
-							if (iter->value() && !iter->value()->hasCaches) {
-								iter->value() = addCaches(iter->value(), cacheInterfaces);
-							}
-						}
-						auto iter = self->locationCache.rangeContaining(begin);
-						if (iter->value() && !iter->value()->hasCaches) {
-							if (end >= iter->range().end) {
-								Key endCopy = iter->range().end; // Copy because insertion invalidates iterator
-								self->locationCache.insert(KeyRangeRef{ begin, endCopy },
-								                           addCaches(iter->value(), cacheInterfaces));
-							} else {
-								self->locationCache.insert(KeyRangeRef{ begin, end },
-								                           addCaches(iter->value(), cacheInterfaces));
-							}
-						}
-						iter = self->locationCache.rangeContainingKeyBefore(end);
-						if (iter->value() && !iter->value()->hasCaches) {
-							Key beginCopy = iter->range().begin; // Copy because insertion invalidates iterator
-							self->locationCache.insert(KeyRangeRef{ beginCopy, end },
-							                           addCaches(iter->value(), cacheInterfaces));
-						}
-					}
-				}
-				wait(delay(2.0)); // we want to wait at least some small amount of time before
-				// updating this list again
-			} catch (Error& e) {
-				wait(tr.onError(e));
-			}
-		}
-	} catch (Error& e) {
-		TraceEvent(SevError, "UpdateCachedRangesFailed").error(e);
-		throw;
-	}
-}
-
-// FIXME: describe what this is supposed to be doing
-// The reason for getting a pointer to DatabaseContext instead of a reference counted object is because reference
-// counting will increment reference count for DatabaseContext which holds the future of this actor. This creates a
-// cyclic reference and hence this actor and Database object will not be destroyed at all.
-ACTOR Future<Void> monitorCacheList(DatabaseContext* self) {
-	state Transaction tr;
-	state std::map<UID, StorageServerInterface> cacheServerMap;
-	state Future<Void> updateRanges = updateCachedRanges(self, &cacheServerMap);
-	state Backoff backoff;
-	// if no caches are configured, we don't want to run this actor at all
-	// so we just wait for the first trigger from a storage server
-	wait(self->updateCache.onTrigger());
-	try {
-		loop {
-			// Need to make sure that we eventually destroy tr. We can't rely on getting cancelled to do this because of
-			// the cyclic reference to self.
-			wait(refreshTransaction(self, &tr));
-			try {
-				RangeResult cacheList = wait(tr.getRange(storageCacheServerKeys, CLIENT_KNOBS->TOO_MANY));
-				ASSERT(!cacheList.more);
-				bool hasChanges = false;
-				std::map<UID, StorageServerInterface> allCacheServers;
-				for (auto kv : cacheList) {
-					auto ssi = BinaryReader::fromStringRef<StorageServerInterface>(kv.value, IncludeVersion());
-					allCacheServers.emplace(ssi.id(), ssi);
-				}
-				std::map<UID, StorageServerInterface> newCacheServers;
-				std::map<UID, StorageServerInterface> deletedCacheServers;
-				std::set_difference(allCacheServers.begin(),
-				                    allCacheServers.end(),
-				                    cacheServerMap.begin(),
-				                    cacheServerMap.end(),
-				                    std::insert_iterator<std::map<UID, StorageServerInterface>>(
-				                        newCacheServers, newCacheServers.begin()));
-				std::set_difference(cacheServerMap.begin(),
-				                    cacheServerMap.end(),
-				                    allCacheServers.begin(),
-				                    allCacheServers.end(),
-				                    std::insert_iterator<std::map<UID, StorageServerInterface>>(
-				                        deletedCacheServers, deletedCacheServers.begin()));
-				hasChanges = !(newCacheServers.empty() && deletedCacheServers.empty());
-				if (hasChanges) {
-					updateLocationCacheWithCaches(self, deletedCacheServers, newCacheServers);
-				}
-				cacheServerMap = std::move(allCacheServers);
-				wait(delay(5.0));
-				backoff = Backoff();
-			} catch (Error& e) {
-				wait(tr.onError(e));
-				wait(backoff.onError());
-			}
-		}
-	} catch (Error& e) {
-		TraceEvent(SevError, "MonitorCacheListFailed").error(e);
-		throw;
-	}
-}
-
 ACTOR static Future<Void> handleTssMismatches(DatabaseContext* cx) {
 	state Reference<ReadYourWritesTransaction> tr;
 	state KeyBackedMap<UID, UID> tssMapDB = KeyBackedMap<UID, UID>(tssMappingKeys.begin);
@@ -1204,20 +1065,12 @@ struct SingleSpecialKeyImpl : SpecialKeyRangeReadImpl {
 		});
 	}
 
-	SingleSpecialKeyImpl(KeyRef k,
-	                     const std::function<Future<Optional<Value>>(ReadYourWritesTransaction*)>& f,
-	                     bool supportsTenants = false)
-	  : SpecialKeyRangeReadImpl(singleKeyRange(k)), k(k), f(f), tenantSupport(supportsTenants) {}
-
-	bool supportsTenants() const override {
-		CODE_PROBE(tenantSupport, "Single special key in tenant");
-		return tenantSupport;
-	};
+	SingleSpecialKeyImpl(KeyRef k, const std::function<Future<Optional<Value>>(ReadYourWritesTransaction*)>& f)
+	  : SpecialKeyRangeReadImpl(singleKeyRange(k)), k(k), f(f) {}
 
 private:
 	Key k;
 	std::function<Future<Optional<Value>>(ReadYourWritesTransaction*)> f;
-	bool tenantSupport;
 };
 
 class HealthMetricsRangeImpl : public SpecialKeyRangeAsyncImpl {
@@ -1334,13 +1187,11 @@ DatabaseContext::DatabaseContext(Reference<AsyncVar<Reference<IClusterConnection
                                  LockAware lockAware,
                                  IsInternal internal,
                                  int _apiVersion,
-                                 IsSwitchable switchable,
-                                 Optional<TenantName> defaultTenant)
+                                 IsSwitchable switchable)
   : dbId(deterministicRandom()->randomUniqueID()), lockAware(lockAware), switchable(switchable),
     connectionRecord(connectionRecord), proxyProvisional(false), clientLocality(clientLocality),
-    enableLocalityLoadBalance(enableLocalityLoadBalance), defaultTenant(defaultTenant), internal(internal),
-    cc("TransactionMetrics", dbId.toString()), transactionReadVersions("ReadVersions", cc),
-    transactionReadVersionsThrottled("ReadVersionsThrottled", cc),
+    enableLocalityLoadBalance(enableLocalityLoadBalance), internal(internal), cc("TransactionMetrics", dbId.toString()),
+    transactionReadVersions("ReadVersions", cc), transactionReadVersionsThrottled("ReadVersionsThrottled", cc),
     transactionReadVersionsCompleted("ReadVersionsCompleted", cc),
     transactionReadVersionBatches("ReadVersionBatches", cc),
     transactionBatchReadVersions("BatchPriorityReadVersions", cc),
@@ -1363,8 +1214,7 @@ DatabaseContext::DatabaseContext(Reference<AsyncVar<Reference<IClusterConnection
     transactionsCommitStarted("CommitStarted", cc), transactionsCommitCompleted("CommitCompleted", cc),
     transactionKeyServerLocationRequests("KeyServerLocationRequests", cc),
     transactionKeyServerLocationRequestsCompleted("KeyServerLocationRequestsCompleted", cc),
-    transactionStatusRequests("StatusRequests", cc), transactionTenantLookupRequests("TenantLookupRequests", cc),
-    transactionTenantLookupRequestsCompleted("TenantLookupRequestsCompleted", cc), transactionsTooOld("TooOld", cc),
+    transactionStatusRequests("StatusRequests", cc), transactionsTooOld("TooOld", cc),
     transactionsFutureVersions("FutureVersions", cc), transactionsNotCommitted("NotCommitted", cc),
     transactionsMaybeCommitted("MaybeCommitted", cc), transactionsResourceConstrained("ResourceConstrained", cc),
     transactionsProcessBehind("ProcessBehind", cc), transactionsThrottled("Throttled", cc),
@@ -1403,7 +1253,6 @@ DatabaseContext::DatabaseContext(Reference<AsyncVar<Reference<IClusterConnection
 	clientDBInfoMonitor = monitorClientDBInfoChange(this, clientInfo, &proxiesChangeTrigger);
 	tssMismatchHandler = handleTssMismatches(this);
 	clientStatusUpdater.actor = clientStatusUpdateActor(this);
-	cacheListMonitor = monitorCacheList(this);
 
 	smoothMidShardSize.reset(CLIENT_KNOBS->INIT_MID_SHARD_BYTES);
 	globalConfig = std::make_unique<GlobalConfig>(this);
@@ -1427,8 +1276,7 @@ DatabaseContext::DatabaseContext(Reference<AsyncVar<Reference<IClusterConnection
 				                            return Optional<Value>(ryw->getSpecialKeySpaceErrorMsg().get());
 			                            else
 				                            return Optional<Value>();
-		                            },
-		                            true));
+		                            }));
 		registerSpecialKeysImpl(
 		    SpecialKeySpace::MODULE::MANAGEMENT,
 		    SpecialKeySpace::IMPLTYPE::READWRITE,
@@ -1562,44 +1410,40 @@ DatabaseContext::DatabaseContext(Reference<AsyncVar<Reference<IClusterConnection
 		                        SpecialKeySpace::IMPLTYPE::READONLY,
 		                        std::make_unique<WorkerInterfacesSpecialKeyImpl>(
 		                            KeyRangeRef("\xff\xff/worker_interfaces/"_sr, "\xff\xff/worker_interfaces0"_sr)));
-		registerSpecialKeysImpl(SpecialKeySpace::MODULE::STATUSJSON,
-		                        SpecialKeySpace::IMPLTYPE::READONLY,
-		                        std::make_unique<SingleSpecialKeyImpl>(
-		                            "\xff\xff/status/json"_sr,
-		                            [](ReadYourWritesTransaction* ryw) -> Future<Optional<Value>> {
-			                            if (ryw->getDatabase().getPtr() && ryw->getDatabase()->getConnectionRecord()) {
-				                            ++ryw->getDatabase()->transactionStatusRequests;
-				                            return getJSON(ryw->getDatabase());
-			                            } else {
-				                            return Optional<Value>();
-			                            }
-		                            },
-		                            true));
-		registerSpecialKeysImpl(SpecialKeySpace::MODULE::CLUSTERFILEPATH,
-		                        SpecialKeySpace::IMPLTYPE::READONLY,
-		                        std::make_unique<SingleSpecialKeyImpl>(
-		                            "\xff\xff/cluster_file_path"_sr,
-		                            [](ReadYourWritesTransaction* ryw) -> Future<Optional<Value>> {
-			                            try {
-				                            if (ryw->getDatabase().getPtr() &&
-				                                ryw->getDatabase()->getConnectionRecord()) {
-					                            Optional<Value> output =
-					                                StringRef(ryw->getDatabase()->getConnectionRecord()->getLocation());
-					                            return output;
-				                            }
-			                            } catch (Error& e) {
-				                            return e;
-			                            }
-			                            return Optional<Value>();
-		                            },
-		                            true));
+		registerSpecialKeysImpl(
+		    SpecialKeySpace::MODULE::STATUSJSON,
+		    SpecialKeySpace::IMPLTYPE::READONLY,
+		    std::make_unique<SingleSpecialKeyImpl>(
+		        "\xff\xff/status/json"_sr, [](ReadYourWritesTransaction* ryw) -> Future<Optional<Value>> {
+			        if (ryw->getDatabase().getPtr() && ryw->getDatabase()->getConnectionRecord()) {
+				        ++ryw->getDatabase()->transactionStatusRequests;
+				        return getJSON(ryw->getDatabase());
+			        } else {
+				        return Optional<Value>();
+			        }
+		        }));
+		registerSpecialKeysImpl(
+		    SpecialKeySpace::MODULE::CLUSTERFILEPATH,
+		    SpecialKeySpace::IMPLTYPE::READONLY,
+		    std::make_unique<SingleSpecialKeyImpl>(
+		        "\xff\xff/cluster_file_path"_sr, [](ReadYourWritesTransaction* ryw) -> Future<Optional<Value>> {
+			        try {
+				        if (ryw->getDatabase().getPtr() && ryw->getDatabase()->getConnectionRecord()) {
+					        Optional<Value> output =
+					            StringRef(ryw->getDatabase()->getConnectionRecord()->getLocation());
+					        return output;
+				        }
+			        } catch (Error& e) {
+				        return e;
+			        }
+			        return Optional<Value>();
+		        }));
 
 		registerSpecialKeysImpl(
 		    SpecialKeySpace::MODULE::CONNECTIONSTRING,
 		    SpecialKeySpace::IMPLTYPE::READONLY,
 		    std::make_unique<SingleSpecialKeyImpl>(
-		        "\xff\xff/connection_string"_sr,
-		        [](ReadYourWritesTransaction* ryw) -> Future<Optional<Value>> {
+		        "\xff\xff/connection_string"_sr, [](ReadYourWritesTransaction* ryw) -> Future<Optional<Value>> {
 			        try {
 				        if (ryw->getDatabase().getPtr() && ryw->getDatabase()->getConnectionRecord()) {
 					        Reference<IClusterConnectionRecord> f = ryw->getDatabase()->getConnectionRecord();
@@ -1610,30 +1454,22 @@ DatabaseContext::DatabaseContext(Reference<AsyncVar<Reference<IClusterConnection
 				        return e;
 			        }
 			        return Optional<Value>();
-		        },
-		        true));
-		registerSpecialKeysImpl(SpecialKeySpace::MODULE::CLUSTERID,
-		                        SpecialKeySpace::IMPLTYPE::READONLY,
-		                        std::make_unique<SingleSpecialKeyImpl>(
-		                            "\xff\xff/cluster_id"_sr,
-		                            [](ReadYourWritesTransaction* ryw) -> Future<Optional<Value>> {
-			                            try {
-				                            if (ryw->getDatabase().getPtr()) {
-					                            return map(getClusterId(ryw->getDatabase()), [](UID id) {
-						                            return Optional<Value>(StringRef(id.toString()));
-					                            });
-				                            }
-			                            } catch (Error& e) {
-				                            return e;
-			                            }
-			                            return Optional<Value>();
-		                            },
-		                            true));
-
+		        }));
 		registerSpecialKeysImpl(
-		    SpecialKeySpace::MODULE::MANAGEMENT,
-		    SpecialKeySpace::IMPLTYPE::READWRITE,
-		    std::make_unique<TenantRangeImpl>(SpecialKeySpace::getManagementApiCommandRange("tenant")));
+		    SpecialKeySpace::MODULE::CLUSTERID,
+		    SpecialKeySpace::IMPLTYPE::READONLY,
+		    std::make_unique<SingleSpecialKeyImpl>(
+		        "\xff\xff/cluster_id"_sr, [](ReadYourWritesTransaction* ryw) -> Future<Optional<Value>> {
+			        try {
+				        if (ryw->getDatabase().getPtr()) {
+					        return map(getClusterId(ryw->getDatabase()),
+					                   [](UID id) { return Optional<Value>(StringRef(id.toString())); });
+				        }
+			        } catch (Error& e) {
+				        return e;
+			        }
+			        return Optional<Value>();
+		        }));
 	}
 	throttleExpirer = recurring([this]() { expireThrottles(); }, CLIENT_KNOBS->TAG_THROTTLE_EXPIRATION_INTERVAL);
 
@@ -1669,8 +1505,7 @@ DatabaseContext::DatabaseContext(const Error& err)
     transactionsCommitStarted("CommitStarted", cc), transactionsCommitCompleted("CommitCompleted", cc),
     transactionKeyServerLocationRequests("KeyServerLocationRequests", cc),
     transactionKeyServerLocationRequestsCompleted("KeyServerLocationRequestsCompleted", cc),
-    transactionStatusRequests("StatusRequests", cc), transactionTenantLookupRequests("TenantLookupRequests", cc),
-    transactionTenantLookupRequestsCompleted("TenantLookupRequestsCompleted", cc), transactionsTooOld("TooOld", cc),
+    transactionStatusRequests("StatusRequests", cc), transactionsTooOld("TooOld", cc),
     transactionsFutureVersions("FutureVersions", cc), transactionsNotCommitted("NotCommitted", cc),
     transactionsMaybeCommitted("MaybeCommitted", cc), transactionsResourceConstrained("ResourceConstrained", cc),
     transactionsProcessBehind("ProcessBehind", cc), transactionsThrottled("Throttled", cc),
@@ -1708,7 +1543,6 @@ Database DatabaseContext::create(Reference<AsyncVar<ClientDBInfo>> clientInfo,
 }
 
 DatabaseContext::~DatabaseContext() {
-	cacheListMonitor.cancel();
 	clientDBInfoMonitor.cancel();
 	monitorTssInfoChange.cancel();
 	tssMismatchHandler.cancel();

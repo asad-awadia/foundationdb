@@ -7,7 +7,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the 'License');
  * you may not use this file except in compliance with the License.
@@ -34,8 +34,5 @@
 
 /* API version introducing disable_client_bypass option */
 #define FDB_API_VERSION_DISABLE_CLIENT_BYPASS @FDB_AV_DISABLE_CLIENT_BYPASS@
-
-/* API version with multitenancy API released */
-#define FDB_API_VERSION_TENANT_API_RELEASED @FDB_AV_TENANT_API_RELEASED@
 
 #endif

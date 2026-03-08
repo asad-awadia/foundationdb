@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,9 +26,7 @@
 #define FDBSERVER_PROXYCOMMITDATA_ACTOR_H
 
 #include "fdbclient/FDBTypes.h"
-#include "fdbclient/GetEncryptCipherKeys.h"
 #include "fdbclient/RangeLock.h"
-#include "fdbclient/Tenant.h"
 #include "fdbrpc/Stats.h"
 #include "fdbserver/AccumulativeChecksumUtil.h"
 #include "fdbserver/Knobs.h"
@@ -65,14 +63,10 @@ struct ProxyStats {
 	Counter mutations;
 	Counter conflictRanges;
 	Counter keyServerLocationIn, keyServerLocationOut, keyServerLocationErrors;
-	Counter tenantIdRequestIn;
-	Counter tenantIdRequestOut;
-	Counter tenantIdRequestErrors;
 	Counter txnExpensiveClearCostEstCount;
 	Version lastCommitVersionAssigned;
 
 	LatencySample commitLatencySample;
-	LatencySample encryptionLatencySample;
 	LatencyBands commitLatencyBands;
 
 	// Ratio of tlogs receiving empty commit messages.
@@ -123,8 +117,7 @@ struct ProxyStats {
 	explicit ProxyStats(UID id,
 	                    NotifiedVersion* pVersion,
 	                    NotifiedVersion* pCommittedVersion,
-	                    int64_t* commitBatchesMemBytesCountPtr,
-	                    std::map<int64_t, TenantName>* pTenantMap)
+	                    int64_t* commitBatchesMemBytesCountPtr)
 	  : cc("ProxyStats", id.toString()), txnCommitIn("TxnCommitIn", cc),
 	    txnCommitVersionAssigned("TxnCommitVersionAssigned", cc), txnCommitResolving("TxnCommitResolving", cc),
 	    txnCommitResolved("TxnCommitResolved", cc), txnCommitOut("TxnCommitOut", cc),
@@ -133,17 +126,12 @@ struct ProxyStats {
 	    commitBatchIn("CommitBatchIn", cc), commitBatchOut("CommitBatchOut", cc), mutationBytes("MutationBytes", cc),
 	    mutations("Mutations", cc), conflictRanges("ConflictRanges", cc),
 	    keyServerLocationIn("KeyServerLocationIn", cc), keyServerLocationOut("KeyServerLocationOut", cc),
-	    keyServerLocationErrors("KeyServerLocationErrors", cc), tenantIdRequestIn("TenantIdRequestIn", cc),
-	    tenantIdRequestOut("TenantIdRequestOut", cc), tenantIdRequestErrors("TenantIdRequestErrors", cc),
+	    keyServerLocationErrors("KeyServerLocationErrors", cc),
 	    txnExpensiveClearCostEstCount("ExpensiveClearCostEstCount", cc), lastCommitVersionAssigned(0),
 	    commitLatencySample("CommitLatencyMetrics",
 	                        id,
 	                        SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
 	                        SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
-	    encryptionLatencySample("CommitEncryptionLatencyMetrics",
-	                            id,
-	                            SERVER_KNOBS->LATENCY_METRICS_LOGGING_INTERVAL,
-	                            SERVER_KNOBS->LATENCY_SKETCH_ACCURACY),
 	    commitLatencyBands("CommitLatencyBands", id, SERVER_KNOBS->STORAGE_LOGGING_DELAY),
 	    commitBatchingEmptyMessageRatio("CommitBatchingEmptyMessageRatio",
 	                                    id,
@@ -175,7 +163,6 @@ struct ProxyStats {
 		specialCounter(cc, "CommitBatchesMemBytesCount", [commitBatchesMemBytesCountPtr]() {
 			return *commitBatchesMemBytesCountPtr;
 		});
-		specialCounter(cc, "NumTenants", [pTenantMap]() { return pTenantMap ? pTenantMap->size() : 0; });
 		specialCounter(cc, "MaxCompute", [this]() { return this->getAndResetMaxCompute(); });
 		specialCounter(cc, "MinCompute", [this]() { return this->getAndResetMinCompute(); });
 		logger = cc.traceCounters("ProxyMetrics", id, SERVER_KNOBS->WORKER_LOGGING_INTERVAL, "ProxyMetrics");
@@ -196,10 +183,6 @@ struct RangeLock;
 struct ProxyCommitData {
 	UID dbgid;
 	int64_t commitBatchesMemBytesCount;
-	std::unordered_map<TenantName, int64_t> tenantNameIndex;
-	std::map<int64_t, TenantName> tenantMap;
-	std::set<int64_t> lockedTenants;
-	std::unordered_set<int64_t> tenantsOverStorageQuota;
 	ProxyStats stats;
 	MasterInterface master;
 	std::vector<ResolverInterface> resolvers;
@@ -221,7 +204,6 @@ struct ProxyCommitData {
 	// only tracks normalKeys. This is used for tracking versions for systemKeys.
 	Deque<Version> systemKeyVersions;
 	KeyRangeMap<ServerCacheInfo> keyInfo; // keyrange -> all storage servers in all DCs for the keyrange
-	KeyRangeMap<bool> cacheInfo;
 	std::map<Key, ApplyMutationsData> uid_applyMutationsData;
 	bool firstProxy;
 	double lastCoalesceTime;
@@ -261,9 +243,6 @@ struct ProxyCommitData {
 	double lastResolverReset;
 	int localTLogCount = -1;
 
-	EncryptionAtRestMode encryptMode;
-	Reference<GetEncryptCipherKeysMonitor> encryptionMonitor;
-
 	PromiseStream<ExpectedIdempotencyIdCountForKey> expectedIdempotencyIdCountForKey;
 	Standalone<VectorRef<MutationRef>> idempotencyClears;
 
@@ -288,22 +267,6 @@ struct ProxyCommitData {
 			return r.tags;
 		}
 		return tags;
-	}
-
-	bool needsCacheTag(KeyRangeRef range) {
-		auto ranges = cacheInfo.intersectingRanges(range);
-		for (auto r : ranges) {
-			if (r.value()) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-	TenantMode getTenantMode() const {
-		CODE_PROBE(db->get().client.grvProxies.empty() || db->get().client.grvProxies[0].provisional,
-		           "Accessing tenant mode in provisional ClientDBInfo");
-		return db->get().client.tenantMode;
 	}
 
 	void updateLatencyBandConfig(Optional<LatencyBandConfig> newLatencyBandConfig) {
@@ -337,12 +300,10 @@ struct ProxyCommitData {
 	// RangeLock feature currently does not support version vector
 	// So, if the version vector is enabled, the RangeLock is automatically disabled
 	// RangeLock feature currently rely on processing private mutations in commit proxy
-	// So, if PROXY_USE_RESOLVER_PRIVATE_MUTATIONS is on, the RangeLock is automatically disabled
-	// RangeLock feature currently is not compatible with encryption and tenant
+	// So, if PROXY_USE_RESOLVER_PRIVATE_MUTATIONS is on, the RangeLock is automatically disabled.
 	bool rangeLockEnabled() {
 		return SERVER_KNOBS->ENABLE_READ_LOCK_ON_RANGE && !SERVER_KNOBS->ENABLE_VERSION_VECTOR &&
-		       !SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST && !encryptMode.isEncryptionEnabled() &&
-		       getTenantMode() == TenantMode::DISABLED;
+		       !SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST;
 	}
 
 	ProxyCommitData(UID dbgid,
@@ -352,25 +313,22 @@ struct ProxyCommitData {
 	                PublicRequestStream<CommitTransactionRequest> commit,
 	                Reference<AsyncVar<ServerDBInfo> const> db,
 	                bool firstProxy,
-	                EncryptionAtRestMode encryptMode,
 	                bool provisional,
 	                uint16_t commitProxyIndex,
 	                LogEpoch epoch)
 	  : dbgid(dbgid), commitBatchesMemBytesCount(0),
-	    stats(dbgid, &version, &committedVersion, &commitBatchesMemBytesCount, &tenantMap), master(master),
-	    logAdapter(nullptr), txnStateStore(nullptr), committedVersion(recoveryTransactionVersion),
-	    minKnownCommittedVersion(0), version(0), lastVersionTime(0), commitVersionRequestNumber(1),
-	    mostRecentProcessedRequestNumber(0), firstProxy(firstProxy), encryptMode(encryptMode),
-	    encryptionMonitor(makeReference<GetEncryptCipherKeysMonitor>()), provisional(provisional), lastCoalesceTime(0),
-	    locked(false), commitBatchInterval(SERVER_KNOBS->COMMIT_TRANSACTION_BATCH_INTERVAL_MIN),
-	    localCommitBatchesStarted(0), getConsistentReadVersion(getConsistentReadVersion), commit(commit),
+	    stats(dbgid, &version, &committedVersion, &commitBatchesMemBytesCount), master(master), logAdapter(nullptr),
+	    txnStateStore(nullptr), committedVersion(recoveryTransactionVersion), minKnownCommittedVersion(0), version(0),
+	    lastVersionTime(0), commitVersionRequestNumber(1), mostRecentProcessedRequestNumber(0), firstProxy(firstProxy),
+	    provisional(provisional), lastCoalesceTime(0), locked(false),
+	    commitBatchInterval(SERVER_KNOBS->COMMIT_TRANSACTION_BATCH_INTERVAL_MIN), localCommitBatchesStarted(0),
+	    getConsistentReadVersion(getConsistentReadVersion), commit(commit),
 	    cx(openDBOnServer(db, TaskPriority::DefaultEndpoint, LockAware::True)), db(db),
 	    singleKeyMutationEvent("SingleKeyMutation"_sr), lastTxsPop(0), popRemoteTxs(false), lastStartCommit(0),
 	    lastCommitLatency(SERVER_KNOBS->REQUIRED_MIN_RECOVERY_DURATION), lastCommitTime(0), lastMasterReset(now()),
 	    lastResolverReset(now()), commitProxyIndex(commitProxyIndex),
 	    acsBuilder(CLIENT_KNOBS->ENABLE_MUTATION_CHECKSUM && CLIENT_KNOBS->ENABLE_ACCUMULATIVE_CHECKSUM &&
-	                       !encryptMode.isEncryptionEnabled() && !SERVER_KNOBS->ENABLE_VERSION_VECTOR &&
-	                       !SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST
+	                       !SERVER_KNOBS->ENABLE_VERSION_VECTOR && !SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST
 	                   ? std::make_shared<AccumulativeChecksumBuilder>(
 	                         getCommitProxyAccumulativeChecksumIndex(commitProxyIndex))
 	                   : nullptr),

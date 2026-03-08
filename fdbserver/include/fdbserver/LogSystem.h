@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -680,6 +680,9 @@ struct ILogSystem {
 
 	// Returns when the log system configuration has changed due to a tlog rejoin.
 	virtual Future<Void> onLogSystemConfigChange() = 0;
+
+	// Update a specific log router in the log system configuration
+	virtual void updateLogRouter(int logSetIndex, int tagId, TLogInterface const& newLogRouter) = 0;
 
 	virtual void getPushLocations(VectorRef<Tag> tags,
 	                              std::vector<int>& locations,

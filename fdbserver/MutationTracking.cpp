@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,20 +40,20 @@ std::vector<std::pair<const char*, KeyRangeRef>> debugRanges = { { "Everything",
 TraceEvent debugMutationEnabled(const char* context, Version version, MutationRef const& mutation, UID id) {
 	const char* label = nullptr;
 
-	for (auto& labelKey : debugKeys) {
+	for (const auto& [keyLabel, debugKey] : debugKeys) {
 		if (((mutation.type == mutation.ClearRange || mutation.type == mutation.DebugKeyRange) &&
-		     KeyRangeRef(mutation.param1, mutation.param2).contains(labelKey.second)) ||
-		    mutation.param1 == labelKey.second) {
-			label = labelKey.first;
+		     KeyRangeRef(mutation.param1, mutation.param2).contains(debugKey)) ||
+		    mutation.param1 == debugKey) {
+			label = keyLabel;
 			break;
 		}
 	}
 
-	for (auto& labelRange : debugRanges) {
+	for (const auto& [rangeLabel, debugRange] : debugRanges) {
 		if (((mutation.type == mutation.ClearRange || mutation.type == mutation.DebugKeyRange) &&
-		     KeyRangeRef(mutation.param1, mutation.param2).intersects(labelRange.second)) ||
-		    labelRange.second.contains(mutation.param1)) {
-			label = labelRange.first;
+		     KeyRangeRef(mutation.param1, mutation.param2).intersects(debugRange)) ||
+		    debugRange.contains(mutation.param1)) {
+			label = rangeLabel;
 			break;
 		}
 	}
@@ -65,15 +65,6 @@ TraceEvent debugMutationEnabled(const char* context, Version version, MutationRe
 	}
 
 	return TraceEvent();
-}
-
-TraceEvent debugEncrptedMutationEnabled(const char* context, Version version, MutationRef const& mutation, UID id) {
-	ASSERT(mutation.type == mutation.Encrypted);
-	MutationRef fmutation = Standalone(mutation);
-	Arena tempArena;
-	ArenaReader reader(tempArena, mutation.param2, AssumeVersion(ProtocolVersion::withEncryptionAtRest()));
-	reader >> fmutation;
-	return debugMutationEnabled(context, version, fmutation, id);
 }
 
 TraceEvent debugKeyRangeEnabled(const char* context, Version version, KeyRangeRef const& keys, UID id) {
@@ -126,11 +117,7 @@ TraceEvent debugTagsAndMessageEnabled(const char* context, Version version, Stri
 
 #if MUTATION_TRACKING_ENABLED
 TraceEvent debugMutation(const char* context, Version version, MutationRef const& mutation, UID id) {
-	if (mutation.type == mutation.Encrypted) {
-		return debugEncrptedMutationEnabled(context, version, mutation, id);
-	} else {
-		return debugMutationEnabled(context, version, mutation, id);
-	}
+	return debugMutationEnabled(context, version, mutation, id);
 }
 TraceEvent debugKeyRange(const char* context, Version version, KeyRangeRef const& keys, UID id) {
 	return debugKeyRangeEnabled(context, version, keys, id);

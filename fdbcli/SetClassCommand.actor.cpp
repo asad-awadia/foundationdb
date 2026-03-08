@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -132,6 +132,6 @@ CommandFactory setClassFactory(
                 "classes are `unset', `storage', `transaction', `resolution', `commit_proxy', `grv_proxy', "
                 "`master', `test', "
                 "`stateless', `log', `router', `cluster_controller', `fast_restore', `data_distributor', "
-                "`coordinator', `ratekeeper', `storage_cache', `backup', and `default'."));
+                "`coordinator', `ratekeeper', `backup', and `default'."));
 
 } // namespace fdb_cli

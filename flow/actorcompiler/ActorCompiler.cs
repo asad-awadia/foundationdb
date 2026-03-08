@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -525,7 +525,7 @@ namespace actorcompiler
                 writer.WriteLine("ACTOR_TEST_CASE({0}, {1})", actor.name, actor.testCaseParameters);
             }
 
-            Console.WriteLine("\tCompiled ACTOR {0} (line {1})", actor.name, actor.SourceLine);
+            // Console.WriteLine("\tCompiled ACTOR {0} (line {1})", actor.name, actor.SourceLine);
         }
 
         const string thisAddress = "reinterpret_cast<unsigned long>(this)";

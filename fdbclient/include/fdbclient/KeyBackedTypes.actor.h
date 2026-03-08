@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -600,9 +600,9 @@ public:
 			    map(safeThreadFutureToFuture(getRangeFuture),
 			        [prefix = subspace.begin, valueCodec = valueCodec](RangeResult const& kvs) -> RangeResultType {
 				        RangeResultType rangeResult;
-				        for (int i = 0; i < kvs.size(); ++i) {
-					        KeyType key = KeyCodec::unpack(kvs[i].key.removePrefix(prefix));
-					        ValueType val = valueCodec.unpack(kvs[i].value);
+				        for (const auto& keyValue : kvs) {
+					        KeyType key = KeyCodec::unpack(keyValue.key.removePrefix(prefix));
+					        ValueType val = valueCodec.unpack(keyValue.value);
 					        rangeResult.results.push_back(PairType(key, val));
 				        }
 				        rangeResult.more = kvs.more;

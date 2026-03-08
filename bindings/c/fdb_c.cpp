@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 #define FDB_USE_LATEST_API_VERSION
 #define FDB_INCLUDE_LEGACY_TYPES
 
+#include "fdbclient/CommitTransaction.h"
 #include "fdbclient/MultiVersionTransaction.h"
 #include "fdbclient/MultiVersionAssignmentVars.h"
 #include "foundationdb/fdb_c.h"
@@ -39,14 +40,12 @@ int g_api_version = 0;
  *   FDBFuture -> ThreadSingleAssignmentVarBase
  *   FDBResult -> ThreadSingleAssignmentVarBase
  *   FDBDatabase -> IDatabase
- *   FDBTenant -> ITenant
  *   FDBTransaction -> ITransaction
  */
 #define TSAVB(f) ((ThreadSingleAssignmentVarBase*)(f))
 #define TSAV(T, f) ((ThreadSingleAssignmentVar<T>*)(f))
 
 #define DB(d) ((IDatabase*)d)
-#define TENANT(t) ((ITenant*)t)
 #define TXN(t) ((ITransaction*)t)
 
 // Legacy (pre API version 610)
@@ -333,16 +332,6 @@ extern "C" DLLEXPORT fdb_error_t fdb_future_get_key_array(FDBFuture* f, FDBKey c
 	                 *out_count = na.size(););
 }
 
-namespace {
-
-void parseGetTenant(Optional<KeyRef>& dest, FDBBGTenantPrefix const* source) {
-	if (source->present) {
-		dest = StringRef(source->prefix.key, source->prefix.key_length);
-	}
-}
-
-} // namespace
-
 extern "C" DLLEXPORT void fdb_result_destroy(FDBResult* r) {
 	CATCH_AND_DIE(TSAVB(r)->cancel(););
 }
@@ -424,12 +413,31 @@ extern "C" DLLEXPORT void fdb_database_destroy(FDBDatabase* d) {
 	CATCH_AND_DIE(DB(d)->delref(););
 }
 
+// Define these symbols so that older client bindings (in particular,
+// python) can load them at startup. Nobody should be calling this
+// stuff in 8.0.0+ because it has always been experimental and is now
+// deleted.
 extern "C" DLLEXPORT fdb_error_t fdb_database_open_tenant(FDBDatabase* d,
                                                           uint8_t const* tenant_name,
                                                           int tenant_name_length,
                                                           FDBTenant** out_tenant) {
-	CATCH_AND_RETURN(*out_tenant =
-	                     (FDBTenant*)DB(d)->openTenant(TenantNameRef(tenant_name, tenant_name_length)).extractPtr(););
+	fprintf(stderr, "Unexpected call to removed functionality [fdb_database_open_tenant]\n");
+	abort();
+}
+
+extern "C" DLLEXPORT fdb_error_t fdb_tenant_create_transaction(FDBTenant* tenant, FDBTransaction** out_transaction) {
+	fprintf(stderr, "Unexpected call to removed functionality [fdb_tenant_create_transaction]\n");
+	abort();
+}
+
+extern "C" DLLEXPORT WARN_UNUSED_RESULT FDBFuture* fdb_tenant_get_id(FDBTenant* tenant) {
+	fprintf(stderr, "Unexpected call to removed functionality [fdb_tenant_get_id]\n");
+	abort();
+}
+
+extern "C" DLLEXPORT void fdb_tenant_destroy(FDBTenant* tenant) {
+	fprintf(stderr, "Unexpected call to removed functionality [fdb_tenant_destroy]\n");
+	abort();
 }
 
 extern "C" DLLEXPORT fdb_error_t fdb_database_create_transaction(FDBDatabase* d, FDBTransaction** out_transaction) {
@@ -498,21 +506,6 @@ extern "C" DLLEXPORT FDBFuture* fdb_database_get_server_protocol(FDBDatabase* db
 
 extern "C" DLLEXPORT WARN_UNUSED_RESULT FDBFuture* fdb_database_get_client_status(FDBDatabase* db) {
 	return (FDBFuture*)(DB(db)->getClientStatus().extractPtr());
-}
-
-extern "C" DLLEXPORT fdb_error_t fdb_tenant_create_transaction(FDBTenant* tenant, FDBTransaction** out_transaction) {
-	CATCH_AND_RETURN(*out_transaction = (FDBTransaction*)TENANT(tenant)->createTransaction().extractPtr(););
-}
-
-extern "C" DLLEXPORT WARN_UNUSED_RESULT FDBFuture* fdb_tenant_get_id(FDBTenant* tenant) {
-	return (FDBFuture*)(TENANT(tenant)->getId().extractPtr());
-}
-
-extern "C" DLLEXPORT void fdb_tenant_destroy(FDBTenant* tenant) {
-	try {
-		TENANT(tenant)->delref();
-	} catch (...) {
-	}
 }
 
 extern "C" DLLEXPORT void fdb_transaction_destroy(FDBTransaction* tr) {
@@ -596,7 +589,7 @@ FDBFuture* validate_and_update_parameters(int& limit,
 
 	/* _ITERATOR mode maps to one of the known streaming modes
 	   depending on iteration */
-	const int mode_bytes_array[] = { GetRangeLimits::BYTE_LIMIT_UNLIMITED, 256, 1000, 4096, 80000 };
+	const int mode_bytes_array[] = { GetRangeLimits::BYTE_LIMIT_UNLIMITED, 256, 1000, 4096, 120000 };
 
 	/* The progression used for FDB_STREAMING_MODE_ITERATOR.
 	   Goes 1.5 * previous. */

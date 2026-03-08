@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,7 +53,7 @@ typedef uint64_t CoordinatorsHash;
 static const KeyRef invalidKey = "\xff\xff\xff\xff\xff\xff\xff\xff"_sr;
 
 enum {
-	tagLocalitySpecial = -1, // tag with this locality means it is invalidTag (id=0), txsTag (id=1), or cacheTag (id=2)
+	tagLocalitySpecial = -1, // tag with this locality means it is invalidTag (id=0) or txsTag (id=1)
 	tagLocalityLogRouter = -2,
 	tagLocalityRemoteLog = -3, // tag created by log router for remote (aka. not in Primary DC) tLogs
 	tagLocalityUpgraded = -4, // tlogs with old log format (no longer applicable)
@@ -156,7 +156,6 @@ struct hash<Tag> {
 
 static const Tag invalidTag{ tagLocalitySpecial, 0 };
 static const Tag txsTag{ tagLocalitySpecial, 1 }; // obsolete now
-static const Tag cacheTag{ tagLocalitySpecial, 2 };
 
 struct TagsAndMessage {
 	StringRef message;
@@ -318,7 +317,7 @@ struct KeyRangeRef {
 	KeyRangeRef() {}
 	KeyRangeRef(const KeyRef& begin, const KeyRef& end) : begin(begin), end(end) {
 		if (begin > end) {
-			TraceEvent("InvertedRange").detail("Begin", begin).detail("End", end);
+			TraceEvent("InvertedRange").detail("Begin", begin).detail("End", end).backtrace();
 			throw inverted_range();
 		}
 	}
@@ -394,7 +393,7 @@ struct KeyRangeRef {
 		}
 
 		if (begin > end) {
-			TraceEvent("InvertedRange").detail("Begin", begin).detail("End", end);
+			TraceEvent("InvertedRange").detail("Begin", begin).detail("End", end).backtrace();
 			throw inverted_range();
 		};
 	}
@@ -1424,89 +1423,20 @@ struct StorageMigrationType {
 	uint32_t type;
 };
 
-struct TenantMode {
+// We assume this type is persistend in database metadata. Rename it to indicate
+// deprecation status, but leave the values as-is so that they can be interpreted.
+struct EncryptionAtRestModeDeprecated {
 	// These enumerated values are stored in the database configuration, so can NEVER be changed.  Only add new ones
 	// just before END.
-	// Note: OPTIONAL_TENANT is not named OPTIONAL because of a collision with a Windows macro.
-	enum Mode { DISABLED = 0, OPTIONAL_TENANT = 1, REQUIRED = 2, END = 3 };
+	enum Mode {
+		DISABLED = 0,
+		DOMAIN_AWARE = 1,
+		CLUSTER_AWARE = 2,
+		END = 3,
+	};
 
-	TenantMode() : mode(DISABLED) {}
-	TenantMode(Mode mode) : mode(mode) {
-		if ((uint32_t)mode >= END) {
-			this->mode = DISABLED;
-		}
-	}
-	operator Mode() const { return Mode(mode); }
-
-	template <class Ar>
-	void serialize(Ar& ar) {
-		serializer(ar, mode);
-	}
-
-	// This does not go back-and-forth cleanly with toString
-	// The '_experimental' suffix, if present, needs to be removed in order to be parsed.
-	static TenantMode fromString(std::string mode) {
-		if (mode.find("_experimental") != std::string::npos) {
-			mode.replace(mode.find("_experimental"), std::string::npos, "");
-		}
-		if (mode == "disabled") {
-			return TenantMode::DISABLED;
-		} else if (mode == "optional") {
-			return TenantMode::OPTIONAL_TENANT;
-		} else if (mode == "required") {
-			return TenantMode::REQUIRED;
-		} else {
-			TraceEvent(SevError, "UnknownTenantMode").detail("TenantMode", mode);
-			ASSERT(false);
-			throw internal_error();
-		}
-	}
-
-	std::string toString() const {
-		switch (mode) {
-		case DISABLED:
-			return "disabled";
-		case OPTIONAL_TENANT:
-			return "optional_experimental";
-		case REQUIRED:
-			return "required_experimental";
-		default:
-			ASSERT(false);
-		}
-		return "";
-	}
-
-	Value toValue() const { return ValueRef(format("%d", (int)mode)); }
-
-	static TenantMode fromValue(Optional<ValueRef> val) {
-		if (!val.present()) {
-			return DISABLED;
-		}
-
-		// A failed parsing returns 0 (DISABLED)
-		int num = atoi(val.get().toString().c_str());
-		if (num < 0 || num >= END) {
-			return DISABLED;
-		}
-
-		return static_cast<Mode>(num);
-	}
-
-	uint32_t mode;
-};
-
-template <>
-struct Traceable<TenantMode> : std::true_type {
-	static std::string toString(const TenantMode& value) { return value.toString(); }
-};
-
-struct EncryptionAtRestMode {
-	// These enumerated values are stored in the database configuration, so can NEVER be changed.  Only add new ones
-	// just before END.
-	enum Mode { DISABLED = 0, DOMAIN_AWARE = 1, CLUSTER_AWARE = 2, END = 3 };
-
-	EncryptionAtRestMode() : mode(DISABLED) {}
-	EncryptionAtRestMode(Mode mode) : mode(mode) {
+	EncryptionAtRestModeDeprecated() : mode(DISABLED) {}
+	EncryptionAtRestModeDeprecated(Mode mode) : mode(mode) {
 		if ((uint32_t)mode >= END) {
 			this->mode = DISABLED;
 		}
@@ -1532,13 +1462,13 @@ struct EncryptionAtRestMode {
 		return "";
 	}
 
-	static EncryptionAtRestMode fromString(std::string mode) {
+	static EncryptionAtRestModeDeprecated fromString(std::string mode) {
 		if (mode == "disabled") {
-			return EncryptionAtRestMode::DISABLED;
+			return EncryptionAtRestModeDeprecated::DISABLED;
 		} else if (mode == "cluster_aware") {
-			return EncryptionAtRestMode::CLUSTER_AWARE;
+			return EncryptionAtRestModeDeprecated::CLUSTER_AWARE;
 		} else if (mode == "domain_aware") {
-			return EncryptionAtRestMode::DOMAIN_AWARE;
+			return EncryptionAtRestModeDeprecated::DOMAIN_AWARE;
 		} else {
 			TraceEvent(SevError, "UnknownEncryptMode").detail("EncryptMode", mode);
 			ASSERT(false);
@@ -1548,16 +1478,16 @@ struct EncryptionAtRestMode {
 
 	Value toValue() const { return ValueRef(format("%d", (int)mode)); }
 
-	bool isEquals(const EncryptionAtRestMode& e) const { return this->mode == e.mode; }
+	bool isEquals(const EncryptionAtRestModeDeprecated& e) const { return this->mode == e.mode; }
 
-	bool operator==(const EncryptionAtRestMode& e) const { return isEquals(e); }
-	bool operator!=(const EncryptionAtRestMode& e) const { return !isEquals(e); }
+	bool operator==(const EncryptionAtRestModeDeprecated& e) const { return isEquals(e); }
+	bool operator!=(const EncryptionAtRestModeDeprecated& e) const { return !isEquals(e); }
 	bool operator==(Mode m) const { return mode == m; }
 	bool operator!=(Mode m) const { return mode != m; }
 
-	bool isEncryptionEnabled() const { return mode != EncryptionAtRestMode::DISABLED; }
+	bool isEncryptionEnabled() const { return mode != EncryptionAtRestModeDeprecated::DISABLED; }
 
-	static EncryptionAtRestMode fromValueRef(Optional<ValueRef> val) {
+	static EncryptionAtRestModeDeprecated fromValueRef(Optional<ValueRef> val) {
 		if (!val.present()) {
 			return DISABLED;
 		}
@@ -1571,26 +1501,27 @@ struct EncryptionAtRestMode {
 		return static_cast<Mode>(num);
 	}
 
-	static EncryptionAtRestMode fromValue(Optional<Value> val) {
+	static EncryptionAtRestModeDeprecated fromValue(Optional<Value> val) {
 		if (!val.present()) {
-			return EncryptionAtRestMode();
+			return EncryptionAtRestModeDeprecated();
 		}
 
-		return EncryptionAtRestMode::fromValueRef(Optional<ValueRef>(val.get().contents()));
+		return EncryptionAtRestModeDeprecated::fromValueRef(Optional<ValueRef>(val.get().contents()));
 	}
 
 	uint32_t mode;
 };
 
 template <>
-struct Traceable<EncryptionAtRestMode> : std::true_type {
-	static std::string toString(const EncryptionAtRestMode& mode) { return mode.toString(); }
+struct Traceable<EncryptionAtRestModeDeprecated> : std::true_type {
+	static std::string toString(const EncryptionAtRestModeDeprecated& mode) { return mode.toString(); }
 };
 
 typedef StringRef ClusterNameRef;
 typedef Standalone<ClusterNameRef> ClusterName;
 
-enum class ClusterType { STANDALONE, METACLUSTER_MANAGEMENT, METACLUSTER_DATA };
+// TODO(gglass): delete metacluster code and tenant code and reassess the need for this enum
+enum class ClusterType { STANDALONE, LEGACY_UNUSED_METACLUSTER_MANAGEMENT, LEGACY_UNUSED_METACLUSTER_DATA };
 
 struct GRVCacheSpace {
 	Version cachedReadVersion;
@@ -1701,7 +1632,7 @@ struct StorageWiggleValue {
 	}
 };
 
-enum class ReadType { EAGER = 0, FETCH = 1, LOW = 2, NORMAL = 3, HIGH = 4, MIN = EAGER, MAX = HIGH };
+enum ReadType { EAGER = 0, FETCH = 1, LOW = 2, NORMAL = 3, HIGH = 4, MIN = EAGER, MAX = HIGH };
 
 FDB_BOOLEAN_PARAM(CacheResult);
 

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -154,8 +154,8 @@ bool verifyMD5(HTTPData<std::string>* data, bool fail_if_header_missing, Optiona
 std::string IncomingResponse::toString() const {
 	std::string r = fmt::format("Response Code: {0}\n", code);
 	r += fmt::format("Response ContentLen: {0}\n", data.contentLen);
-	for (auto h : data.headers)
-		r += fmt::format("Response Header: {0}: {1}\n", h.first, h.second);
+	for (const auto& [headerName, headerValue] : data.headers)
+		r += fmt::format("Response Header: {0}: {1}\n", headerName, headerValue);
 	r.append("-- RESPONSE CONTENT--\n");
 	// Limit the length of the response content to 1024 bytes for logging.
 	// No one wants 40MB of content dumped to the console.
@@ -171,10 +171,10 @@ std::string IncomingResponse::toString() const {
 }
 
 void writeHeaders(HTTP::Headers const& headers, PacketWriter& writer) {
-	for (auto h : headers) {
-		writer.serializeBytes(h.first);
+	for (const auto& [headerName, headerValue] : headers) {
+		writer.serializeBytes(headerName);
 		writer.serializeBytes(": "_sr);
-		writer.serializeBytes(h.second);
+		writer.serializeBytes(headerValue);
 		writer.serializeBytes("\r\n"_sr);
 	}
 	writer.serializeBytes("\r\n"_sr);
@@ -358,7 +358,7 @@ ACTOR Future<Void> readHTTPData(HTTPData<std::string>* r,
 
 	auto i = r->headers.find("Content-Length");
 	if (i != r->headers.end()) {
-		r->contentLen = strtoll(i->second.c_str(), NULL, 10);
+		r->contentLen = strtoll(i->second.c_str(), nullptr, 10);
 	} else {
 		r->contentLen = -1; // Content length unknown
 	}

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,7 +48,6 @@ struct DataDistributionTrackerInitParams {
 	Reference<AsyncVar<bool>> anyZeroHealthyTeams;
 	KeyRangeMap<ShardTrackedData>* shards = nullptr;
 	bool* trackerCancelled = nullptr;
-	Optional<Reference<TenantCache>> ddTenantCache;
 	int32_t usableRegions = -1;
 };
 
@@ -114,8 +113,6 @@ public:
 			return &tracker;
 		}
 	};
-
-	Optional<Reference<TenantCache>> ddTenantCache;
 
 	Reference<DDConfiguration::RangeConfigMapSnapshot> userRangeConfig;
 

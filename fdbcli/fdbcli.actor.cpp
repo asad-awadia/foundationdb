@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,7 +40,6 @@
 #include "fdbclient/FDBOptions.g.h"
 #include "fdbclient/SystemData.h"
 #include "fdbclient/TagThrottle.actor.h"
-#include "fdbclient/TenantManagement.actor.h"
 #include "fdbclient/Tuple.h"
 
 #include "fdbclient/ThreadSafeTransaction.h"
@@ -352,6 +351,7 @@ static std::string formatStringRef(StringRef item, bool fullEscaping = false) {
 	return ret;
 }
 
+// NOLINTBEGIN(bugprone-use-after-move): ignore clang-tidy false positives in parseLine's token buffer handling.
 static std::vector<std::vector<StringRef>> parseLine(std::string& line, bool& err, bool& partial) {
 	err = false;
 	partial = false;
@@ -469,6 +469,7 @@ static std::vector<std::vector<StringRef>> parseLine(std::string& line, bool& er
 
 	return ret;
 }
+// NOLINTEND(bugprone-use-after-move)
 
 static void printProgramUsage(const char* name) {
 	printf("FoundationDB CLI " FDB_VT_PACKAGE_NAME " (v" FDB_VT_VERSION ")\n"
@@ -525,14 +526,11 @@ void initHelp() {
 	                "transaction, and are automatically committed for you. By explicitly beginning a transaction, "
 	                "successive operations are all performed as part of a single transaction.\n\nTo commit the "
 	                "transaction, use the commit command. To discard the transaction, use the reset command.");
-	helpMap["commit"] = CommandHelp("commit [description]",
+	helpMap["commit"] = CommandHelp("commit",
 	                                "commit the current transaction",
 	                                "Any sets or clears executed after the start of the current transaction will be "
 	                                "committed to the database. On success, the committed version number is displayed. "
-	                                "If commit fails, the error is displayed and the transaction must be retried. The "
-	                                "command optionally allows for a description in case the transaction targets the "
-	                                "configuration database. If no description is provided in the command, a prompt "
-	                                "will be shown asking for a relevant description of the configuration change");
+	                                "If commit fails, the error is displayed and the transaction must be retried.");
 	helpMap["clear"] = CommandHelp(
 	    "clear <KEY>",
 	    "clear a key from the database",
@@ -566,12 +564,7 @@ void initHelp() {
 	    CommandHelp("getversion",
 	                "Fetch the current read version",
 	                "Displays the current read version of the database or currently running transaction.");
-	helpMap["quota"] = CommandHelp("quota",
-	                               "quota [get <tag> [reserved_throughput|total_throughput|storage] | "
-	                               "set <tag> [reserved_throughput|total_throughput|storage] <value> | "
-	                               "clear <tag>]",
-	                               "Get, modify, or clear the reserved/total throughput quota (in bytes/s) or "
-	                               "storage quota (in bytes) for the specified tag.");
+
 	helpMap["reset"] =
 	    CommandHelp("reset",
 	                "reset the current transaction",
@@ -583,17 +576,6 @@ void initHelp() {
 	helpMap["set"] = CommandHelp("set <KEY> <VALUE>",
 	                             "set a value for a given key",
 	                             "If KEY is not already present in the database, it will be created." ESCAPINGKV);
-
-	helpMap["setknob"] = CommandHelp("setknob <KEY> <VALUE> [CONFIG_CLASS]",
-	                                 "updates a knob to specified value",
-	                                 "setknob will prompt for a description of the changes" ESCAPINGKV);
-
-	helpMap["getknob"] = CommandHelp(
-	    "getknob <KEY> [CONFIG_CLASS]", "gets the value of the specified knob", "CONFIG_CLASS is optional." ESCAPINGK);
-
-	helpMap["clearknob"] = CommandHelp("clearknob <KEY> [CONFIG_CLASS]",
-	                                   "clears the value of the specified knob in the configuration database",
-	                                   "CONFIG_CLASS is optional." ESCAPINGK);
 
 	helpMap["option"] = CommandHelp(
 	    "option <STATE> <OPTION> <ARG>",
@@ -608,19 +590,6 @@ void initHelp() {
 	helpMap["writemode"] = CommandHelp("writemode <on|off>",
 	                                   "enables or disables sets and clears",
 	                                   "Setting or clearing keys from the CLI is not recommended.");
-	helpMap["usetenant"] =
-	    CommandHelp("usetenant [NAME]",
-	                "prints or configures the tenant used for transactions",
-	                "If no name is given, prints the name of the current active tenant. Otherwise, all commands that "
-	                "are used to read or write keys are done inside the tenant with the specified NAME. By default, "
-	                "no tenant is configured and operations are performed on the raw key-space. The tenant cannot be "
-	                "configured while a transaction started with `begin' is open.");
-	helpMap["defaulttenant"] =
-	    CommandHelp("defaulttenant",
-	                "configures transactions to not use a named tenant",
-	                "All commands that are used to read or write keys will be done without a tenant and will operate "
-	                "on the raw key-space. This is the default behavior. The tenant cannot be configured while a "
-	                "transaction started with `begin' is open.");
 }
 
 void printVersion() {
@@ -763,18 +732,13 @@ ACTOR Future<bool> createSnapshot(Database db, std::vector<StringRef> tokens) {
 
 // TODO: Update the function to get rid of the Database after refactoring
 Reference<ITransaction> getTransaction(Reference<IDatabase> db,
-                                       Reference<ITenant> tenant,
                                        Reference<ITransaction>& tr,
                                        FdbOptions* options,
                                        bool intrans) {
 	// Update "tr" to point to a brand new transaction object when it's not initialized or "intrans" flag is "false",
 	// which indicates we need a new transaction object
 	if (!tr || !intrans) {
-		if (tenant) {
-			tr = tenant->createTransaction();
-		} else {
-			tr = db->createTransaction();
-		}
+		tr = db->createTransaction();
 		options->apply(tr);
 	}
 
@@ -1103,26 +1067,13 @@ Future<T> stopNetworkAfter(Future<T> what) {
 	}
 }
 
-enum TransType { Db = 0, Config, None };
-
 ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterConnectionFile> ccf) {
 	state LineNoise& linenoise = *plinenoise;
 	state bool intrans = false;
-	state TransType transtype = TransType::None;
-	state bool isCommitDesc = false;
 
 	state Database localDb;
 	state Reference<IDatabase> db;
-	state Reference<IDatabase> configDb;
-	state Reference<ITenant> tenant;
-	state Optional<TenantName> tenantName;
-	state Optional<TenantMapEntry> tenantEntry;
-
-	// This tenant is kept empty for operations that perform management tasks (e.g. killing a process)
-	state const Reference<ITenant> managementTenant;
-
 	state Reference<ITransaction> tr;
-	state Reference<ITransaction> config_tr;
 	state Transaction trx;
 
 	state bool writeMode = false;
@@ -1145,8 +1096,6 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 			printf("Using cluster file `%s'.\n", ccf->getLocation().c_str());
 		}
 		db = API->createDatabase(opt.clusterFile.c_str());
-		configDb = API->createDatabase(opt.clusterFile.c_str());
-		configDb->setOption(FDBDatabaseOptions::USE_CONFIG_DATABASE);
 	} catch (Error& e) {
 		fprintf(stderr, "ERROR: %s (%d)\n", e.what(), e.code());
 		printf("Unable to connect to cluster from `%s'\n", ccf->getLocation().c_str());
@@ -1173,7 +1122,7 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 	// The 3.0 timeout is a guard to avoid waiting forever when the cli cannot talk to any coordinators
 	loop {
 		try {
-			getTransaction(db, managementTenant, tr, options, intrans);
+			getTransaction(db, tr, options, intrans);
 			tr->setOption(FDBTransactionOptions::LOCK_AWARE);
 			wait(delay(3.0) || success(safeThreadFutureToFuture(tr->getReadVersion())));
 			break;
@@ -1340,8 +1289,8 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 				}
 
 				if (tokencmp(tokens[0], "waitopen")) {
-					wait(makeInterruptable(success(safeThreadFutureToFuture(
-					    getTransaction(db, managementTenant, tr, options, intrans)->getReadVersion()))));
+					wait(makeInterruptable(
+					    success(safeThreadFutureToFuture(getTransaction(db, tr, options, intrans)->getReadVersion()))));
 					continue;
 				}
 
@@ -1487,59 +1436,27 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 						activeOptions = FdbOptions(globalOptions);
 						options = &activeOptions;
 						intrans = true;
-						transtype = TransType::None;
-						getTransaction(db, tenant, tr, options, false);
+						getTransaction(db, tr, options, false);
 						printf("Transaction started\n");
 					}
 					continue;
 				}
 
 				if (tokencmp(tokens[0], "commit")) {
-					if (tokens.size() > 2) {
+					if (tokens.size() != 1) {
 						printUsage(tokens[0]);
 						is_error = true;
 					} else if (!intrans) {
 						fprintf(stderr, "ERROR: No active transaction\n");
 						is_error = true;
 					} else {
-						if (isCommitDesc && tokens.size() == 1) {
-							// prompt for description and add to txn
-							state Optional<std::string> raw;
-							warn.cancel();
-							while (!raw.present() || raw.get().empty()) {
-								fprintf(stdout,
-								        "Please set a description for the change. Description must be non-empty.\n");
-								state Optional<std::string> rawline =
-								    wait(makeInterruptable(linenoise.read("description: ")));
-								raw = rawline;
-							}
-							std::string line = raw.get();
-							config_tr->set("\xff\xff/description"_sr, line);
-						}
 						warn =
 						    checkStatus(timeWarning(5.0, "\nWARNING: Long delay (Ctrl-C to interrupt)\n"), db, localDb);
-						if (transtype == TransType::Db) {
-							wait(commitTransaction(tr));
-						} else {
-							if (tokens.size() > 1) {
-								config_tr->set("\xff\xff/description"_sr, tokens[1]);
-							}
-							wait(commitTransaction(config_tr));
-						}
-						isCommitDesc = false;
+						wait(commitTransaction(tr));
 						intrans = false;
-						transtype = TransType::None;
 						options = &globalOptions;
 					}
 
-					continue;
-				}
-
-				if (tokencmp(tokens[0], "quota")) {
-					bool _result = wait(makeInterruptable(quotaCommandActor(db, tokens)));
-					if (!_result) {
-						is_error = true;
-					}
 					continue;
 				}
 
@@ -1551,16 +1468,10 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 						fprintf(stderr, "ERROR: No active transaction\n");
 						is_error = true;
 					} else {
-						if (transtype == TransType::Config) {
-							config_tr->reset();
-						} else {
-							tr->reset();
-							activeOptions = FdbOptions(globalOptions);
-							options = &activeOptions;
-							options->apply(tr);
-						}
-						isCommitDesc = false;
-						transtype = TransType::None;
+						tr->reset();
+						activeOptions = FdbOptions(globalOptions);
+						options = &activeOptions;
+						options->apply(tr);
 						printf("Transaction reset\n");
 					}
 					continue;
@@ -1586,17 +1497,8 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 						printUsage(tokens[0]);
 						is_error = true;
 					} else {
-						if (intrans) {
-							if (transtype == TransType::None) {
-								transtype = TransType::Db;
-							} else if (transtype == TransType::Config) {
-								fprintf(stderr, "ERROR: Cannot perform get in configuration transaction\n");
-								is_error = true;
-								continue;
-							}
-						}
 						state ThreadFuture<Optional<Value>> valueF =
-						    getTransaction(db, tenant, tr, options, intrans)->get(tokens[1]);
+						    getTransaction(db, tr, options, intrans)->get(tokens[1]);
 						Optional<Standalone<StringRef>> v = wait(makeInterruptable(safeThreadFutureToFuture(valueF)));
 
 						if (v.present())
@@ -1616,7 +1518,7 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 
 				if (tokencmp(tokens[0], "getall")) {
 					Version _v = wait(makeInterruptable(
-					    safeThreadFutureToFuture(getTransaction(db, tenant, tr, options, intrans)->getReadVersion())));
+					    safeThreadFutureToFuture(getTransaction(db, tr, options, intrans)->getReadVersion())));
 					bool _result = wait(makeInterruptable(getallCommandActor(localDb, tokens, _v)));
 					if (!_result)
 						is_error = true;
@@ -1635,8 +1537,8 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 						printUsage(tokens[0]);
 						is_error = true;
 					} else {
-						Version v = wait(makeInterruptable(safeThreadFutureToFuture(
-						    getTransaction(db, tenant, tr, options, intrans)->getReadVersion())));
+						Version v = wait(makeInterruptable(
+						    safeThreadFutureToFuture(getTransaction(db, tr, options, intrans)->getReadVersion())));
 						fmt::print("{}\n", v);
 					}
 					continue;
@@ -1657,7 +1559,7 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 				}
 
 				if (tokencmp(tokens[0], "kill")) {
-					getTransaction(db, managementTenant, tr, options, intrans);
+					getTransaction(db, tr, options, intrans);
 					bool _result = wait(makeInterruptable(killCommandActor(db, tr, tokens, &address_interface)));
 					if (!_result)
 						is_error = true;
@@ -1665,7 +1567,7 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 				}
 
 				if (tokencmp(tokens[0], "suspend")) {
-					getTransaction(db, managementTenant, tr, options, intrans);
+					getTransaction(db, tr, options, intrans);
 					bool _result = wait(makeInterruptable(suspendCommandActor(db, tr, tokens, &address_interface)));
 					if (!_result)
 						is_error = true;
@@ -1731,7 +1633,7 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 				}
 
 				if (tokencmp(tokens[0], "consistencycheck")) {
-					getTransaction(db, managementTenant, tr, options, intrans);
+					getTransaction(db, tr, options, intrans);
 					bool _result = wait(makeInterruptable(consistencyCheckCommandActor(tr, tokens, intrans)));
 					if (!_result)
 						is_error = true;
@@ -1746,7 +1648,7 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 				}
 
 				if (tokencmp(tokens[0], "profile")) {
-					getTransaction(db, managementTenant, tr, options, intrans);
+					getTransaction(db, tr, options, intrans);
 					bool _result = wait(makeInterruptable(profileCommandActor(localDb, tr, tokens, intrans)));
 					if (!_result)
 						is_error = true;
@@ -1754,7 +1656,7 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 				}
 
 				if (tokencmp(tokens[0], "expensive_data_check")) {
-					getTransaction(db, managementTenant, tr, options, intrans);
+					getTransaction(db, tr, options, intrans);
 					bool _result =
 					    wait(makeInterruptable(expensiveDataCheckCommandActor(db, tr, tokens, &address_interface)));
 					if (!_result)
@@ -1770,17 +1672,6 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 					} else {
 						state int limit;
 						bool valid = true;
-						if (intrans) {
-							if (transtype == TransType::None) {
-								transtype = TransType::Db;
-							} else if (transtype == TransType::Config) {
-								fprintf(
-								    stderr,
-								    "ERROR: Cannot perform getrange or getrangekeys in configuration transaction\n");
-								is_error = true;
-								continue;
-							}
-						}
 						if (tokens.size() == 4) {
 							// INT_MAX is 10 digits; rather than
 							// worrying about overflow we'll just cap
@@ -1824,7 +1715,7 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 							endKey = strinc(tokens[1]);
 						}
 
-						getTransaction(db, tenant, tr, options, intrans);
+						getTransaction(db, tr, options, intrans);
 						state ThreadFuture<RangeResult> kvsF = tr->getRange(KeyRangeRef(tokens[1], endKey), limit);
 						RangeResult kvs = wait(makeInterruptable(safeThreadFutureToFuture(kvsF)));
 
@@ -1869,156 +1760,11 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 						printUsage(tokens[0]);
 						is_error = true;
 					} else {
-						if (intrans) {
-							if (transtype == TransType::None) {
-								transtype = TransType::Db;
-							} else if (transtype == TransType::Config) {
-								fprintf(stderr, "ERROR: Cannot perform set in configuration transaction\n");
-								is_error = true;
-								continue;
-							}
-						}
-						getTransaction(db, tenant, tr, options, intrans);
+						getTransaction(db, tr, options, intrans);
 						tr->set(tokens[1], tokens[2]);
 
 						if (!intrans) {
 							wait(commitTransaction(tr));
-						}
-					}
-					continue;
-				}
-
-				state Optional<std::string> raw_desc;
-				if (tokencmp(tokens[0], "setknob")) {
-					if (tokens.size() > 4 || tokens.size() < 3) {
-						printUsage(tokens[0]);
-						is_error = true;
-					} else {
-						if (intrans) {
-							if (transtype == TransType::None) {
-								transtype = TransType::Config;
-							} else if (transtype == TransType::Db) {
-								fprintf(stderr, "ERROR: Cannot perform setknob in database transaction\n");
-								is_error = true;
-								isCommitDesc = false;
-								continue;
-							}
-						}
-						Tuple t;
-						if (tokens.size() == 4) {
-							t.append(tokens[3]);
-						} else {
-							t.appendNull();
-						}
-						t.append(tokens[1]);
-						getTransaction(configDb, tenant, config_tr, options, intrans);
-
-						config_tr->set(t.pack(), tokens[2]);
-						if (!intrans) {
-							// prompt for description and add to txn
-							raw_desc.reset();
-							warn.cancel();
-							while (!raw_desc.present() || raw_desc.get().empty()) {
-								fprintf(stdout,
-								        "Please set a description for the change. Description must be non-empty\n");
-								Optional<std::string> rawline_knob =
-								    wait(makeInterruptable(linenoise.read("description: ")));
-								raw_desc = rawline_knob;
-							}
-							std::string line = raw_desc.get();
-							config_tr->set("\xff\xff/description"_sr, line);
-							warn = checkStatus(
-							    timeWarning(5.0, "\nWARNING: Long delay (Ctrl-C to interrupt)\n"), db, localDb);
-							wait(commitTransaction(config_tr));
-						} else {
-							isCommitDesc = true;
-						}
-					}
-					continue;
-				}
-
-				if (tokencmp(tokens[0], "getknob")) {
-					if (tokens.size() > 3 || tokens.size() < 2) {
-						printUsage(tokens[0]);
-						is_error = true;
-					} else {
-						if (intrans) {
-							if (transtype == TransType::None) {
-								transtype = TransType::Config;
-							} else if (transtype == TransType::Db) {
-								fprintf(stderr, "ERROR: Cannot perform getknob in database transaction\n");
-								is_error = true;
-								continue;
-							}
-						}
-						Tuple t;
-						if (tokens.size() == 2) {
-							t.appendNull();
-						} else {
-							t.append(tokens[2]);
-						}
-						t.append(tokens[1]);
-						state ThreadFuture<Optional<Value>> valueF_knob =
-						    getTransaction(configDb, tenant, config_tr, options, intrans)->get(t.pack());
-						Optional<Standalone<StringRef>> v =
-						    wait(makeInterruptable(safeThreadFutureToFuture(valueF_knob)));
-						std::string knob_class = printable(tokens[1]);
-						if (tokens.size() == 3) {
-							std::string config_class = (" in configuration class " + printable(tokens[2]));
-							knob_class += config_class;
-						}
-						if (v.present())
-							printf("`%s' is `%s'\n",
-							       knob_class.c_str(),
-							       Tuple::tupleToString(Tuple::unpack(v.get())).c_str());
-						else
-							printf("`%s' is not found\n", knob_class.c_str());
-					}
-					continue;
-				}
-
-				if (tokencmp(tokens[0], "clearknob")) {
-					if (tokens.size() > 3 || tokens.size() < 2) {
-						printUsage(tokens[0]);
-						is_error = true;
-					} else {
-						if (intrans) {
-							if (transtype == TransType::None) {
-								transtype = TransType::Config;
-							} else if (transtype == TransType::Db) {
-								fprintf(stderr, "ERROR: Cannot perform clearknob in database transaction\n");
-								is_error = true;
-								continue;
-							}
-						}
-						Tuple t;
-						if (tokens.size() == 2) {
-							t.appendNull();
-						} else {
-							t.append(tokens[2]);
-						}
-						t.append(tokens[1]);
-						getTransaction(configDb, tenant, config_tr, options, intrans);
-
-						config_tr->clear(t.pack());
-						if (!intrans) {
-							// prompt for description and add to txn
-							raw_desc.reset();
-							warn.cancel();
-							while (!raw_desc.present() || raw_desc.get().empty()) {
-								fprintf(stdout,
-								        "Please set a description for the change. Description must be non-empty\n");
-								Optional<std::string> rawline_knob =
-								    wait(makeInterruptable(linenoise.read("description: ")));
-								raw_desc = rawline_knob;
-							}
-							std::string line = raw_desc.get();
-							config_tr->set("\xff\xff/description"_sr, line);
-							warn = checkStatus(
-							    timeWarning(5.0, "\nWARNING: Long delay (Ctrl-C to interrupt)\n"), db, localDb);
-							wait(commitTransaction(config_tr));
-						} else {
-							isCommitDesc = true;
 						}
 					}
 					continue;
@@ -2035,16 +1781,7 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 						printUsage(tokens[0]);
 						is_error = true;
 					} else {
-						if (intrans) {
-							if (transtype == TransType::None) {
-								transtype = TransType::Db;
-							} else if (transtype == TransType::Config) {
-								fprintf(stderr, "ERROR: Cannot perform clear in configuration transaction\n");
-								is_error = true;
-								continue;
-							}
-						}
-						getTransaction(db, tenant, tr, options, intrans);
+						getTransaction(db, tr, options, intrans);
 						tr->clear(tokens[1]);
 
 						if (!intrans) {
@@ -2065,16 +1802,7 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 						printUsage(tokens[0]);
 						is_error = true;
 					} else {
-						if (intrans) {
-							if (transtype == TransType::None) {
-								transtype = TransType::Db;
-							} else if (transtype == TransType::Config) {
-								fprintf(stderr, "ERROR: Cannot perform clearrange in configuration transaction\n");
-								is_error = true;
-								continue;
-							}
-						}
-						getTransaction(db, tenant, tr, options, intrans);
+						getTransaction(db, tr, options, intrans);
 						tr->clear(KeyRangeRef(tokens[1], tokens[2]));
 
 						if (!intrans) {
@@ -2156,98 +1884,6 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 					continue;
 				}
 
-				if (tokencmp(tokens[0], "cache_range")) {
-					bool _result = wait(makeInterruptable(cacheRangeCommandActor(db, tokens)));
-					if (!_result)
-						is_error = true;
-					continue;
-				}
-
-				if (tokencmp(tokens[0], "usetenant")) {
-					if (tokens.size() > 2) {
-						printUsage(tokens[0]);
-						is_error = true;
-					} else if (intrans && tokens.size() == 2) {
-						fprintf(stderr, "ERROR: Tenant cannot be changed while a transaction is open\n");
-						is_error = true;
-					} else if (tokens.size() == 1) {
-						if (!tenantName.present()) {
-							printf("Using the default tenant\n");
-						} else {
-							printf("Using tenant `%s'\n", printable(tenantName.get()).c_str());
-						}
-					} else {
-						Optional<TenantMapEntry> entry =
-						    wait(makeInterruptable(TenantAPI::tryGetTenant(db, tokens[1])));
-						if (!entry.present()) {
-							fprintf(stderr, "ERROR: Tenant `%s' does not exist\n", printable(tokens[1]).c_str());
-							is_error = true;
-						} else {
-							tenant = db->openTenant(tokens[1]);
-							tenantName = tokens[1];
-							tenantEntry = entry;
-							printf("Using tenant `%s'\n", printable(tokens[1]).c_str());
-						}
-					}
-
-					continue;
-				}
-
-				if (tokencmp(tokens[0], "defaulttenant")) {
-					if (tokens.size() != 1) {
-						printUsage(tokens[0]);
-						is_error = true;
-					} else if (intrans) {
-						fprintf(stderr, "ERROR: Tenant cannot be changed while a transaction is open\n");
-						is_error = true;
-					} else {
-						tenant = Reference<ITenant>();
-						tenantName = Optional<Standalone<StringRef>>();
-						tenantEntry = Optional<TenantMapEntry>();
-						printf("Using the default tenant\n");
-					}
-
-					continue;
-				}
-
-				if (tokencmp(tokens[0], "tenant")) {
-					bool _result = wait(makeInterruptable(tenantCommand(db, tokens)));
-					if (!_result) {
-						is_error = true;
-					} else if (tokens.size() >= 3 && tenantName.present() && tokencmp(tokens[1], "delete") &&
-					           tokens[2] == tenantName.get()) {
-						printAtCol("WARNING: the active tenant was deleted. Use the `usetenant' or `defaulttenant' "
-						           "command to choose a new tenant.\n",
-						           80);
-					}
-
-					continue;
-				}
-
-				if (tokencmp(tokens[0], "createtenant") || tokencmp(tokens[0], "deletetenant") ||
-				    tokencmp(tokens[0], "listtenants") || tokencmp(tokens[0], "gettenant") ||
-				    tokencmp(tokens[0], "configuretenant") || tokencmp(tokens[0], "renametenant")) {
-					bool _result = wait(makeInterruptable(tenantCommandForwarder(db, tokens)));
-					if (!_result) {
-						is_error = true;
-					}
-					continue;
-				}
-
-				if (tokencmp(tokens[0], "tenantgroup")) {
-					bool _result = wait(makeInterruptable(tenantGroupCommand(db, tokens)));
-					if (!_result)
-						is_error = true;
-					continue;
-				}
-
-				if (tokencmp(tokens[0], "metacluster")) {
-					bool _result = wait(makeInterruptable(metaclusterCommand(db, tokens)));
-					if (!_result)
-						is_error = true;
-					continue;
-				}
-
 				if (tokencmp(tokens[0], "idempotencyids")) {
 					bool _result = wait(makeInterruptable(idempotencyIdsCommandActor(localDb, tokens)));
 					if (!_result) {
@@ -2280,12 +1916,6 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise, Reference<ClusterCo
 		} catch (Error& e) {
 			if (e.code() == error_code_operation_cancelled) {
 				throw;
-			}
-			if (e.code() == error_code_tenant_name_required) {
-				printAtCol("ERROR: tenant name required. Use the `usetenant' command to select a tenant or enable the "
-				           "`RAW_ACCESS' option to read raw keys.",
-				           80,
-				           stderr);
 			} else if (e.code() != error_code_actor_cancelled) {
 				fprintf(stderr, "ERROR: %s (%d)\n", e.what(), e.code());
 			}

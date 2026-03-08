@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,6 @@
 #include "fdbclient/json_spirit/json_spirit_value.h"
 #include "fdbclient/json_spirit/json_spirit_writer_options.h"
 #include "fdbclient/json_spirit/json_spirit_writer_template.h"
-#include "fdbrpc/TenantInfo.h"
 #include "fdbserver/WorkerInterface.actor.h"
 #include "flow/IRandom.h"
 #include "flow/IndexedSet.h"
@@ -1255,7 +1254,7 @@ ACTOR Future<bool> getKeyServers(
 			    commitProxyInfo->get(i, &CommitProxyInterface::getKeyServersLocations)
 			        .getReplyUnlessFailedFor(
 			            GetKeyServerLocationsRequest(
-			                span.context, TenantInfo(), begin, end, limitKeyServers, false, latestVersion, Arena()),
+			                span.context, begin, end, limitKeyServers, false, latestVersion, Arena()),
 			            2,
 			            0));
 

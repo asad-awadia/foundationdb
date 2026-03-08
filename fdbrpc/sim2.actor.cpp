@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,13 +18,10 @@
  * limitations under the License.
  */
 
-#include <cinttypes>
-#include <memory>
 #include <string>
 #include <utility>
 
 #include "flow/MkCert.h"
-#include "fmt/format.h"
 #include "fdbrpc/simulator.h"
 #include "flow/Arena.h"
 #ifndef BOOST_SYSTEM_NO_LIB
@@ -39,10 +36,9 @@
 #include "fdbrpc/SimExternalConnection.h"
 #include "flow/ActorCollection.h"
 #include "flow/IRandom.h"
-#include "flow/IThreadPool.h"
+#include "flow/CodeProbe.h"
 #include "flow/ProtocolVersion.h"
 #include "flow/Util.h"
-#include "flow/WriteOnlySet.h"
 #include "flow/IAsyncFile.h"
 #include "fdbrpc/AsyncFileCached.actor.h"
 #include "fdbrpc/AsyncFileEncrypted.h"
@@ -53,7 +49,6 @@
 #include "fdbrpc/TraceFileIO.h"
 #include "flow/flow.h"
 #include "flow/swift.h"
-#include "flow/swift_concurrency_hooks.h"
 #include "flow/swift/ABI/Task.h"
 #include "flow/genericactors.actor.h"
 #include "flow/network.h"
@@ -63,10 +58,12 @@
 #include "fdbrpc/ReplicationUtils.h"
 #include "fdbrpc/AsyncFileWriteChecker.actor.h"
 #include "fdbrpc/genericactors.actor.h"
+#include "fdbrpc/WellKnownEndpoints.h"
 #include "flow/FaultInjection.h"
 #include "flow/TaskQueue.h"
 #include "flow/IUDPSocket.h"
 #include "flow/IConnection.h"
+
 #include "flow/actorcompiler.h" // This must be the last #include.
 
 ISimulator* g_simulator = nullptr;
@@ -75,9 +72,9 @@ thread_local bool ISimulator::isMainThread = false;
 
 ISimulator::ISimulator()
   : desiredCoordinators(1), physicalDatacenters(1), processesPerMachine(0), listenersPerProcess(1), usableRegions(1),
-    allowLogSetKills(true), tssMode(TSSMode::Disabled), configDBType(ConfigDBType::DISABLED), isStopped(false),
-    lastConnectionFailure(0), connectionFailuresDisableDuration(0), speedUpSimulation(false),
-    connectionFailureEnableTime(0), disableTLogRecoveryFinish(false), backupAgents(BackupAgentType::WaitForType),
+    allowLogSetKills(true), tssMode(TSSMode::Disabled), isStopped(false), lastConnectionFailure(0),
+    connectionFailuresDisableDuration(0), speedUpSimulation(false), connectionFailureEnableTime(0),
+    disableTLogRecoveryFinish(false), backupAgents(BackupAgentType::WaitForType),
     drAgents(BackupAgentType::WaitForType), allSwapsDisabled(false) {}
 ISimulator::~ISimulator() = default;
 
@@ -120,29 +117,6 @@ bool simulator_should_inject_fault(const char* context, const char* file, int li
 	return false;
 }
 
-bool simulator_should_inject_blob_fault(const char* context, const char* file, int line, int error_code) {
-	if (!g_network->isSimulated() || !faultInjectionActivated)
-		return false;
-
-	auto p = g_simulator->getCurrentProcess();
-
-	if (!g_simulator->speedUpSimulation && deterministicRandom()->random01() < p->blob_inject_failure_rate) {
-		CODE_PROBE(true, "A blob fault was injected", probe::assert::simOnly, probe::context::sim2);
-		CODE_PROBE(error_code == error_code_http_request_failed,
-		           "A failed http request was injected",
-		           probe::assert::simOnly,
-		           probe::context::sim2);
-		TraceEvent("BlobFaultInjected")
-		    .detail("Context", context)
-		    .detail("File", file)
-		    .detail("Line", line)
-		    .detail("ErrorCode", error_code);
-		return true;
-	}
-
-	return false;
-}
-
 void ISimulator::disableFor(const std::string& desc, double time) {
 	disabledMap[desc] = time;
 }
@@ -163,11 +137,24 @@ bool ISimulator::checkInjectedCorruption() {
 }
 
 flowGlobalType ISimulator::global(int id) const {
-	return getCurrentProcess()->global(id);
+	const ProcessInfo* proc = getCurrentProcess();
+	if (!proc) {
+		// currentProcess can be nullptr during process destruction when currentProcess
+		// is cleared in destroyProcess() or before any process is created (initialization).
+		// Return nullptr if either of above.
+		return nullptr;
+	}
+	return proc->global(id);
 };
 
 void ISimulator::setGlobal(size_t id, flowGlobalType v) {
-	getCurrentProcess()->setGlobal(id, v);
+	ProcessInfo* proc = getCurrentProcess();
+	if (!proc) {
+		// currentProcess can be nullptr during process destruction or initialization.
+		// if nullptr, cannot set process-specific globals.
+		return;
+	}
+	proc->setGlobal(id, v);
 };
 
 void ISimulator::displayWorkers() const {
@@ -204,25 +191,6 @@ void ISimulator::displayWorkers() const {
 	}
 
 	return;
-}
-
-WipedString ISimulator::makeToken(int64_t tenantId, uint64_t ttlSecondsFromNow) {
-	ASSERT_GT(authKeys.size(), 0);
-	auto tokenSpec = authz::jwt::TokenRef{};
-	auto [keyName, key] = *authKeys.begin();
-	tokenSpec.algorithm = key.algorithm() == PKeyAlgorithm::EC ? authz::Algorithm::ES256 : authz::Algorithm::RS256;
-	tokenSpec.keyId = keyName;
-	tokenSpec.issuer = "sim2_issuer"_sr;
-	tokenSpec.subject = "sim2_testing"_sr;
-	auto const now = static_cast<uint64_t>(g_network->timer());
-	tokenSpec.notBeforeUnixTime = now - 1;
-	tokenSpec.issuedAtUnixTime = now;
-	tokenSpec.expiresAtUnixTime = now + ttlSecondsFromNow;
-	auto const tokenId = deterministicRandom()->randomAlphaNumeric(10);
-	tokenSpec.tokenId = StringRef(tokenId);
-	tokenSpec.tenants = VectorRef<int64_t>(&tenantId, 1);
-	Arena arena;
-	return WipedString(authz::jwt::signToken(arena, tokenSpec, key));
 }
 
 int openFileCount = 0;
@@ -1726,7 +1694,9 @@ public:
 					                                   satelliteTLogWriteAntiQuorumFallback,
 					                                   false)
 					        : primarySatelliteProcessesDead.validate(satelliteTLogPolicyFallback);
-					bool remoteSatelliteTLogsDead =
+					// Ignore remoteSatelliteTLogsDead because remote satellites are not used and
+					// not affecting recovery.
+					/* bool remoteSatelliteTLogsDead =
 					    satelliteTLogWriteAntiQuorumFallback
 					        ? !validateAllCombinations(badCombo,
 					                                   remoteSatelliteProcessesDead,
@@ -1734,7 +1704,7 @@ public:
 					                                   remoteSatelliteLocalitiesLeft,
 					                                   satelliteTLogWriteAntiQuorumFallback,
 					                                   false)
-					        : remoteSatelliteProcessesDead.validate(satelliteTLogPolicyFallback);
+					        : remoteSatelliteProcessesDead.validate(satelliteTLogPolicyFallback); */
 
 					if (usableRegions > 1) {
 						notEnoughLeft = !primaryProcessesLeft.validate(tLogPolicy) ||
@@ -1755,8 +1725,7 @@ public:
 					}
 
 					if (usableRegions > 1 && allowLogSetKills) {
-						tooManyDead = (primaryTLogsDead && primarySatelliteTLogsDead) ||
-						              (remoteTLogsDead && remoteSatelliteTLogsDead) ||
+						tooManyDead = (primaryTLogsDead && primarySatelliteTLogsDead) || remoteTLogsDead ||
 						              (primaryTLogsDead && remoteTLogsDead) ||
 						              (primaryProcessesDead.validate(storagePolicy) &&
 						               remoteProcessesDead.validate(storagePolicy));
@@ -1824,6 +1793,13 @@ public:
 			std::swap(*it, processes.back());
 		}
 		processes.pop_back();
+
+		// Clear currentProcess if it points to the process being destroyed
+		// This prevents trace events during destruction from accessing a dangling pointer
+		if (currentProcess == p) {
+			currentProcess = nullptr;
+		}
+
 		killProcess_internal(p, KillType::KillInstantly);
 	}
 	void killProcess_internal(ProcessInfo* machine, KillType kt) {
@@ -2399,18 +2375,6 @@ public:
 		g_clogging.reconnectPair(from, to);
 	}
 
-	void processInjectBlobFault(ProcessInfo* machine, double failureRate) override {
-		CODE_PROBE(true, "Simulated process beginning blob fault", probe::context::sim2, probe::assert::simOnly);
-		should_inject_blob_fault = simulator_should_inject_blob_fault;
-		ASSERT(machine->blob_inject_failure_rate == 0.0);
-		machine->blob_inject_failure_rate = failureRate;
-	}
-
-	void processStopInjectBlobFault(ProcessInfo* machine) override {
-		CODE_PROBE(true, "Simulated process stopping blob fault", probe::context::sim2, probe::assert::simOnly);
-		machine->blob_inject_failure_rate = 0.0;
-	}
-
 	std::vector<ProcessInfo*> getAllProcesses() const override {
 		std::vector<ProcessInfo*> processes;
 		for (auto& c : machines) {
@@ -2979,7 +2943,7 @@ void enableConnectionFailures(std::string const& context, double duration) {
 	}
 }
 
-double disableConnectionFailures(std::string const& context, ForceDisable flag) {
+double disableConnectionFailures(std::string const& context, ForceDisable flag, double duration) {
 	if (g_network->isSimulated()) {
 		if (now() + DISABLE_CONNECTION_FAILURE_MIN_INTERVAL < g_simulator->connectionFailureDisableTime &&
 		    flag == ForceDisable::False) {
@@ -2989,7 +2953,7 @@ double disableConnectionFailures(std::string const& context, ForceDisable flag) 
 			return g_simulator->connectionFailureDisableTime - now(); // return remaining time (>0.001s)
 		} else {
 			// if remaining time is less than 0.001s, or forced to disable, disable now
-			g_simulator->connectionFailuresDisableDuration = DISABLE_CONNECTION_FAILURE_FOREVER;
+			g_simulator->connectionFailuresDisableDuration = duration;
 			g_simulator->speedUpSimulation = true;
 			TraceEvent(SevWarnAlways, ("DisableConnectionFailures_" + context).c_str());
 			return 0;

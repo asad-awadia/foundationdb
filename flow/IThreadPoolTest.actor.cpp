@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -159,6 +159,58 @@ TEST_CASE("/flow/IThreadPool/ThreadReturnPromiseStream") {
 
 	wait(pool->stop());
 
+	return Void();
+}
+
+struct MockReceiver : public IThreadPoolReceiver {
+	void init() final {}
+};
+
+struct MockTask final : public ThreadAction {
+	ThreadReturnPromise<Void> promise;
+
+	void operator()(IThreadPoolReceiver*) final {
+		promise.send(Void());
+		delete this;
+	}
+
+	void cancel() final {}
+
+	double getTimeEstimate() const final { return 0; }
+};
+
+Reference<IThreadPool> initTestPool() {
+	auto pool = createGenericThreadPool();
+	auto task = g_network->getCurrentTask();
+	g_network->setCurrentTask(TaskPriority::Worker);
+	pool->addThread(new MockReceiver(), "TestWorker");
+	g_network->setCurrentTask(task);
+	return pool;
+}
+
+// These two cases are used to verify the destruction of the ThreadPool.
+// See the comments within ThreadPool::stop() for more details.
+
+TEST_CASE("/flow/IThreadPool/ExplicitStop") {
+	noUnseed = true;
+
+	state Reference<IThreadPool> pool = initTestPool();
+	auto task = new MockTask();
+	auto future = task->promise.getFuture();
+	pool->post(task);
+	wait(future);
+	wait(pool->stop());
+	return Void();
+}
+
+TEST_CASE("/flow/IThreadPool/ImplicitStop") {
+	noUnseed = true;
+
+	state Reference<IThreadPool> pool = initTestPool();
+	auto task = new MockTask();
+	auto future = task->promise.getFuture();
+	pool->post(task);
+	wait(future);
 	return Void();
 }
 

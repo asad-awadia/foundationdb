@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,7 +30,6 @@
 #include "fdbclient/FDBTypes.h"
 #include "fdbclient/RangeLock.h"
 #include "fdbclient/StorageServerInterface.h"
-#include "fdbclient/Tenant.h"
 
 // Don't warn on constants being defined in this file.
 #pragma clang diagnostic push
@@ -180,23 +179,6 @@ const Value dataMoveValue(const DataMoveMetaData& dataMove);
 UID decodeDataMoveKey(const KeyRef& key);
 DataMoveMetaData decodeDataMoveValue(const ValueRef& value);
 
-// "\xff/storageCacheServer/[[UID]] := StorageServerInterface"
-// This will be added by the cache server on initialization and removed by DD
-// TODO[mpilman]: We will need a way to map uint16_t ids to UIDs in a future
-//                versions. For now caches simply cache everything so the ids
-//                are not yet meaningful.
-extern const KeyRangeRef storageCacheServerKeys;
-extern const KeyRef storageCacheServersPrefix, storageCacheServersEnd;
-const Key storageCacheServerKey(UID id);
-const Value storageCacheServerValue(const StorageServerInterface& ssi);
-
-//    "\xff/storageCache/[[begin]]" := "[[vector<uint16_t>]]"
-extern const KeyRangeRef storageCacheKeys;
-extern const KeyRef storageCachePrefix;
-const Key storageCacheKey(const KeyRef& k);
-const Value storageCacheValue(const std::vector<uint16_t>& serverIndices);
-void decodeStorageCacheValue(const ValueRef& value, std::vector<uint16_t>& serverIndices);
-
 //    "\xff/serverKeys/[[serverID]]/[[begin]]" := "[[serverKeysTrue]]" |" [[serverKeysFalse]]"
 //	An internal mapping of what shards any given server currently has ownership of
 //	Using the serverID as a prefix, then followed by the beginning of the shard range
@@ -233,19 +215,6 @@ extern const ValueRef conflictingKeysTrue, conflictingKeysFalse;
 extern const KeyRangeRef writeConflictRangeKeysRange;
 extern const KeyRangeRef readConflictRangeKeysRange;
 extern const KeyRangeRef ddStatsRange;
-
-extern const KeyRef cacheKeysPrefix;
-
-const Key cacheKeysKey(uint16_t idx, const KeyRef& key);
-const Key cacheKeysPrefixFor(uint16_t idx);
-uint16_t cacheKeysDecodeIndex(const KeyRef& key);
-KeyRef cacheKeysDecodeKey(const KeyRef& key);
-
-extern const KeyRef cacheChangeKey;
-extern const KeyRangeRef cacheChangeKeys;
-extern const KeyRef cacheChangePrefix;
-const Key cacheChangeKeyFor(uint16_t idx);
-uint16_t cacheChangeKeyDecodeIndex(const KeyRef& key);
 
 // "\xff/tss/[[serverId]]" := "[[tssId]]"
 extern const KeyRangeRef tssMappingKeys;
@@ -355,6 +324,7 @@ UID decodeProcessClassKeyOld(KeyRef const& key);
 extern const KeyRangeRef configKeys;
 extern const KeyRef configKeysPrefix;
 
+extern const KeyRef backupWorkerEnabledKey;
 extern const KeyRef perpetualStorageWiggleKey;
 extern const KeyRef perpetualStorageWiggleLocalityKey;
 extern const KeyRef perpetualStorageWiggleIDPrefix;
@@ -366,9 +336,6 @@ extern const KeyRef triggerDDTeamInfoPrintKey;
 
 // Encryption data at-rest config key
 extern const KeyRef encryptionAtRestModeConfKey;
-
-// Tenant mode config key
-extern const KeyRef tenantModeConfKey;
 
 //	The differences between excluded and failed can be found in "command-line-interface.rst"
 //	and in the help message of the fdbcli command "exclude".
@@ -471,9 +438,6 @@ std::vector<std::pair<UID, Version>> decodeBackupStartedValue(const ValueRef& va
 // 1 = Send a signal to pause/already paused.
 extern const KeyRef backupPausedKey;
 
-// The key to store the maximum version that backup workers popped in NOOP mode.
-extern const KeyRef backupWorkerMaxNoopVersionKey;
-
 //	"\xff/previousCoordinators" = "[[ClusterConnectionString]]"
 //	Set to the encoded structure of the cluster's previous set of coordinators.
 //	Changed when performing quorumChange.
@@ -519,7 +483,6 @@ extern const KeyRef primaryLocalityKey;
 extern const KeyRef primaryLocalityPrivateKey;
 extern const KeyRef fastLoggingEnabled;
 extern const KeyRef fastLoggingEnabledPrivateKey;
-extern const KeyRef constructDataKey;
 
 extern const KeyRef moveKeysLockOwnerKey, moveKeysLockWriteKey;
 
@@ -659,6 +622,8 @@ extern const KeyRef backupLatestVersionsPrefix;
 // Key range reserved by backup agent to storing mutations
 extern const KeyRangeRef backupLogKeys;
 extern const KeyRangeRef applyLogKeys;
+// Key range reserved for restore validation data storage (system key space)
+extern const KeyRangeRef validateRestoreLogKeys;
 // Returns true if m is a blog (backup log) or alog (apply log) mutation
 bool isBackupLogMutation(const MutationRef& m);
 
@@ -719,12 +684,6 @@ extern const ValueRef writeRecoveryKeyTrue;
 //	Written by master server during recovery if recovering from a snapshot.
 //	Allows incremental restore to read and set starting version for consistency.
 extern const KeyRef snapshotEndVersionKey;
-
-// Configuration database special keys
-extern const KeyRef configTransactionDescriptionKey;
-extern const KeyRange globalConfigKnobKeys;
-extern const KeyRangeRef configKnobKeys;
-extern const KeyRangeRef configClassKeys;
 
 extern const KeyRangeRef idempotencyIdKeys;
 extern const KeyRef idempotencyIdsExpiredVersion;

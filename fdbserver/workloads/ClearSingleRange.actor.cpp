@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,22 +44,25 @@ struct ClearSingleRange : TestWorkload {
 
 	void getMetrics(std::vector<PerfMetric>& m) override {}
 
-	ACTOR static Future<Void> fdbClientClearRange(Database db, ClearSingleRange* self) {
-		state Transaction tr(db);
+	static Future<Void> fdbClientClearRange(Database db, ClearSingleRange* self) {
+		Transaction tr(db);
+		Error err;
 		try {
 			TraceEvent("ClearSingleRange")
 			    .detail("Begin", printable(self->begin))
 			    .detail("End", printable(self->end))
 			    .detail("StartDelay", self->startDelay);
 			tr.setOption(FDBTransactionOptions::NEXT_WRITE_NO_WRITE_CONFLICT_RANGE);
-			wait(delay(self->startDelay));
+			co_await delay(self->startDelay);
 			tr.clear(KeyRangeRef(self->begin, self->end));
-			wait(tr.commit());
+			co_await tr.commit();
 		} catch (Error& e) {
-			TraceEvent("ClearRangeError").error(e);
-			wait(tr.onError(e));
+			err = e;
 		}
-		return Void();
+		if (err.isValid()) {
+			TraceEvent("ClearRangeError").error(err);
+			co_await tr.onError(err);
+		}
 	}
 };
 

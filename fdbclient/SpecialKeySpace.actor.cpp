@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -99,9 +99,6 @@ std::unordered_map<std::string, KeyRange> SpecialKeySpace::managementApiCommandT
 	{ "datadistribution",
 	  KeyRangeRef("data_distribution/"_sr, "data_distribution0"_sr)
 	      .withPrefix(moduleToBoundary[MODULE::MANAGEMENT].begin) },
-	{ "tenant", KeyRangeRef("tenant/"_sr, "tenant0"_sr).withPrefix(moduleToBoundary[MODULE::MANAGEMENT].begin) },
-	{ "tenantmap",
-	  KeyRangeRef("tenant_map/"_sr, "tenant_map0"_sr).withPrefix(moduleToBoundary[MODULE::MANAGEMENT].begin) }
 };
 
 std::unordered_map<std::string, KeyRange> SpecialKeySpace::actorLineageApiCommandToRange = {
@@ -134,12 +131,6 @@ ACTOR Future<Void> moveKeySelectorOverRangeActor(const SpecialKeyRangeReadImpl* 
 
 	// never being called if KeySelector is already normalized
 	ASSERT(ks->offset != 1);
-
-	// Throw error if module doesn't support tenants and we have a tenant
-	if (ryw->getTenant().present() && !skrImpl->supportsTenants()) {
-		CODE_PROBE(true, "Illegal tenant access to special keys module");
-		throw illegal_tenant_access();
-	}
 
 	state Key startKey(skrImpl->getKeyRange().begin);
 	state Key endKey(skrImpl->getKeyRange().end);
@@ -279,17 +270,17 @@ SpecialKeySpace::SpecialKeySpace(KeyRef spaceStartKey, KeyRef spaceEndKey, bool 
 }
 
 void SpecialKeySpace::modulesBoundaryInit() {
-	for (const auto& pair : moduleToBoundary) {
-		ASSERT(range.contains(pair.second));
+	for (const auto& [module, moduleBoundary] : moduleToBoundary) {
+		ASSERT(range.contains(moduleBoundary));
 		// Make sure the module is not overlapping with any registered read modules
 		// Note: same like ranges, one module's end cannot be another module's start, relax the condition if needed
-		ASSERT(modules.rangeContaining(pair.second.begin) == modules.rangeContaining(pair.second.end) &&
-		       modules[pair.second.begin] == SpecialKeySpace::MODULE::UNKNOWN);
-		modules.insert(pair.second, pair.first);
+		ASSERT(modules.rangeContaining(moduleBoundary.begin) == modules.rangeContaining(moduleBoundary.end) &&
+		       modules[moduleBoundary.begin] == SpecialKeySpace::MODULE::UNKNOWN);
+		modules.insert(moduleBoundary, module);
 		// Note: Due to underlying implementation, the insertion here is important to make cross_module_read being
 		// handled correctly
-		readImpls.insert(pair.second, nullptr);
-		writeImpls.insert(pair.second, nullptr);
+		readImpls.insert(moduleBoundary, nullptr);
+		writeImpls.insert(moduleBoundary, nullptr);
 	}
 }
 
@@ -364,21 +355,6 @@ ACTOR Future<RangeResult> SpecialKeySpace::getRangeAggregationActor(SpecialKeySp
 	state RangeMap<Key, SpecialKeyRangeReadImpl*, KeyRangeRef>::Ranges ranges =
 	    sks->getReadImpls().intersectingRanges(KeyRangeRef(begin.getKey(), end.getKey()));
 
-	// Check tenant legality separately from below iterations
-	// because it may be partially completed and returned
-	// before illegal range is checked due to the limits handler
-	if (ryw->getTenant().present()) {
-		for (auto iter : ranges) {
-			if (iter->value() == nullptr) {
-				continue;
-			}
-			if (!iter->value()->supportsTenants()) {
-				CODE_PROBE(true, "Illegal tenant access to special keys module");
-				throw illegal_tenant_access();
-			}
-		}
-	}
-
 	// TODO : workaround to write this two together to make the code compact
 	// The issue here is boost::iterator_range<> doest not provide rbegin(), rend()
 	iter = reverse ? ranges.end() : ranges.begin();
@@ -431,13 +407,13 @@ ACTOR Future<RangeResult> SpecialKeySpace::getRangeAggregationActor(SpecialKeySp
 			}
 			result.arena().dependsOn(pairs.arena());
 			// limits handler
-			for (int i = 0; i < pairs.size(); ++i) {
-				ASSERT(iter->range().contains(pairs[i].key));
-				result.push_back(result.arena(), pairs[i]);
+			for (const auto& keyValue : pairs) {
+				ASSERT(iter->range().contains(keyValue.key));
+				result.push_back(result.arena(), keyValue);
 				// Note : behavior here is even the last k-v pair makes total bytes larger than specified, it's still
 				// returned. In other words, the total size of the returned value (less the last entry) will be less
 				// than byteLimit
-				limits.decrement(pairs[i]);
+				limits.decrement(keyValue);
 				if (limits.isReached()) {
 					result.more = true;
 					result.readThroughEnd = false;
@@ -504,10 +480,6 @@ void SpecialKeySpace::set(ReadYourWritesTransaction* ryw, const KeyRef& key, con
 		    .detail("Value", value.toString());
 		throw special_keys_no_write_module_found();
 	}
-	if (!impl->supportsTenants() && ryw->getTenant().present()) {
-		CODE_PROBE(true, "Illegal tenant write to special keys module");
-		throw illegal_tenant_access();
-	}
 	return impl->set(ryw, key, value);
 }
 
@@ -525,10 +497,6 @@ void SpecialKeySpace::clear(ReadYourWritesTransaction* ryw, const KeyRangeRef& r
 		TraceEvent(SevDebug, "SpecialKeySpaceNoWriteModuleFound").detail("Range", range);
 		throw special_keys_no_write_module_found();
 	}
-	if (!begin->supportsTenants() && ryw->getTenant().present()) {
-		CODE_PROBE(true, "Illegal tenant clear range to special keys module");
-		throw illegal_tenant_access();
-	}
 	return begin->clear(ryw, range);
 }
 
@@ -538,10 +506,6 @@ void SpecialKeySpace::clear(ReadYourWritesTransaction* ryw, const KeyRef& key) {
 	auto impl = writeImpls[key];
 	if (impl == nullptr)
 		throw special_keys_no_write_module_found();
-	if (!impl->supportsTenants() && ryw->getTenant().present()) {
-		CODE_PROBE(true, "Illegal tenant clear to special keys module", probe::decoration::rare);
-		throw illegal_tenant_access();
-	}
 	return impl->clear(ryw, key);
 }
 
@@ -628,18 +592,8 @@ ACTOR Future<Void> commitActor(SpecialKeySpace* sks, ReadYourWritesTransaction* 
 		}
 		++iter;
 	}
-	state std::vector<SpecialKeyRangeRWImpl*>::const_iterator it;
-	// Check validity of tenant support before iterating through
-	// module ptrs and potentially getting partial commits
-	if (ryw->getTenant().present()) {
-		for (it = writeModulePtrs.begin(); it != writeModulePtrs.end(); ++it) {
-			if (!(*it)->supportsTenants()) {
-				CODE_PROBE(true, "Illegal tenant commit to special keys module", probe::decoration::rare);
-				throw illegal_tenant_access();
-			}
-		}
-	}
 
+	state std::vector<SpecialKeyRangeRWImpl*>::const_iterator it;
 	for (it = writeModulePtrs.begin(); it != writeModulePtrs.end(); ++it) {
 		Optional<std::string> msg = wait((*it)->commit(ryw));
 		if (msg.present()) {
@@ -1346,14 +1300,14 @@ ACTOR Future<RangeResult> ExclusionInProgressActor(ReadYourWritesTransaction* ry
 	// for locality based exclusions. The problematic edge case here is a log server that still has mutation on it
 	// but is currently not part of the worker list, e.g. because it was shutdown or is partitioned.
 	auto logs = decodeLogsValue(value.get());
-	for (auto const& log : logs.first) {
-		if (log.second == NetworkAddress() || addressExcluded(exclusions, log.second)) {
-			inProgressExclusion.insert(log.second);
+	for (const auto& [_logId, logAddress] : logs.first) {
+		if (logAddress == NetworkAddress() || addressExcluded(exclusions, logAddress)) {
+			inProgressExclusion.insert(logAddress);
 		}
 	}
-	for (auto const& log : logs.second) {
-		if (log.second == NetworkAddress() || addressExcluded(exclusions, log.second)) {
-			inProgressExclusion.insert(log.second);
+	for (const auto& [_logId, logAddress] : logs.second) {
+		if (logAddress == NetworkAddress() || addressExcluded(exclusions, logAddress)) {
+			inProgressExclusion.insert(logAddress);
 		}
 	}
 
@@ -1933,15 +1887,11 @@ ACTOR static Future<Optional<std::string>> coordinatorsCommitActor(ReadYourWrite
 		}
 	}
 
-	auto configDBEntry = ryw->getSpecialKeySpaceWriteMap()["config_db"_sr.withPrefix(kr.begin)];
-
 	TraceEvent(SevDebug, "SKSChangeCoordinatorsStart")
 	    .detail("NewConnectionString", conn.toString())
-	    .detail("Description", entry.first ? entry.second.get().toString() : "")
-	    .detail("ConfigDBDisabled", configDBEntry.first);
+	    .detail("Description", entry.first ? entry.second.get().toString() : "");
 
-	Optional<CoordinatorsResult> r =
-	    wait(changeQuorumChecker(&ryw->getTransaction(), &conn, newName, configDBEntry.first));
+	Optional<CoordinatorsResult> r = wait(changeQuorumChecker(&ryw->getTransaction(), &conn, newName));
 
 	TraceEvent(SevDebug, "SKSChangeCoordinatorsFinish")
 	    .detail("Result", r.present() ? static_cast<int>(r.get()) : -1); // -1 means success
@@ -1995,10 +1945,7 @@ ACTOR static Future<RangeResult> CoordinatorsAutoImplActor(ReadYourWritesTransac
 
 	std::vector<NetworkAddress> oldCoordinators = wait(old.tryResolveHostnames());
 	std::vector<NetworkAddress> _desiredCoordinators = wait(autoQuorumChange()->getDesiredCoordinators(
-	    &tr,
-	    oldCoordinators,
-	    Reference<ClusterConnectionMemoryRecord>(new ClusterConnectionMemoryRecord(old)),
-	    result));
+	    &tr, oldCoordinators, makeReference<ClusterConnectionMemoryRecord>(old), result));
 
 	if (result == CoordinatorsResult::NOT_ENOUGH_MACHINES) {
 		// we could get not_enough_machines if we happen to see the database while the cluster controller is updating

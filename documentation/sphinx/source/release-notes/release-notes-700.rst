@@ -32,7 +32,7 @@ Features
 Performance
 -----------
 * Improved Deque copy performance. `(PR #3197) <https://github.com/apple/foundationdb/pull/3197>`_
-* Increased performance of dr_agent when copying the mutation log. The ``COPY_LOG_BLOCK_SIZE``, ``COPY_LOG_BLOCKS_PER_TASK``, ``COPY_LOG_PREFETCH_BLOCKS``, ``COPY_LOG_READ_AHEAD_BYTES`` and ``COPY_LOG_TASK_DURATION_NANOS`` knobs can be set. `(PR #3436) <https://github.com/apple/foundationdb/pull/3436>`_
+* Increased performance of dr_agent when copying the mutation log. The ``COPY_LOG_BLOCK_SIZE``, ``COPY_LOG_BLOCKS_PER_TASK``, ``COPY_LOG_PREFETCH_BLOCKS``, ``COPY_LOG_READ_AHEAD_BYTES`` and ``COPY_LOG_TASK_DURATION_SECONDS`` knobs can be set. `(PR #3436) <https://github.com/apple/foundationdb/pull/3436>`_ `(PR #12733) <https://github.com/apple/foundationdb/pull/12733>`_
 * Added multiple new microbenchmarks for PromiseStream, Reference, IRandom, and timer, as well as support for benchmarking actors. `(PR #3590) <https://github.com/apple/foundationdb/pull/3590>`_
 * Use xxhash3 for SQLite page checksums. `(PR #4075) <https://github.com/apple/foundationdb/pull/4075>`_
 * fdbserver now uses jemalloc on Linux instead of the system malloc. `(PR #4222) <https://github.com/apple/foundationdb/pull/4222>`_
@@ -46,7 +46,7 @@ Performance
 Reliability
 -----------
 * Backup agents now pause themselves upon a successful snapshot recovery to avoid unintentional data corruption. Operators should manually abort backup agents and clear the backup agent keyspace to avoid using the old cluster's backup configuration. `(PR #4027) <https://github.com/apple/foundationdb/pull/4027>`_
-* Log class processes are prioritized above transaction class proceses for becoming tlogs. `(PR #4509) <https://github.com/apple/foundationdb/pull/4509>`_ 
+* Log class processes are prioritized above transaction class processes for becoming tlogs. `(PR #4509) <https://github.com/apple/foundationdb/pull/4509>`_ 
 * Improved worker recruitment logic to avoid unnecessary recoveries when processes are added or removed from a cluster. `(PR #4695) <https://github.com/apple/foundationdb/pull/4695>`_ `(PR #4631) <https://github.com/apple/foundationdb/pull/4631>`_ `(PR #4509) <https://github.com/apple/foundationdb/pull/4509>`_
 
 Fixes

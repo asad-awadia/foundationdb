@@ -49,13 +49,6 @@ The ``clear`` command clears a key from the database. Its syntax is ``clear <KEY
 
 Note that :ref:`characters can be escaped <cli-escaping>` when specifying keys (or values) in ``fdbcli``.
 
-clearknob
----------
-
-The ``clearknob`` command can be used to clear knobs set in the configuration database. Its syntax is ``clearknob <KNOBNAME> [CONFIGCLASS]``. If not present in a ``begin\commit`` block, the CLI will prompt for a description of the change.
-
-Note that :ref:`characters can be escaped <cli-escaping>` when specifying keys (or values) in ``fdbcli``.
-
 clearrange
 ----------
 
@@ -71,7 +64,7 @@ The ``commit`` command commits the current transaction. Any sets or clears execu
 configure
 ---------
 
-The ``configure`` command changes the database configuration. Its syntax is ``configure [new|tss] [single|double|triple|three_data_hall|three_datacenter] [ssd|memory] [grv_proxies=<N>] [commit_proxies=<N>] [resolvers=<N>] [logs=<N>] [count=<TSS_COUNT>] [perpetual_storage_wiggle=<WIGGLE_SPEED>] [perpetual_storage_wiggle_locality=<<LOCALITY_KEY>:<LOCALITY_VALUE>|0>] [storage_migration_type={disabled|aggressive|gradual}] [tenant_mode={disabled|optional_experimental|required_experimental}] [encryption_at_rest_mode={aes_256_ctr|disabled}]``.
+The ``configure`` command changes the database configuration. Its syntax is ``configure [new|tss] [single|double|triple|three_data_hall|three_datacenter] [ssd|memory] [grv_proxies=<N>] [commit_proxies=<N>] [resolvers=<N>] [logs=<N>] [count=<TSS_COUNT>] [perpetual_storage_wiggle=<WIGGLE_SPEED>] [perpetual_storage_wiggle_locality=<<LOCALITY_KEY>:<LOCALITY_VALUE>|0>] [storage_migration_type={disabled|aggressive|gradual}]``.
 
 The ``new`` option, if present, initializes a new database with the given configuration rather than changing the configuration of an existing one. When ``new`` is used, both a redundancy mode and a storage engine must be specified.
 
@@ -190,13 +183,6 @@ If ``description=<DESC>`` is specified, the description field in the cluster fil
 
 For more information on setting the cluster description, see :ref:`configuration-setting-cluster-description`.
 
-defaulttenant
--------------
-
-The ``defaulttenant`` command configures ``fdbcli`` to run its commands without a tenant. This is the default behavior.
-
-The active tenant cannot be changed while a transaction (using ``begin``) is open.
-
 datadistribution
 ----------------
 
@@ -254,13 +240,6 @@ get
 ---
 
 The ``get`` command fetches the value of a given key. Its syntax is ``get <KEY>``. It displays the value of ``<KEY>`` if ``<KEY>`` is present in the database and ``not found`` otherwise.
-
-Note that :ref:`characters can be escaped <cli-escaping>` when specifying keys (or values) in ``fdbcli``.
-
-getknob
--------
-
-The ``getknob`` command fetches the value of a given knob that has been populated by ``setknob``. Its syntax is ``getknob <KNOBNAME> [CONFIGCLASS]``. It displays the value of ``<KNOBNAME>`` if ``<KNOBNAME>`` is present in the database and ``not found`` otherwise.
 
 Note that :ref:`characters can be escaped <cli-escaping>` when specifying keys (or values) in ``fdbcli``.
 
@@ -454,14 +433,7 @@ setclass
 
 The ``setclass`` command can be used to change the :ref:`process class <guidelines-process-class-config>` for a given process. Its syntax is ``setclass [<ADDRESS> <CLASS>]``. If no arguments are specified, then the process classes of all processes are listed. Setting the class to ``default`` to revert to the process class specified on the command line.
 
-The available process classes are ``unset``, ``storage``, ``transaction``, ``resolution``, ``grv_proxy``, ``commit_proxy``, ``master``, ``test``, ``unset``, ``stateless``, ``log``, ``router``, ``cluster_controller``, ``fast_restore``, ``data_distributor``, ``coordinator``, ``ratekeeper``, ``storage_cache``, ``backup``, and ``default``.
-
-setknob
--------
-
-The ``setknob`` command can be used to set knobs dynamically. Its syntax is ``setknob <KNOBNAME> <KNOBVALUE> [CONFIGCLASS]``. If not present in a ``begin\commit`` block, the CLI will prompt for a description of the change.
-
-Note that :ref:`characters can be escaped <cli-escaping>` when specifying keys (or values) in ``fdbcli``.
+The available process classes are ``unset``, ``storage``, ``transaction``, ``resolution``, ``grv_proxy``, ``commit_proxy``, ``master``, ``test``, ``unset``, ``stateless``, ``log``, ``router``, ``cluster_controller``, ``fast_restore``, ``data_distributor``, ``coordinator``, ``ratekeeper``, ``backup``, and ``default``.
 
 sleep
 -----
@@ -496,147 +468,6 @@ status json
 ^^^^^^^^^^^
 
 ``status json`` will provide the cluster status in its JSON format. For a detailed description of this format, see :doc:`mr-status`.
-
-tenant
-------
-
-The ``tenant`` command is used to view and manage the tenants in a cluster. The ``tenant`` command has the following subcommands:
-
-create
-^^^^^^
-
-``tenant create <NAME> [tenant_group=<TENANT_GROUP>] [assigned_cluster=<CLUSTER_NAME>]``
-
-Creates a new tenant in the cluster.
-
-``NAME`` - The desired name of the tenant. The name can be any byte string that does not begin with the ``\xff`` byte.
-
-``TENANT_GROUP`` - The tenant group the tenant will be placed in.
-
-``CLUSTER_NAME`` - The cluster the tenant will be placed in (metacluster only). If unspecified, the metacluster will choose the cluster.
-
-delete
-^^^^^^
-
-``tenant delete <NAME>``
-
-Deletes a tenant from the cluster. The tenant must be empty.
-
-``NAME`` - the name of the tenant to delete.
-
-list
-^^^^
-
-``tenant list [BEGIN] [END] [limit=LIMIT] [offset=OFFSET] [state=<STATE1>,<STATE2>,...]``
-
-Lists the tenants present in the cluster.
-
-``BEGIN`` - the first tenant to list. Defaults to the empty tenant name ``""``.
-
-``END`` - the exclusive end tenant to list. Defaults to ``\xff\xff``.
-
-``LIMIT`` - the number of tenants to list. Defaults to 100.
-
-``OFFSET`` - the number of items to skip over, starting from the beginning of the range. Defaults to 0.
-
-``STATE``` - TenantState(s) to filter the list with. Defaults to no filters.
-
-get
-^^^
-
-``tenant get <NAME> [JSON]``
-
-Prints the metadata for a tenant.
-
-``NAME`` - the name of the tenant to print.
-
-``JSON`` - if specified, the output of the command will be printed in the form of a JSON string::
-
-    {
-        "tenant": {
-            "id": 0,
-            "prefix": {
-              "base64": "AAAAAAAAAAU=",
-              "printable": "\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x05",
-            }
-        },
-        "type": "success"
-    }
-
-In the event of an error, the JSON output will include an error message::
-
-    {
-        "error": "...",
-        "type": "error"
-    }
-
-configure
-^^^^^^^^^
-
-``tenant configure <TENANT_NAME> <[unset] tenant_group[=GROUP_NAME]>``
-
-Changes the configuration of a tenant.
-
-``TENANT_NAME`` - the name of the tenant to reconfigure.
-
-The following tenant fields can be configured:
-
-``tenant_group`` - changes the tenant group a tenant is assigned to. If ``unset`` is specified, the tenant will be configured to not be in a group. Otherwise, ``GROUP_NAME`` must be specified to the new group that the tenant should be made a member of.
-
-rename
-^^^^^^
-
-``tenant rename <OLD_NAME> <NEW_NAME>``
-
-Changes the name of an existing tenant.
-
-``OLD_NAME`` - the name of the tenant being renamed.
-
-``NEW_NAME`` - the desired name of the tenant. This name must not already be in use.
-
-
-tenantgroup
------------
-
-The ``tenantgroup`` command is used to view details about the tenant groups in a cluster. The ``tenantgroup`` command has the following subcommands:
-
-list
-^^^^
-
-``tenantgroup list [BEGIN] [END] [LIMIT]``
-
-Lists the tenant groups present in the cluster.
-
-``BEGIN`` - the first tenant group to list. Defaults to the empty tenant group name ``""``.
-
-``END`` - the exclusive end tenant group to list. Defaults to ``\xff\xff``.
-
-``LIMIT`` - the number of tenant groups to list. Defaults to 100.
-
-get
-^^^
-
-``tenantgroup get <NAME> [JSON]``
-
-Prints the metadata for a tenant group.
-
-``NAME`` - the name of the tenant group to print.
-
-``JSON`` - if specified, the output of the command will be printed in the form of a JSON string::
-
-    {
-        "tenant_group": {
-            "assigned_cluster": "cluster1",
-        },
-        "type": "success"
-    }
-
-In the event of an error, the JSON output will include an error message::
-
-    {
-        "error": "...",
-        "type": "error"
-    }
 
 .. _cli-throttle:
 
@@ -728,17 +559,6 @@ unlock
 
 The ``unlock`` command unlocks the database with the specified lock UID. Because this is a potentially dangerous operation, users must copy a passphrase before the unlock command is executed.
 
-usetenant
----------
-
-The ``usetenant`` command configures ``fdbcli`` to run transactions within the specified tenant. Its syntax is ``usetenant <TENANT_NAME>``.
-
-When configured, transactions will read and write keys from the key-space associated with the specified tenant. By default, ``fdbcli`` runs without a tenant. Management operations that modify keys (e.g. ``exclude``) will not operate within the tenant.
-
-If the tenant chosen does not exist, ``fdbcli`` will report an error.
-
-The active tenant cannot be changed while a transaction (using ``begin``) is open.
-
 writemode
 ---------
 
@@ -781,4 +601,3 @@ It will populate a list of available storage servers' network addresses. Users n
 ``hotrange <IP:PORT> <bytes|readBytes|readOps> <begin> <end> <splitCount>``
 
 Fetch read metrics from the given storage server to find the hot range. Run ``help hotrange`` to read the guide.
-

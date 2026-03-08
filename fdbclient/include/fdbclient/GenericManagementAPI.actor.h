@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,7 +39,6 @@ the contents of the system key space.
 #include "fdbclient/Status.h"
 #include "fdbclient/Subspace.h"
 #include "fdbclient/DatabaseConfiguration.h"
-#include "fdbclient/MetaclusterRegistration.h"
 #include "fdbclient/Status.h"
 #include "fdbclient/SystemData.h"
 #include "fdbclient/StorageWiggleMetrics.actor.h"
@@ -70,8 +69,8 @@ enum class ConfigurationResult {
 	SUCCESS_WARN_SHARDED_ROCKSDB_EXPERIMENTAL,
 	DATABASE_CREATED_WARN_SHARDED_ROCKSDB_EXPERIMENTAL,
 	DATABASE_IS_REGISTERED,
-	ENCRYPTION_AT_REST_MODE_ALREADY_SET,
-	INVALID_STORAGE_TYPE
+	INVALID_STORAGE_TYPE,
+	BACKUP_WORKER_ENABLED_RESTRICTED
 };
 
 enum class CoordinatorsResult {
@@ -132,84 +131,8 @@ bool isCompleteConfiguration(std::map<std::string, std::string> const& options);
 
 ConfigureAutoResult parseConfig(StatusObject const& status);
 
-bool isEncryptionAtRestModeConfigValid(Optional<DatabaseConfiguration> oldConfiguration,
-                                       std::map<std::string, std::string> newConfig,
-                                       bool creating);
-bool isTenantModeModeConfigValid(DatabaseConfiguration oldConfiguration, DatabaseConfiguration newConfiguration);
-
 // Management API written in template code to support both IClientAPI and NativeAPI
 namespace ManagementAPI {
-
-ACTOR template <class DB>
-Future<Void> changeCachedRange(Reference<DB> db, KeyRangeRef range, bool add) {
-	state Reference<typename DB::TransactionT> tr = db->createTransaction();
-	state KeyRange sysRange = KeyRangeRef(storageCacheKey(range.begin), storageCacheKey(range.end));
-	state KeyRange sysRangeClear = KeyRangeRef(storageCacheKey(range.begin), keyAfter(storageCacheKey(range.end)));
-	state KeyRange privateRange = KeyRangeRef(cacheKeysKey(0, range.begin), cacheKeysKey(0, range.end));
-	state Value trueValue = storageCacheValue(std::vector<uint16_t>{ 0 });
-	state Value falseValue = storageCacheValue(std::vector<uint16_t>{});
-	loop {
-		tr->setOption(FDBTransactionOptions::LOCK_AWARE);
-		tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
-		try {
-			tr->clear(sysRangeClear);
-			tr->clear(privateRange);
-			tr->addReadConflictRange(privateRange);
-			// hold the returned standalone object's memory
-			state typename DB::TransactionT::template FutureT<RangeResult> previousFuture =
-			    tr->getRange(KeyRangeRef(storageCachePrefix, sysRange.begin), 1, Snapshot::False, Reverse::True);
-			RangeResult previous = wait(safeThreadFutureToFuture(previousFuture));
-			bool prevIsCached = false;
-			if (!previous.empty()) {
-				std::vector<uint16_t> prevVal;
-				decodeStorageCacheValue(previous[0].value, prevVal);
-				prevIsCached = !prevVal.empty();
-			}
-			if (prevIsCached && !add) {
-				// we need to uncache from here
-				tr->set(sysRange.begin, falseValue);
-				tr->set(privateRange.begin, serverKeysFalse);
-			} else if (!prevIsCached && add) {
-				// we need to cache, starting from here
-				tr->set(sysRange.begin, trueValue);
-				tr->set(privateRange.begin, serverKeysTrue);
-			}
-			// hold the returned standalone object's memory
-			state typename DB::TransactionT::template FutureT<RangeResult> afterFuture =
-			    tr->getRange(KeyRangeRef(sysRange.end, storageCacheKeys.end), 1, Snapshot::False, Reverse::False);
-			RangeResult after = wait(safeThreadFutureToFuture(afterFuture));
-			bool afterIsCached = false;
-			if (!after.empty()) {
-				std::vector<uint16_t> afterVal;
-				decodeStorageCacheValue(after[0].value, afterVal);
-				afterIsCached = afterVal.empty();
-			}
-			if (afterIsCached && !add) {
-				tr->set(sysRange.end, trueValue);
-				tr->set(privateRange.end, serverKeysTrue);
-			} else if (!afterIsCached && add) {
-				tr->set(sysRange.end, falseValue);
-				tr->set(privateRange.end, serverKeysFalse);
-			}
-			wait(safeThreadFutureToFuture(tr->commit()));
-			return Void();
-		} catch (Error& e) {
-			state Error err = e;
-			wait(safeThreadFutureToFuture(tr->onError(e)));
-			TraceEvent(SevDebug, "ChangeCachedRangeError").error(err);
-		}
-	}
-}
-
-template <class DB>
-Future<Void> addCachedRange(Reference<DB> db, KeyRangeRef range) {
-	return changeCachedRange(db, range, true);
-}
-
-template <class DB>
-Future<Void> removeCachedRange(Reference<DB> db, KeyRangeRef range) {
-	return changeCachedRange(db, range, false);
-}
 
 ACTOR template <class Tr>
 Future<std::vector<ProcessData>> getWorkers(Reference<Tr> tr,
@@ -280,12 +203,6 @@ Future<ConfigurationResult> changeConfig(Reference<DB> db, std::map<std::string,
 		if (!isCompleteConfiguration(m)) {
 			return ConfigurationResult::INCOMPLETE_CONFIGURATION;
 		}
-		if (!isEncryptionAtRestModeConfigValid(Optional<DatabaseConfiguration>(), m, creating)) {
-			return ConfigurationResult::INVALID_CONFIGURATION;
-		}
-	} else if (m.count(encryptionAtRestModeConfKey.toString()) != 0) {
-		// Encryption data at-rest mode can be set only at the time of database creation
-		return ConfigurationResult::ENCRYPTION_AT_REST_MODE_ALREADY_SET;
 	}
 
 	state Future<Void> tooLong = delay(60);
@@ -325,8 +242,7 @@ Future<ConfigurationResult> changeConfig(Reference<DB> db, std::map<std::string,
 					for (auto kv : m) {
 						newConfig.set(kv.first, kv.second);
 					}
-					if (!newConfig.isValid() || !isEncryptionAtRestModeConfigValid(oldConfig, m, creating) ||
-					    !isTenantModeModeConfigValid(oldConfig, newConfig)) {
+					if (!newConfig.isValid()) {
 						return ConfigurationResult::INVALID_CONFIGURATION;
 					}
 
@@ -493,15 +409,6 @@ Future<ConfigurationResult> changeConfig(Reference<DB> db, std::map<std::string,
 					           newConfig.storageServerStoreType == KeyValueStoreType::SSD_SHARDED_ROCKSDB) {
 						warnShardedRocksDBIsExperimental = true;
 					}
-
-					if (newConfig.tenantMode != oldConfig.tenantMode) {
-						Optional<MetaclusterRegistrationEntry> metaclusterRegistration =
-						    wait(metacluster::metadata::metaclusterRegistration().get(tr));
-						if (metaclusterRegistration.present()) {
-							CODE_PROBE(true, "Attempt to change tenant mode in a metacluster", probe::decoration::rare);
-							return ConfigurationResult::DATABASE_IS_REGISTERED;
-						}
-					}
 				}
 			}
 			if (creating) {
@@ -531,6 +438,12 @@ Future<ConfigurationResult> changeConfig(Reference<DB> db, std::map<std::string,
 					} else if (i->first == "1") {
 						resetPPWStats = false; // the latter setting will override the former setting
 					}
+				}
+
+				// Clear backup progress when backup workers are disabled
+				if (i->first == backupWorkerEnabledKey && i->second == "0") {
+					tr->clear(backupProgressKeys);
+					TraceEvent("BackupWorkerProgressCleared");
 				}
 			}
 

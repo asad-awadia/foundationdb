@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -549,14 +549,14 @@ struct RequestData : NonCopyable {
 		if (backoff > 0) {
 			response = mapAsync(delay(backoff), [this, stream, &request, model, alternatives, channel](Void _) {
 				requestStarted = true;
-				modelHolder = Reference<ModelHolder>(new ModelHolder(model, stream->getEndpoint().token.first()));
+				modelHolder = makeReference<ModelHolder>(model, stream->getEndpoint().token.first());
 				Future<Reply> resp = stream->tryGetReply(request);
 				maybeDuplicateTSSRequest(stream, request, model, resp, alternatives, channel);
 				return resp;
 			});
 		} else {
 			requestStarted = true;
-			modelHolder = Reference<ModelHolder>(new ModelHolder(model, stream->getEndpoint().token.first()));
+			modelHolder = makeReference<ModelHolder>(model, stream->getEndpoint().token.first());
 			response = stream->tryGetReply(request);
 			maybeDuplicateTSSRequest(stream, request, model, response, alternatives, channel);
 		}

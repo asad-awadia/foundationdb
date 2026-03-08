@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,21 +41,6 @@ public class TransactionIntegrationTest {
             for (int i = 0; i < 10; i++) {
                 try (Transaction tr = db.createTransaction()) {
                     doTestOperationsAfterCommit(tr);
-                }
-            }
-        }
-    }
-
-    @Test
-    public void testOperationsAfterCommitInTenant() throws Exception {
-        try (Database db = fdb.open()) {
-            byte[] tenantName = "testOperationsAfterCommitInTenant".getBytes();
-            TenantManagement.createTenant(db, tenantName).join();
-            try (Tenant tenant = db.openTenant(tenantName)) {
-                for (int i = 0; i < 10; i++) {
-                    try (Transaction tr = tenant.createTransaction()) {
-                        doTestOperationsAfterCommit(tr);
-                    }
                 }
             }
         }

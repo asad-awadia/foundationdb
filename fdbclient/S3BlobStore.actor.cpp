@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -92,8 +92,6 @@ S3BlobStoreEndpoint::Stats S3BlobStoreEndpoint::Stats::operator-(const Stats& rh
 }
 
 S3BlobStoreEndpoint::Stats S3BlobStoreEndpoint::s_stats;
-std::unique_ptr<S3BlobStoreEndpoint::BlobStats> S3BlobStoreEndpoint::blobStats;
-Future<Void> S3BlobStoreEndpoint::statsLogger = Never();
 
 S3BlobStoreEndpoint::BlobKnobs::BlobKnobs() {
 	secure_connection = 1;
@@ -223,8 +221,7 @@ std::string guessRegionFromDomain(std::string domain) {
 	static const std::vector<const char*> knownServices = { "s3.", "cos.", "oss-", "obs." };
 	boost::algorithm::to_lower(domain);
 
-	for (int i = 0; i < knownServices.size(); ++i) {
-		const char* service = knownServices[i];
+	for (const auto& service : knownServices) {
 
 		std::size_t p = domain.find(service);
 		if (p == std::string::npos || (p >= 1 && domain[p - 1] != '.')) {
@@ -501,6 +498,8 @@ ACTOR Future<bool> bucketExists_impl(Reference<S3BlobStoreEndpoint> b, std::stri
 		    wait(doRequest_impl(b, "HEAD", resource, headers, nullptr, 0, { 200, 404 }));
 		return r->code == 200;
 	} catch (Error& e) {
+		if (e.code() == error_code_actor_cancelled)
+			throw;
 		TraceEvent(SevError, "S3ClientBucketExistsError")
 		    .detail("Bucket", bucket)
 		    .detail("Host", b->host)
@@ -724,7 +723,7 @@ static S3BlobStoreEndpoint::Credentials getSecretSdk() {
 
 	return fdbCreds;
 #else
-	TraceEvent(SevError, "S3BlobStoreNoSDK");
+	TraceEvent(SevError, "S3BlobStoreNoSDK").log();
 	throw backup_auth_missing();
 #endif
 }
@@ -1097,6 +1096,21 @@ ACTOR Future<Reference<HTTP::IncomingResponse>> doRequest_impl(Reference<S3BlobS
 		state std::string canonicalURI = resource;
 		// Set the resource on each loop so we don't double-encode when we set it to `getCanonicalURI` below.
 		req->resource = resource;
+
+		// Reset headers to initial state for this retry attempt to prevent header accumulation
+		// across retries and potential map corruption
+		req->data.headers = headers;
+		req->data.headers["Host"] = bstore->host;
+		req->data.headers["Accept"] = "application/xml";
+		// Re-merge extraHeaders
+		for (const auto& [k, v] : bstore->extraHeaders) {
+			std::string& fieldValue = req->data.headers[k];
+			if (!fieldValue.empty()) {
+				fieldValue.append(",");
+			}
+			fieldValue.append(v);
+		}
+
 		state UID connID = UID();
 		state double reqStartTimer;
 		state double connectStartTimer = g_network->timer();
@@ -1202,7 +1216,11 @@ ACTOR Future<Reference<HTTP::IncomingResponse>> doRequest_impl(Reference<S3BlobS
 				}
 			} catch (Error& e) {
 				// retry with GET failed, but continue to do original request anyway
-				TraceEvent(SevError, "ErrorDuringRetryS3TokenIssue").errorUnsuppressed(e);
+				if (e.code() != error_code_actor_cancelled) {
+					TraceEvent(SevError, "ErrorDuringRetryS3TokenIssue").errorUnsuppressed(e);
+				} else {
+					throw;
+				}
 			}
 			setHeaders(bstore, req);
 			req->resource = getCanonicalURI(bstore, req);
@@ -1219,7 +1237,14 @@ ACTOR Future<Reference<HTTP::IncomingResponse>> doRequest_impl(Reference<S3BlobS
 			}
 
 			Reference<HTTP::IncomingResponse> _r = wait(timeoutError(reqF, requestTimeout));
-			if (g_network->isSimulated() && BUGGIFY && deterministicRandom()->random01() < 0.1) {
+			// Don't simulate token errors for multipart complete operations (POST with uploadId but no partNumber)
+			// because changing a successful 200 to 400 after the server has already completed and removed
+			// the upload causes the client to infinitely retry with a phantom upload ID. This seems too much of
+			// an artifical manufacture.
+			bool isMultipartComplete = verb == "POST" && resource.find("uploadId=") != std::string::npos &&
+			                           resource.find("partNumber=") == std::string::npos;
+			if (g_network->isSimulated() && BUGGIFY && deterministicRandom()->random01() < 0.1 &&
+			    !isMultipartComplete) {
 				// simulate an error from s3
 				_r->code = badRequestCode;
 				simulateS3TokenError = true;
@@ -1745,7 +1770,7 @@ std::string hmac_sha256_hex(std::string key, std::string msg) {
 	unsigned char hash[32];
 
 	HMAC_CTX* hmac = HMAC_CTX_new();
-	HMAC_Init_ex(hmac, &key[0], key.length(), EVP_sha256(), NULL);
+	HMAC_Init_ex(hmac, &key[0], key.length(), EVP_sha256(), nullptr);
 	HMAC_Update(hmac, (unsigned char*)&msg[0], msg.length());
 	unsigned int len = 32;
 	HMAC_Final(hmac, hash, &len);
@@ -1763,7 +1788,7 @@ std::string hmac_sha256(std::string key, std::string msg) {
 	unsigned char hash[32];
 
 	HMAC_CTX* hmac = HMAC_CTX_new();
-	HMAC_Init_ex(hmac, &key[0], key.length(), EVP_sha256(), NULL);
+	HMAC_Init_ex(hmac, &key[0], key.length(), EVP_sha256(), nullptr);
 	HMAC_Update(hmac, (unsigned char*)&msg[0], msg.length());
 	unsigned int len = 32;
 	HMAC_Final(hmac, hash, &len);
@@ -1831,16 +1856,16 @@ void S3BlobStoreEndpoint::setV4AuthHeaders(std::string const& verb,
 		headersList.push_back({ "content-type", trim_copy(headers["Content-Type"]) + "\n" });
 	if (headers.find("Content-MD5") != headers.end())
 		headersList.push_back({ "content-md5", trim_copy(headers["Content-MD5"]) + "\n" });
-	for (auto h : headers) {
-		if (StringRef(h.first).startsWith("x-amz"_sr))
-			headersList.push_back({ to_lower_copy(h.first), trim_copy(h.second) + "\n" });
+	for (const auto& [headerName, headerValue] : headers) {
+		if (StringRef(headerName).startsWith("x-amz"_sr))
+			headersList.push_back({ to_lower_copy(headerName), trim_copy(headerValue) + "\n" });
 	}
 	std::sort(headersList.begin(), headersList.end());
 	std::string canonicalHeaders;
 	std::string signedHeaders;
-	for (auto& i : headersList) {
-		canonicalHeaders += i.first + ":" + i.second;
-		signedHeaders += i.first + ";";
+	for (const auto& [headerName, headerValue] : headersList) {
+		canonicalHeaders += headerName + ":" + headerValue;
+		signedHeaders += headerName + ";";
 	}
 	signedHeaders.pop_back();
 	std::string canonicalRequest = verb + "\n" + canonicalURI + "\n" + canonicalQueryString + "\n" + canonicalHeaders +
@@ -1891,12 +1916,12 @@ void S3BlobStoreEndpoint::setAuthHeaders(std::string const& verb, std::string co
 	msg.append("\n");
 	msg.append(date);
 	msg.append("\n");
-	for (auto h : headers) {
-		StringRef name = h.first;
+	for (const auto& [headerName, headerValue] : headers) {
+		StringRef name = headerName;
 		if (name.startsWith("x-amz"_sr) || name.startsWith("x-icloud"_sr)) {
-			msg.append(h.first);
+			msg.append(headerName);
 			msg.append(":");
-			msg.append(h.second);
+			msg.append(headerValue);
 			msg.append("\n");
 		}
 	}

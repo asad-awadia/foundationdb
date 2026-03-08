@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -59,8 +59,6 @@ public:
 	// we cache the results to keep consistency in the same getrange lifetime
 	// TODO : give this function a more descriptive name
 	virtual bool isAsync() const { return false; }
-
-	virtual bool supportsTenants() const { return false; }
 
 	virtual ~SpecialKeyRangeReadImpl() {}
 
@@ -303,10 +301,6 @@ public:
 	Future<RangeResult> getRange(ReadYourWritesTransaction* ryw,
 	                             KeyRangeRef kr,
 	                             GetRangeLimits limitsHint) const override;
-	bool supportsTenants() const override {
-		CODE_PROBE(true, "Accessing conflicting keys in tenant");
-		return true;
-	};
 };
 
 class ReadConflictRangeImpl : public SpecialKeyRangeReadImpl {
@@ -315,10 +309,6 @@ public:
 	Future<RangeResult> getRange(ReadYourWritesTransaction* ryw,
 	                             KeyRangeRef kr,
 	                             GetRangeLimits limitsHint) const override;
-	bool supportsTenants() const override {
-		CODE_PROBE(true, "Accessing read conflict ranges in tenant");
-		return true;
-	};
 };
 
 class WriteConflictRangeImpl : public SpecialKeyRangeReadImpl {
@@ -327,10 +317,6 @@ public:
 	Future<RangeResult> getRange(ReadYourWritesTransaction* ryw,
 	                             KeyRangeRef kr,
 	                             GetRangeLimits limitsHint) const override;
-	bool supportsTenants() const override {
-		CODE_PROBE(true, "Accessing write conflict ranges in tenant");
-		return true;
-	};
 };
 
 class DDStatsRangeImpl : public SpecialKeyRangeAsyncImpl {

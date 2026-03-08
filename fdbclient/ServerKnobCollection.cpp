@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,9 +48,14 @@ Optional<KnobValue> ServerKnobCollection::tryParseKnobValue(std::string const& k
 }
 
 bool ServerKnobCollection::trySetKnob(std::string const& knobName, KnobValueRef const& knobValue) {
-	return clientKnobCollection.trySetKnob(knobName, knobValue) || knobValue.visitSetKnob(knobName, serverKnobs);
-}
-
-bool ServerKnobCollection::isAtomic(std::string const& knobName) const {
-	return clientKnobCollection.isAtomic(knobName) || serverKnobs.isAtomic(knobName);
+	// Do not short circuit by directly returning:
+	//     clientKnobCollection.trySetKnob(knobName, knobValue) || knobValue.visitSetKnob(knobName, serverKnobs)
+	// This is because some knobs have the same name in client and server e.g. MAX_WRITE_TRANSACTION_LIFE_VERSIONS
+	// When setting such knobs, we want both client and server knob to have their value updated
+	// Short circuiting would mean that server knob named FOO won't be updated if client knob FOO was updated
+	// Instead, we attempt setting client and server knobs in separate statements, and return true
+	// if at least one of the set attempts was succesful.
+	const bool setClientKnob = clientKnobCollection.trySetKnob(knobName, knobValue);
+	const bool setServerKnob = knobValue.visitSetKnob(knobName, serverKnobs);
+	return setClientKnob || setServerKnob;
 }

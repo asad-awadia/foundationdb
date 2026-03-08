@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -65,13 +65,6 @@ public class StackUtils {
 			item = getErrorBytes(ex);
 		}
 		return item;
-	}
-
-	// Without a JSON parsing library, we try to validate that the metadata consists
-	// of a select few properties using simple string comparison
-	static boolean validTenantMetadata(String metadata) {
-		return (metadata.charAt(0) == '{' && metadata.charAt(metadata.length() - 1) == '}' && metadata.contains("id") &&
-		        metadata.contains("prefix"));
 	}
 
 	////////////////////////

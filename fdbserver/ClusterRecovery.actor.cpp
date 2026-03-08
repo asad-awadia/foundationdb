@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@
 #include <utility>
 
 #include "fdbclient/FDBTypes.h"
-#include "fdbclient/MetaclusterRegistration.h"
 #include "fdbrpc/sim_validation.h"
 #include "fdbserver/ApplyMetadataMutation.h"
 #include "fdbserver/BackupProgress.actor.h"
@@ -35,13 +34,6 @@
 #include "flow/Trace.h"
 
 #include "flow/actorcompiler.h" // This must be the last #include.
-
-namespace {
-EncryptionAtRestMode getEncryptionAtRest(DatabaseConfiguration config) {
-	TraceEvent(SevDebug, "CREncryptionAtRestMode").detail("Mode", config.encryptionAtRestMode.toString());
-	return config.encryptionAtRestMode;
-}
-} // namespace
 
 static std::set<int> const& normalClusterRecoveryErrors() {
 	static std::set<int> s;
@@ -204,12 +196,10 @@ ACTOR Future<Void> newCommitProxies(Reference<ClusterRecoveryData> self, Recruit
 		req.recoveryCount = self->cstate.myDBState.recoveryCount + 1;
 		req.recoveryTransactionVersion = self->recoveryTransactionVersion;
 		req.firstProxy = i == 0;
-		req.encryptMode = getEncryptionAtRest(self->configuration);
 		req.commitProxyIndex = i;
 		TraceEvent("CommitProxyReplies", self->dbgid)
 		    .detail("WorkerID", recr.commitProxies[i].id())
 		    .detail("RecoveryTxnVersion", self->recoveryTransactionVersion)
-		    .detail("EncryptMode", req.encryptMode.toString())
 		    .detail("FirstProxy", req.firstProxy ? "True" : "False")
 		    .detail("CommitProxyIndex", req.commitProxyIndex);
 		initializationReplies.push_back(
@@ -254,7 +244,6 @@ ACTOR Future<Void> newResolvers(Reference<ClusterRecoveryData> self, RecruitFrom
 		req.recoveryCount = self->cstate.myDBState.recoveryCount + 1;
 		req.commitProxyCount = recr.commitProxies.size();
 		req.resolverCount = recr.resolvers.size();
-		req.encryptMode = getEncryptionAtRest(self->configuration);
 		TraceEvent("ResolverReplies", self->dbgid).detail("WorkerID", recr.resolvers[i].id());
 		initializationReplies.push_back(
 		    transformErrors(throwErrorOr(recr.resolvers[i].resolver.getReplyUnlessFailedFor(
@@ -371,7 +360,6 @@ ACTOR Future<Void> newSeedServers(Reference<ClusterRecoveryData> self,
 		isr.reqId = deterministicRandom()->randomUniqueID();
 		isr.interfaceId = deterministicRandom()->randomUniqueID();
 		isr.initialClusterVersion = self->recoveryTransactionVersion;
-		isr.encryptMode = self->configuration.encryptionAtRestMode;
 
 		ErrorOr<InitializeStorageReply> newServer = wait(recruits.storageServers[idx].storage.tryGetReply(isr));
 
@@ -461,7 +449,6 @@ ACTOR Future<Void> trackTlogRecovery(Reference<ClusterRecoveryData> self,
                                      Future<Void> minRecoveryDuration) {
 	state Future<Void> rejoinRequests = Never();
 	state DBRecoveryCount recoverCount = self->cstate.myDBState.recoveryCount + 1;
-	state EncryptionAtRestMode encryptionAtRestMode = getEncryptionAtRest(self->configuration);
 	state DatabaseConfiguration configuration =
 	    self->configuration; // self-configuration can be changed by configurationMonitor so we need a copy
 	loop {
@@ -472,9 +459,6 @@ ACTOR Future<Void> trackTlogRecovery(Reference<ClusterRecoveryData> self,
 		// which may cause immediate recovery to stuck in locking old tlogs.
 		self->logSystem->purgeOldRecoveredGenerationsCoreState(newState);
 		newState.recoveryCount = recoverCount;
-
-		// Update Coordinators EncryptionAtRest status during the very first recovery of the cluster (empty database)
-		newState.encryptionAtRestMode = encryptionAtRestMode;
 
 		state Future<Void> changed = self->logSystem->onCoreStateChanged();
 
@@ -489,7 +473,6 @@ ACTOR Future<Void> trackTlogRecovery(Reference<ClusterRecoveryData> self,
 		    .detail("FinalUpdate", finalUpdate)
 		    .detail("NewState.tlogs", newState.tLogs.size())
 		    .detail("NewState.OldTLogs", newState.oldTLogData.size())
-		    .detail("NewState.EncryptionAtRestMode", newState.encryptionAtRestMode.toString())
 		    .detail("Expected.tlogs",
 		            configuration.expectedLogSets(self->primaryDcId.size() ? self->primaryDcId[0] : Optional<Key>()))
 		    .detail("RecoveryCount", newState.recoveryCount);
@@ -637,10 +620,8 @@ ACTOR Future<Void> configurationMonitor(Reference<ClusterRecoveryData> self, Dat
 	}
 }
 
-// Returns the minimum backup version and the maximum backup worker noop version.
-ACTOR static Future<std::pair<Optional<Version>, Optional<Version>>> getMinBackupVersion(
-    Reference<ClusterRecoveryData> self,
-    Database cx) {
+// Returns the minimum backup version.
+ACTOR static Future<Optional<Version>> getMinBackupVersion(Reference<ClusterRecoveryData> self, Database cx) {
 	loop {
 		state ReadYourWritesTransaction tr(cx);
 
@@ -648,11 +629,9 @@ ACTOR static Future<std::pair<Optional<Version>, Optional<Version>>> getMinBacku
 			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
 			state Future<Optional<Value>> fValue = tr.get(backupStartedKey);
-			state Future<Optional<Value>> fNoopValue = tr.get(backupWorkerMaxNoopVersionKey);
-			wait(success(fValue) && success(fNoopValue));
+			wait(success(fValue));
 			Optional<Value> value = fValue.get();
-			Optional<Value> noopValue = fNoopValue.get();
-			Optional<Version> minVersion, noopVersion;
+			Optional<Version> minVersion;
 			if (value.present()) {
 				auto uidVersions = decodeBackupStartedValue(value.get());
 				TraceEvent e("GotBackupStartKey", self->dbgid);
@@ -665,10 +644,8 @@ ACTOR static Future<std::pair<Optional<Version>, Optional<Version>>> getMinBacku
 			} else {
 				TraceEvent("EmptyBackupStartKey", self->dbgid).log();
 			}
-			if (noopValue.present()) {
-				noopVersion = BinaryReader::fromStringRef<Version>(noopValue.get(), Unversioned());
-			}
-			return std::make_pair(minVersion, noopVersion);
+
+			return minVersion;
 
 		} catch (Error& e) {
 			wait(tr.onError(e));
@@ -717,23 +694,18 @@ ACTOR static Future<Void> recruitBackupWorkers(Reference<ClusterRecoveryData> se
 		                    backup_worker_failed()));
 	}
 
-	state Future<std::pair<Optional<Version>, Optional<Version>>> fMinVersion = getMinBackupVersion(self, cx);
+	state Future<Optional<Version>> fMinVersion = getMinBackupVersion(self, cx);
 	wait(gotProgress && success(fMinVersion));
-	Optional<Version> minVersion = fMinVersion.get().first;
-	Optional<Version> noopVersion = fMinVersion.get().second;
-	TraceEvent("MinBackupVersion", self->dbgid)
-	    .detail("Version", minVersion.present() ? minVersion.get() : -1)
-	    .detail("NoopVersion", noopVersion.present() ? noopVersion.get() : -1);
+	Optional<Version> minVersion = fMinVersion.get();
+	TraceEvent("MinBackupVersion", self->dbgid).detail("Version", minVersion.present() ? minVersion.get() : -1);
 
 	std::map<std::tuple<LogEpoch, Version, int>, std::map<Tag, Version>> toRecruit =
 	    backupProgress->getUnfinishedBackup();
 	for (const auto& [epochVersionTags, tagVersions] : toRecruit) {
 		const Version oldEpochEnd = std::get<1>(epochVersionTags);
-		if ((!minVersion.present() || minVersion.get() + 1 >= oldEpochEnd) ||
-		    (noopVersion.present() && noopVersion.get() >= oldEpochEnd)) {
+		if (!minVersion.present() || minVersion.get() + 1 >= oldEpochEnd) {
 			TraceEvent("SkipBackupRecruitment", self->dbgid)
 			    .detail("MinVersion", minVersion.present() ? minVersion.get() : -1)
-			    .detail("NoopVersion", noopVersion.present() ? noopVersion.get() : -1)
 			    .detail("Epoch", epoch)
 			    .detail("OldEpoch", std::get<0>(epochVersionTags))
 			    .detail("OldEpochEnd", oldEpochEnd);
@@ -810,14 +782,14 @@ ACTOR Future<Void> updateLogsValue(Reference<ClusterRecoveryData> self, Database
 	}
 }
 
-// TODO(ahusain): ClusterController orchestrating recovery, self message can be avoided.
-Future<Void> sendMasterRegistration(ClusterRecoveryData* self,
-                                    LogSystemConfig const& logSystemConfig,
-                                    std::vector<CommitProxyInterface> commitProxies,
-                                    std::vector<GrvProxyInterface> grvProxies,
-                                    std::vector<ResolverInterface> resolvers,
-                                    DBRecoveryCount recoveryCount,
-                                    std::vector<UID> priorCommittedLogServers) {
+// Directly calls clusterRegisterMaster
+void sendMasterRegistration(ClusterRecoveryData* self,
+                            LogSystemConfig const& logSystemConfig,
+                            std::vector<CommitProxyInterface> commitProxies,
+                            std::vector<GrvProxyInterface> grvProxies,
+                            std::vector<ResolverInterface> resolvers,
+                            DBRecoveryCount recoveryCount,
+                            std::vector<UID> priorCommittedLogServers) {
 	RegisterMasterRequest masterReq;
 	masterReq.id = self->masterInterface.id();
 	masterReq.mi = self->masterInterface.locality;
@@ -832,7 +804,8 @@ Future<Void> sendMasterRegistration(ClusterRecoveryData* self,
 	masterReq.priorCommittedLogServers = priorCommittedLogServers;
 	masterReq.recoveryState = self->recoveryState;
 	masterReq.recoveryStalled = self->recruitmentStalled->get();
-	return brokenPromiseToNever(self->clusterController.registerMaster.getReply(masterReq));
+
+	clusterRegisterMaster(self->controllerData, masterReq);
 }
 
 ACTOR Future<Void> updateRegistration(Reference<ClusterRecoveryData> self, Reference<ILogSystem> logSystem) {
@@ -857,23 +830,22 @@ ACTOR Future<Void> updateRegistration(Reference<ClusterRecoveryData> self, Refer
 		    .detail("LastEpochEnd", self->lastEpochEnd);
 
 		if (!self->cstateUpdated.isSet()) {
-			wait(sendMasterRegistration(self.getPtr(),
-			                            logSystemConfig,
-			                            self->provisionalCommitProxies,
-			                            self->provisionalGrvProxies,
-			                            self->resolvers,
-			                            self->cstate.myDBState.recoveryCount,
-			                            self->cstate.prevDBState.getPriorCommittedLogServers()));
-
+			sendMasterRegistration(self.getPtr(),
+			                       logSystemConfig,
+			                       self->provisionalCommitProxies,
+			                       self->provisionalGrvProxies,
+			                       self->resolvers,
+			                       self->cstate.myDBState.recoveryCount,
+			                       self->cstate.prevDBState.getPriorCommittedLogServers());
 		} else if (self->recoveryState >= RecoveryState::ACCEPTING_COMMITS) {
 			updateLogsKey = updateLogsValue(self, cx);
-			wait(sendMasterRegistration(self.getPtr(),
-			                            logSystemConfig,
-			                            self->commitProxies,
-			                            self->grvProxies,
-			                            self->resolvers,
-			                            self->cstate.myDBState.recoveryCount,
-			                            std::vector<UID>()));
+			sendMasterRegistration(self.getPtr(),
+			                       logSystemConfig,
+			                       self->commitProxies,
+			                       self->grvProxies,
+			                       self->resolvers,
+			                       self->cstate.myDBState.recoveryCount,
+			                       std::vector<UID>());
 		} else {
 			// The cluster should enter the accepting commits phase soon, and then we will register again
 			CODE_PROBE(true, "cstate is updated but we aren't accepting commits yet", probe::decoration::rare);
@@ -1060,10 +1032,6 @@ ACTOR Future<std::vector<Standalone<CommitTransactionRef>>> recruitEverything(
 		    .detail("RequiredGrvProxies", 1)
 		    .detail("RequiredResolvers", 1)
 		    .trackLatest(self->clusterRecoveryStateEventHolder->trackingKey);
-		// The cluster's EncryptionAtRest status is now readable.
-		if (self->controllerData->encryptionAtRestMode.canBeSet()) {
-			self->controllerData->encryptionAtRestMode.send(getEncryptionAtRest(self->configuration));
-		}
 	}
 
 	// FIXME: we only need log routers for the same locality as the master
@@ -1182,25 +1150,17 @@ ACTOR Future<Void> readTransactionSystemState(Reference<ClusterRecoveryData> sel
 	// Sets self->configuration to the configuration (FF/conf/ keys) at self->lastEpochEnd
 
 	// Recover transaction state store
-	// If it's the first recovery the encrypt mode is not yet available so create the txn state store with encryption
-	// disabled. This is fine since we will not write any data to disk using this txn store.
-	state bool enableEncryptionForTxnStateStore = false;
-	if (self->controllerData->encryptionAtRestMode.getFuture().isReady()) {
-		EncryptionAtRestMode encryptMode = wait(self->controllerData->encryptionAtRestMode.getFuture());
-		enableEncryptionForTxnStateStore = encryptMode.isEncryptionEnabled();
-	}
-	CODE_PROBE(enableEncryptionForTxnStateStore, "Enable encryption for txnStateStore", probe::decoration::rare);
-	if (self->txnStateStore)
+	if (self->txnStateStore) {
 		self->txnStateStore->close();
+	}
 	self->txnStateLogAdapter = openDiskQueueAdapter(oldLogSystem, myLocality, txsPoppedVersion);
 	self->txnStateStore = keyValueStoreLogSystem(self->txnStateLogAdapter,
 	                                             self->dbInfo,
 	                                             self->dbgid,
 	                                             self->memoryLimit,
-	                                             false,
-	                                             false,
-	                                             true,
-	                                             enableEncryptionForTxnStateStore);
+	                                             /*disableSnapshot=*/false,
+	                                             /*replaceContent=*/false,
+	                                             /*exactRecovery=*/true);
 
 	// Version 0 occurs at the version epoch. The version epoch is the number
 	// of microseconds since the Unix epoch. It can be set through fdbcli.
@@ -1273,9 +1233,6 @@ ACTOR Future<Void> readTransactionSystemState(Reference<ClusterRecoveryData> sel
 
 	RangeResult rawTags = wait(self->txnStateStore->readRange(serverTagKeys));
 	self->allTags.clear();
-	if (self->lastEpochEnd > 0) {
-		self->allTags.push_back(cacheTag);
-	}
 
 	if (self->forceRecovery) {
 		self->safeLocality = oldLogSystem->getLogSystemConfig().tLogs[0].locality;
@@ -1296,42 +1253,7 @@ ACTOR Future<Void> readTransactionSystemState(Reference<ClusterRecoveryData> sel
 		self->allTags.push_back(decodeServerTagValue(kv.value));
 	}
 
-	Optional<Value> metaclusterRegistrationVal =
-	    wait(self->txnStateStore->readValue(metacluster::metadata::metaclusterRegistration().key));
-	Optional<UnversionedMetaclusterRegistrationEntry> metaclusterRegistration =
-	    UnversionedMetaclusterRegistrationEntry::decode(metaclusterRegistrationVal);
-	Optional<ClusterName> metaclusterName;
-	Optional<UID> metaclusterId;
-	Optional<ClusterName> clusterName;
-	Optional<UID> clusterId;
-	self->controllerData->db.metaclusterRegistration = metaclusterRegistration;
-	if (metaclusterRegistration.present()) {
-		self->controllerData->db.metaclusterName = metaclusterRegistration.get().metaclusterName;
-		self->controllerData->db.clusterType = metaclusterRegistration.get().clusterType;
-		metaclusterName = metaclusterRegistration.get().metaclusterName;
-		metaclusterId = metaclusterRegistration.get().metaclusterId;
-		if (metaclusterRegistration.get().clusterType == ClusterType::METACLUSTER_DATA) {
-			clusterName = metaclusterRegistration.get().name;
-			clusterId = metaclusterRegistration.get().id;
-		}
-	} else {
-		self->controllerData->db.metaclusterName = Optional<ClusterName>();
-		self->controllerData->db.clusterType = ClusterType::STANDALONE;
-	}
-
-	TraceEvent("MetaclusterMetadata")
-	    .detail("ClusterType", clusterTypeToString(self->controllerData->db.clusterType))
-	    .detail("MetaclusterName", metaclusterName)
-	    .detail("MetaclusterId", metaclusterId)
-	    .detail("DataClusterName", clusterName)
-	    .detail("DataClusterId", clusterId)
-	    .trackLatest(self->metaclusterEventHolder->trackingKey);
-
 	uniquify(self->allTags);
-
-	// auto kvs = self->txnStateStore->readRange( systemKeys );
-	// for( auto & kv : kvs.get() )
-	//	TraceEvent("ClusterRecoveredTXS", self->dbgid).detail("K", kv.key).detail("V", kv.value);
 
 	self->txnStateLogAdapter->setNextVersion(
 	    oldLogSystem->getEnd()); //< FIXME: (1) the log adapter should do this automatically after recovery; (2) if we
@@ -1582,12 +1504,6 @@ ACTOR Future<Void> clusterRecoveryCore(Reference<ClusterRecoveryData> self) {
 	    .trackLatest(self->clusterRecoveryStateEventHolder->trackingKey);
 
 	wait(self->cstate.read());
-
-	// Unless the cluster database is 'empty', the cluster's EncryptionAtRest status is readable once cstate is
-	// recovered
-	if (!self->cstate.myDBState.tLogs.empty() && self->controllerData->encryptionAtRestMode.canBeSet()) {
-		self->controllerData->encryptionAtRestMode.send(self->cstate.myDBState.encryptionAtRestMode);
-	}
 
 	if (self->cstate.prevDBState.lowestCompatibleProtocolVersion > currentProtocolVersion()) {
 		TraceEvent(SevWarnAlways, "IncompatibleProtocolVersion", self->dbgid).log();
@@ -1914,7 +1830,7 @@ ACTOR Future<Void> clusterRecoveryCore(Reference<ClusterRecoveryData> self) {
 	throw internal_error();
 }
 
-ACTOR Future<Void> cleanupRecoveryActorCollection(Reference<ClusterRecoveryData> self, bool exThrown) {
+ACTOR Future<Void> cleanupRecoveryActorCollection(Reference<ClusterRecoveryData> self) {
 	if (self.isValid()) {
 		wait(delay(0.0));
 

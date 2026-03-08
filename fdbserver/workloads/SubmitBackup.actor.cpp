@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,35 +57,33 @@ struct SubmitBackupWorkload : TestWorkload {
 		}
 	}
 
-	ACTOR static Future<Void> _start(SubmitBackupWorkload* self, Database cx) {
-		wait(delay(self->delayFor));
-		state Standalone<VectorRef<KeyRangeRef>> backupRanges;
+	static Future<Void> _start(SubmitBackupWorkload* self, Database cx) {
+		co_await delay(self->delayFor);
+		Standalone<VectorRef<KeyRangeRef>> backupRanges;
 		addDefaultBackupRanges(backupRanges);
 
 		if (self->encryptionKeyFileName.present()) {
-			wait(BackupContainerFileSystem::createTestEncryptionKeyFile(self->encryptionKeyFileName.get()));
+			co_await BackupContainerFileSystem::createTestEncryptionKeyFile(self->encryptionKeyFileName.get());
 		}
 
 		try {
-			wait(self->backupAgent.submitBackup(cx,
-			                                    self->backupDir,
-			                                    {},
-			                                    self->initSnapshotInterval,
-			                                    self->snapshotInterval,
-			                                    self->tag.toString(),
-			                                    backupRanges,
-			                                    true,
-			                                    self->stopWhenDone,
-			                                    UsePartitionedLog::False,
-			                                    self->incremental,
-			                                    self->encryptionKeyFileName));
+			co_await self->backupAgent.submitBackup(cx,
+			                                        self->backupDir,
+			                                        {},
+			                                        self->initSnapshotInterval,
+			                                        self->snapshotInterval,
+			                                        self->tag.toString(),
+			                                        backupRanges,
+			                                        self->stopWhenDone,
+			                                        UsePartitionedLog::False,
+			                                        self->incremental,
+			                                        self->encryptionKeyFileName);
 		} catch (Error& e) {
 			TraceEvent("BackupSubmitError").error(e);
 			if (e.code() != error_code_backup_duplicate) {
 				throw;
 			}
 		}
-		return Void();
 	}
 
 	Future<Void> setup(Database const& cx) override { return Void(); }

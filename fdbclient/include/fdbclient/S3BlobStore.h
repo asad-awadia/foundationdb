@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -111,8 +111,8 @@ public:
 		                   CLIENT_KNOBS->BLOBSTORE_LATENCY_LOGGING_ACCURACY) {}
 	};
 	// null when initialized, so no blob stats until a blob connection is used
-	static std::unique_ptr<BlobStats> blobStats;
-	static Future<Void> statsLogger;
+	std::unique_ptr<BlobStats> blobStats;
+	Future<Void> statsLogger;
 
 	void maybeStartStatsLogger() {
 		if (!blobStats && CLIENT_KNOBS->BLOBSTORE_ENABLE_LOGGING) {

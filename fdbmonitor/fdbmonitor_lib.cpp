@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -605,7 +605,7 @@ bool argv_equal(const char** a1, const char** a2) {
 	int i = 0;
 
 	while (a1[i] && a2[i]) {
-		if (strcmp(a1[i], a2[i]))
+		if (strcmp(a1[i], a2[i]) != 0)
 			return false;
 		i++;
 	}
@@ -675,12 +675,12 @@ void load_conf(const char* confpath, uid_t& uid, gid_t& gid, sigset_t* mask, fdb
 		/* Any change to uid or gid requires the process to be restarted to take effect */
 		if (uid != _uid || gid != _gid) {
 			std::vector<ProcessID> kill_ids;
-			for (auto i : id_pid) {
+			for (const auto& i : id_pid) {
 				if (id_command[i.first]->kill_on_configuration_change) {
 					kill_ids.push_back(i.first);
 				}
 			}
-			for (auto i : kill_ids) {
+			for (const auto& i : kill_ids) {
 				kill_process(i);
 				id_command.erase(i);
 			}
@@ -693,7 +693,7 @@ void load_conf(const char* confpath, uid_t& uid, gid_t& gid, sigset_t* mask, fdb
 	std::list<ProcessID> kill_ids;
 	std::list<std::pair<ProcessID, Command*>> start_ids;
 
-	for (auto i : id_pid) {
+	for (const auto& i : id_pid) {
 		if (!loadedConf || ini.GetSectionSize(id_command[i.first]->ssection.c_str()) == -1) {
 			/* Process no longer configured; deconfigure it and kill it if required */
 			log_msg(SevInfo, "Deconfigured %s\n", id_command[i.first]->ssection.c_str());
@@ -726,10 +726,10 @@ void load_conf(const char* confpath, uid_t& uid, gid_t& gid, sigset_t* mask, fdb
 		}
 	}
 
-	for (auto i : kill_ids)
+	for (const auto& i : kill_ids)
 		kill_process(i);
 
-	for (auto i : start_ids) {
+	for (const auto& i : start_ids) {
 		start_process(i.second, i.first, uid, gid, 0, mask);
 	}
 
@@ -738,7 +738,7 @@ void load_conf(const char* confpath, uid_t& uid, gid_t& gid, sigset_t* mask, fdb
 	if (loadedConf) {
 		CSimpleIniA::TNamesDepend sections;
 		ini.GetAllSections(sections);
-		for (auto i : sections) {
+		for (const auto& i : sections) {
 			if (auto dot = strrchr(i.pItem, '.')) {
 				ProcessID id = i.pItem;
 				if (!id_pid.count(id)) {

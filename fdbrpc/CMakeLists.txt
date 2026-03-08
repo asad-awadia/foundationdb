@@ -24,10 +24,6 @@ add_flow_target(STATIC_LIBRARY NAME fdbrpc
 add_flow_target(STATIC_LIBRARY NAME fdbrpc_sampling
   SRCS ${FDBRPC_SRCS}
   DISABLE_ACTOR_DIAGNOSTICS ${FDBRPC_SRCS_DISABLE_ACTOR_DIAGNOSTICS})
-add_flow_target(STATIC_LIBRARY NAME tokensign
-  SRCS TokenSign/TokenSignStdTypes.cpp
-  DISABLE_ACTOR_DIAGNOSTICS ${FDBRPC_SRCS_DISABLE_ACTOR_DIAGNOSTICS})
-target_link_libraries(tokensign PRIVATE fdbrpc flow)
 
 add_flow_target(LINK_TEST NAME fdbrpclinktest SRCS LinkTest.cpp)
 target_link_libraries(fdbrpclinktest PRIVATE fdbrpc rapidjson)
@@ -36,7 +32,7 @@ target_include_directories(fdbrpclinktest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/li
 if(COMPILE_EIO)
   add_library(eio STATIC libeio/eio.c)
   if(USE_VALGRIND)
-    target_link_libraries(eio PUBLIC Valgrind)
+    target_link_libraries(eio PUBLIC valgrind)
   endif()
   target_compile_definitions(eio PRIVATE USE_UCONTEXT)
   target_compile_options(eio BEFORE PRIVATE -w) # disable warnings for eio
@@ -60,7 +56,7 @@ if(${COROUTINE_IMPL} STREQUAL libcoro)
     target_compile_options(coro BEFORE PRIVATE -w) # disable warnings for third party
   endif()
   if(USE_VALGRIND)
-    target_link_libraries(coro PUBLIC Valgrind)
+    target_link_libraries(coro PUBLIC valgrind)
   endif()
 endif()
 
@@ -98,7 +94,6 @@ endif()
 target_compile_definitions(fdbrpc_sampling PRIVATE -DENABLE_SAMPLING)
 if(WIN32)
   add_dependencies(fdbrpc_sampling_actors fdbrpc_actors)
-  add_dependencies(tokensign_actors fdbrpc_actors)
 endif()
 
 add_subdirectory(tests)

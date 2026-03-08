@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 
 // When actually compiled (NO_INTELLISENSE), include the generated version of this file.  In intellisense use the source
 // version.
+#include "flow/CodeProbe.h"
 #include "flow/Error.h"
 #include "flow/FastRef.h"
 #include "flow/TaskPriority.h"
@@ -58,7 +59,8 @@ Future<T> traceAfter(Future<T> what, std::string type, bool traceErrors = true) 
 		TraceEvent(typeStr.c_str());
 		return val;
 	} catch (Error& e) {
-		if (traceErrors) {
+		// Don't trace operation_cancelled as it's a normal control flow mechanism, not an error
+		if (traceErrors && e.code() != error_code_operation_cancelled) {
 			TraceEvent(typeStr.c_str()).errorUnsuppressed(e);
 		}
 		throw;

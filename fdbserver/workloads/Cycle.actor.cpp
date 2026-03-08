@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,8 +25,6 @@
 #include "flow/WipedString.h"
 #include "flow/serialize.h"
 #include "fdbrpc/simulator.h"
-#include "fdbrpc/TokenSign.h"
-#include "fdbrpc/TenantInfo.h"
 #include "fdbclient/FDBOptions.g.h"
 #include "fdbclient/NativeAPI.actor.h"
 #include "fdbserver/TesterInterface.actor.h"
@@ -35,27 +33,8 @@
 
 #include "flow/actorcompiler.h" // This must be the last #include.
 
-template <bool MultiTenancy>
-struct CycleMembers {};
-
-template <>
-struct CycleMembers<true> {
-	Arena arena;
-	TenantName tenant;
-	int64_t tenantId;
-	WipedString signedToken;
-	bool useToken;
-};
-
-template <bool>
-struct CycleWorkload;
-
-ACTOR Future<Void> prepareToken(Database cx, CycleWorkload<true>* self);
-
-template <bool MultiTenancy>
-struct CycleWorkload : TestWorkload, CycleMembers<MultiTenancy> {
-	static constexpr auto NAME = MultiTenancy ? "TenantCycle" : "Cycle";
-	static constexpr auto TenantEnabled = MultiTenancy;
+struct CycleWorkload : TestWorkload, Arena {
+	static constexpr auto NAME = "Cycle";
 	int actorCount, nodeCount;
 	double testDuration, transactionsPerSecond, minExpectedTransactionsPerSecond, traceParentProbability;
 	bool unseedCheck{ true };
@@ -78,12 +57,6 @@ struct CycleWorkload : TestWorkload, CycleMembers<MultiTenancy> {
 		minExpectedTransactionsPerSecond = transactionsPerSecond * getOption(options, "expectedRate"_sr, 0.7);
 		unseedCheck = getOption(options, "unseedCheck"_sr, true);
 		skipSetup = getOption(options, "skipSetup"_sr, false);
-		if constexpr (MultiTenancy) {
-			ASSERT(g_network->isSimulated());
-			this->useToken = getOption(options, "useToken"_sr, true);
-			this->tenant = getOption(options, "tenant"_sr, "CycleTenant"_sr);
-			this->tenantId = TenantInfo::INVALID_TENANT;
-		}
 	}
 
 	Future<Void> setup(Database const& cx) override {
@@ -93,27 +66,17 @@ struct CycleWorkload : TestWorkload, CycleMembers<MultiTenancy> {
 		if (skipSetup) {
 			return Void();
 		}
-		Future<Void> prepare;
-		if constexpr (MultiTenancy) {
-			prepare = prepareToken(cx, this);
-		} else {
-			prepare = Void();
-		}
+		// TODO(gglass): possible cleanup here.  Leftover tenant stuff.
+		Future<Void> prepare = Void();
 		return runAfter(prepare, [this, cx](Void) { return bulkSetup(cx, this, nodeCount, Promise<double>()); });
 	}
 	Future<Void> start(Database const& cx) override {
-		if constexpr (MultiTenancy) {
-			cx->defaultTenant = this->tenant;
-		}
 		for (int c = 0; c < actorCount; c++)
 			clients.push_back(
 			    timeout(cycleClient(cx->clone(), this, actorCount / transactionsPerSecond), testDuration, Void()));
 		return delay(testDuration);
 	}
 	Future<bool> check(Database const& cx) override {
-		if constexpr (MultiTenancy) {
-			cx->defaultTenant = this->tenant;
-		}
 		int errors = 0;
 		for (int c = 0; c < clients.size(); c++)
 			errors += clients[c].isError();
@@ -152,54 +115,45 @@ struct CycleWorkload : TestWorkload, CycleMembers<MultiTenancy> {
 		    .detailf("From", "%016llx", debug_lastLoadBalanceResultEndpointToken);
 	}
 
-	template <bool B = MultiTenancy>
-	std::enable_if_t<B> setAuthToken(Transaction& tr) const {
-		if (this->useToken)
-			tr.setOption(FDBTransactionOptions::AUTHORIZATION_TOKEN, this->signedToken);
-	}
-
-	template <bool B = MultiTenancy>
-	std::enable_if_t<!B> setAuthToken(Transaction& tr) const {}
-
-	ACTOR Future<Void> cycleClient(Database cx, CycleWorkload* self, double delay) {
-		state double lastTime = now();
+	Future<Void> cycleClient(Database cx, CycleWorkload* self, double delay) {
+		double lastTime = now();
 		TraceEvent("CycleClientStart").log();
 		try {
 			loop {
-				wait(poisson(&lastTime, delay));
+				co_await poisson(&lastTime, delay);
 
-				state double tstart = now();
-				state int r = deterministicRandom()->randomInt(0, self->nodeCount);
-				state Transaction tr(cx);
+				double tstart = now();
+				int r = deterministicRandom()->randomInt(0, self->nodeCount);
+				Transaction tr(cx);
 				if (deterministicRandom()->random01() <= self->traceParentProbability) {
-					state Span span("CycleClient"_loc);
+					Span span("CycleClient"_loc);
 					TraceEvent("CycleTracingTransaction", span.context.traceID).log();
 					tr.setOption(FDBTransactionOptions::SPAN_PARENT,
 					             BinaryWriter::toValue(span.context, IncludeVersion()));
 				}
 				while (true) {
+					Error err;
 					try {
-						self->setAuthToken(tr);
 						// Reverse next and next^2 node
-						Optional<Value> v = wait(tr.get(self->key(r)));
+						Optional<Value> v = co_await tr.get(self->key(r));
 						if (!v.present()) {
 							self->badRead("KeyR", r, tr);
 						}
-						state int r2 = self->fromValue(v.get());
-						Optional<Value> v2 = wait(tr.get(self->key(r2)));
+						int r2 = self->fromValue(v.get());
+						Optional<Value> v2 = co_await tr.get(self->key(r2));
 						if (!v2.present())
 							self->badRead("KeyR2", r2, tr);
-						state int r3 = self->fromValue(v2.get());
-						Optional<Value> v3 = wait(tr.get(self->key(r3)));
+						int r3 = self->fromValue(v2.get());
+						Optional<Value> v3 = co_await tr.get(self->key(r3));
 						if (!v3.present())
 							self->badRead("KeyR3", r3, tr);
-						state int r4 = self->fromValue(v3.get());
+						int r4 = self->fromValue(v3.get());
 
-						// Single key clear range op will be converted to point delete inside storage engine. Generating
-						// a larger range here to increase test coverage.
-						tr.clear(
-						    self->keyRange(r),
-						    AddConflictRange::True); //< Shouldn't have an effect, but will break with wrong ordering
+						// Single key clear range op will be converted to point delete inside storage engine.
+						// Generating a larger range here to increase test coverage.
+						tr.clear(self->keyRange(r),
+						         AddConflictRange::True); //< Shouldn't have an effect, but will break with wrong
+						                                  // ordering
 						tr.set(self->key(r), self->value(r3));
 						tr.set(self->key(r2), self->value(r4));
 						tr.set(self->key(r3), self->value(r2));
@@ -207,7 +161,7 @@ struct CycleWorkload : TestWorkload, CycleMembers<MultiTenancy> {
 						// TraceEvent("CyclicTest2").detail("RawKey", r2).detail("RawValue", r4).detail("Key", self->key(r2).toString()).detail("Value", self->value(r4).toString()).log();
 						// TraceEvent("CyclicTest3").detail("RawKey", r3).detail("RawValue", r2).detail("Key", self->key(r3).toString()).detail("Value", self->value(r2).toString()).log();
 
-						wait(tr.commit());
+						co_await tr.commit();
 						// TraceEvent("CyclicTestCommit")
 						// 	.detail("R1", r)
 						// 	.detail("R2", r2)
@@ -216,12 +170,13 @@ struct CycleWorkload : TestWorkload, CycleMembers<MultiTenancy> {
 						// 	.log();
 						break;
 					} catch (Error& e) {
-						if (e.code() == error_code_transaction_too_old)
-							++self->tooOldRetries;
-						else if (e.code() == error_code_not_committed)
-							++self->commitFailedRetries;
-						wait(tr.onError(e));
+						err = e;
 					}
+					if (err.code() == error_code_transaction_too_old)
+						++self->tooOldRetries;
+					else if (err.code() == error_code_not_committed)
+						++self->commitFailedRetries;
+					co_await tr.onError(err);
 					++self->retries;
 				}
 				++self->transactions;
@@ -310,7 +265,7 @@ struct CycleWorkload : TestWorkload, CycleMembers<MultiTenancy> {
 		return true;
 	}
 
-	ACTOR Future<bool> cycleCheck(Database cx, CycleWorkload* self, bool ok) {
+	Future<bool> cycleCheck(Database cx, CycleWorkload* self, bool ok) {
 		if (self->transactions.getMetric().value() < self->testDuration * self->minExpectedTransactionsPerSecond) {
 			TraceEvent(SevWarnAlways, "TestFailure")
 			    .detail("Reason", "Rate below desired rate")
@@ -326,47 +281,35 @@ struct CycleWorkload : TestWorkload, CycleMembers<MultiTenancy> {
 		}
 		if (!self->clientId) {
 			// One client checks the validity of the cycle
-			state Transaction tr(cx);
-			state int retryCount = 0;
+			Transaction tr(cx);
+			int retryCount = 0;
 			loop {
+				Error err;
 				try {
-					self->setAuthToken(tr);
-					state Version v = wait(tr.getReadVersion());
-					RangeResult data = wait(tr.getRange(firstGreaterOrEqual(doubleToTestKey(0.0, self->keyPrefix)),
-					                                    firstGreaterOrEqual(doubleToTestKey(1.0, self->keyPrefix)),
-					                                    self->nodeCount + 1));
+					Version v = co_await tr.getReadVersion();
+					RangeResult data = co_await tr.getRange(firstGreaterOrEqual(doubleToTestKey(0.0, self->keyPrefix)),
+					                                        firstGreaterOrEqual(doubleToTestKey(1.0, self->keyPrefix)),
+					                                        self->nodeCount + 1);
 					ok = self->cycleCheckData(data, v) && ok;
 					break;
 				} catch (Error& e) {
-					retryCount++;
-					TraceEvent(retryCount > 20 ? SevWarnAlways : SevWarn, "CycleCheckError").error(e);
-					if (g_network->isSimulated() && retryCount > 50) {
-						CODE_PROBE(true, "Cycle check enable speedUpSimulation because too many transaction_too_old()");
-						// try to make the read window back to normal size (5 * version_per_sec)
-						g_simulator->speedUpSimulation = true;
-					}
-					wait(tr.onError(e));
+					err = e;
 				}
+				retryCount++;
+				TraceEvent(retryCount > 20 ? SevWarnAlways : SevWarn, "CycleCheckError").error(err);
+				if (g_network->isSimulated() && retryCount > 50) {
+					CODE_PROBE(true, "Cycle check enable speedUpSimulation because too many transaction_too_old()");
+					// try to make the read window back to normal size (5 * version_per_sec)
+					g_simulator->speedUpSimulation = true;
+				}
+				co_await tr.onError(err);
 			}
 		}
 		if (!self->unseedCheck) {
 			ASSERT(noUnseed);
 		}
-		return ok;
+		co_return ok;
 	}
 };
 
-ACTOR Future<Void> prepareToken(Database cx, CycleWorkload<true>* self) {
-	cx->defaultTenant = self->tenant;
-	int64_t tenantId = wait(cx->lookupTenant(self->tenant));
-	self->tenantId = tenantId;
-	ASSERT_NE(self->tenantId, TenantInfo::INVALID_TENANT);
-	// make the lifetime comfortably longer than the timeout of the workload
-	self->signedToken = g_simulator->makeToken(self->tenantId,
-	                                           uint64_t(std::lround(self->getCheckTimeout())) +
-	                                               uint64_t(std::lround(self->testDuration)) + 100);
-	return Void();
-}
-
-WorkloadFactory<CycleWorkload<false>> CycleWorkloadFactory(UntrustedMode::False);
-WorkloadFactory<CycleWorkload<true>> TenantCycleWorkloadFactory(UntrustedMode::True);
+WorkloadFactory<CycleWorkload> CycleWorkloadFactory(UntrustedMode::False);

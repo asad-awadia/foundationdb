@@ -110,8 +110,7 @@
                   "commit_proxy",
                   "grv_proxy",
                   "master",
-                  "test",
-                  "storage_cache"
+                  "test"
                ]
             },
             "degraded":true,
@@ -152,7 +151,6 @@
                         "cluster_controller",
                         "data_distributor",
                         "ratekeeper",
-                        "storage_cache",
                         "router",
                         "coordinator"
                      ]
@@ -617,8 +615,7 @@
                   "primary_dc_missing",
                   "fetch_primary_dc_timeout",
                   "fetch_storage_wiggler_stats_timeout",
-                  "fetch_consistency_scan_status_timeout",
-                  "metacluster_metrics_missing"
+                  "fetch_consistency_scan_status_timeout"
                ]
             },
             "issues":[
@@ -901,17 +898,6 @@
              "gradual",
              "aggressive"
          ]},
-         "tenant_mode": {
-             "$enum":[
-             "disabled",
-             "optional_experimental",
-             "required_experimental"
-         ]},
-         "encryption_at_rest_mode": {
-             "$enum":[
-             "disabled",
-             "aes_256_ctr"
-         ]}
       },
       "data":{
          "least_operating_space_bytes_log_server":0,
@@ -1004,19 +990,6 @@
                "logical_core_utilization":0.4 // computed as cpu_seconds / elapsed_seconds; value may be capped at 0.5 due to hyper-threading
             }
          }
-      },
-      "metacluster" : {
-         "cluster_type" : "management",         // management, data, or standalone
-         "metacluster_name" : "metacluster1",
-         "metacluster_id" : 12345,
-         "data_cluster_name" : "data_cluster1", // data cluster only
-         "data_cluster_id" : 12346,             // data cluster only
-         "num_data_clusters": 10                // management cluster only
-      },
-      "tenants" : {
-         "num_tenants" : 1, // on data cluster, local count; on management cluster, total metacluster count
-         "num_tenant_groups" : 10,
-         "tenant_group_capacity" : 20,
       },
       "idempotency_ids" : {
          "size_bytes" : 0, // An estimate of the current number of bytes used in the database to store idempotency ids.

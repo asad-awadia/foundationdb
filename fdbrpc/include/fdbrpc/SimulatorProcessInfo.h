@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -132,7 +132,6 @@ struct ProcessInfo : NonCopyable {
 		case ProcessClass::RatekeeperClass:
 		case ProcessClass::ConsistencyScanClass:
 		case ProcessClass::BlobManagerClass:
-		case ProcessClass::StorageCacheClass:
 		case ProcessClass::BackupClass:
 		case ProcessClass::EncryptKeyProxyClass:
 		default:
@@ -146,7 +145,10 @@ struct ProcessInfo : NonCopyable {
 		return listener->second;
 	}
 
-	inline flowGlobalType global(int id) const { return (globals.size() > id) ? globals[id] : nullptr; };
+	inline flowGlobalType global(int id) const {
+		ASSERT(id >= 0);
+		return (globals.size() > id) ? globals[id] : nullptr;
+	};
 	inline void setGlobal(size_t id, flowGlobalType v) {
 		globals.resize(std::max(globals.size(), id + 1));
 		globals[id] = v;

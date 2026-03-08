@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -66,33 +66,39 @@ struct LowLatencyWorkload : TestWorkload {
 		return Void();
 	}
 
-	ACTOR static Future<Void> _start(Database cx, LowLatencyWorkload* self) {
-		state double testStart = now();
+	static Future<Void> _start(Database cx, LowLatencyWorkload* self) {
+		double testStart = now();
 		try {
 			loop {
-				wait(delay(self->checkDelay));
-				state Transaction tr(cx);
-				state double operationStart = now();
-				state bool doCommit = self->testWrites && deterministicRandom()->coinflip();
-				state double maxLatency = doCommit ? self->maxCommitLatency : self->maxGRVLatency;
+				co_await delay(self->checkDelay);
+				Transaction tr(cx);
+				double operationStart = now();
+				bool doCommit = self->testWrites && deterministicRandom()->coinflip();
+				double maxLatency = doCommit ? self->maxCommitLatency : self->maxGRVLatency;
 				++self->operations;
 				loop {
+					Error err;
 					try {
-						TraceEvent("StartLowLatencyTransaction").log();
+						TraceEvent("LowLatencyTransactionStart").detail("Retries", self->retries.getValue());
 						tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 						tr.setOption(FDBTransactionOptions::LOCK_AWARE);
 						if (doCommit) {
+							TraceEvent("LowLatencyTransactionCommitStart");
 							tr.set(self->testKey, ""_sr);
-							wait(tr.commit());
+							co_await tr.commit();
+							TraceEvent("LowLatencyTransactionCommitFinish");
 						} else {
-							wait(success(tr.getReadVersion()));
+							TraceEvent("LowLatencyTransactionGRVStart");
+							co_await success(tr.getReadVersion());
+							TraceEvent("LowLatencyTransactionGRVFinish");
 						}
 						break;
 					} catch (Error& e) {
-						TraceEvent("LowLatencyTransactionFailed").errorUnsuppressed(e);
-						wait(tr.onError(e));
-						++self->retries;
+						err = e;
 					}
+					TraceEvent("LowLatencyTransactionFailed").errorUnsuppressed(err);
+					co_await tr.onError(err);
+					++self->retries;
 				}
 				if (now() - operationStart > maxLatency) {
 					TraceEvent(SevError, "LatencyTooLarge")
@@ -104,7 +110,7 @@ struct LowLatencyWorkload : TestWorkload {
 				if (now() - testStart > self->testDuration)
 					break;
 			}
-			return Void();
+			co_return;
 		} catch (Error& e) {
 			TraceEvent(SevError, "LowLatencyError").errorUnsuppressed(e);
 			throw;

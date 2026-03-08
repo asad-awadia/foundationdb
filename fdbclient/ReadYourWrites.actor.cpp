@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1547,21 +1547,13 @@ public:
 	}
 };
 
-ReadYourWritesTransaction::ReadYourWritesTransaction(Database const& cx, Optional<Reference<Tenant>> const& tenant)
-  : ISingleThreadTransaction(cx->deferredError), tr(cx, tenant), cache(&arena), writes(&arena), retries(0),
-    approximateSize(0), creationTime(now()), commitStarted(false), versionStampFuture(tr.getVersionstamp()),
+ReadYourWritesTransaction::ReadYourWritesTransaction(Database const& cx)
+  : deferredError(cx->deferredError), tr(cx), cache(&arena), writes(&arena), retries(0), approximateSize(0),
+    creationTime(now()), commitStarted(false), versionStampFuture(tr.getVersionstamp()),
     specialKeySpaceWriteMap(std::make_pair(false, Optional<Value>()), specialKeys.end), options(tr) {
 	std::copy(
 	    cx.getTransactionDefaults().begin(), cx.getTransactionDefaults().end(), std::back_inserter(persistentOptions));
 	applyPersistentOptions();
-}
-
-void ReadYourWritesTransaction::construct(Database const& cx) {
-	*this = ReadYourWritesTransaction(cx);
-}
-
-void ReadYourWritesTransaction::construct(Database const& cx, Reference<Tenant> const& tenant) {
-	*this = ReadYourWritesTransaction(cx, tenant);
 }
 
 ACTOR Future<Void> timebomb(double endTime, Promise<Void> resetPromise) {
@@ -1857,10 +1849,7 @@ Future<int64_t> ReadYourWritesTransaction::getEstimatedRangeSizeBytes(const KeyR
 	if (resetPromise.isSet())
 		return resetPromise.getFuture().getError();
 
-	// Pass in the TransactionState only if tenant is present
-	Optional<Reference<TransactionState>> trState =
-	    tr.trState->hasTenant() ? tr.trState : Optional<Reference<TransactionState>>();
-	return map(waitOrError(tr.getDatabase()->getStorageMetrics(keys, -1, trState), resetPromise.getFuture()),
+	return map(waitOrError(tr.getDatabase()->getStorageMetrics(keys, -1), resetPromise.getFuture()),
 	           [](const StorageMetrics& m) { return m.bytes; });
 }
 
@@ -2590,7 +2579,7 @@ void ReadYourWritesTransaction::operator=(ReadYourWritesTransaction&& r) noexcep
 }
 
 ReadYourWritesTransaction::ReadYourWritesTransaction(ReadYourWritesTransaction&& r) noexcept
-  : ISingleThreadTransaction(std::move(r.deferredError)), arena(std::move(r.arena)), cache(std::move(r.cache)),
+  : deferredError(std::move(r.deferredError)), arena(std::move(r.arena)), cache(std::move(r.cache)),
     writes(std::move(r.writes)), resetPromise(std::move(r.resetPromise)), reading(std::move(r.reading)),
     retries(r.retries), approximateSize(r.approximateSize), timeoutActor(std::move(r.timeoutActor)),
     creationTime(r.creationTime), commitStarted(r.commitStarted), transactionDebugInfo(r.transactionDebugInfo),

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +29,11 @@
 FDB_BOOLEAN_PARAM(Randomize);
 FDB_BOOLEAN_PARAM(IsSimulated);
 
+// Returns a deterministically random transaction timeout value for simulation testing.
+// More weight is given to the famous 5s timeout, but [1, 10] range is returned with lower weight.
+// This is only be used in simulation.
+int getSimulatedTxnTimeoutSeconds();
+
 class SWIFT_CXX_IMMORTAL_SINGLETON_TYPE ClientKnobs : public KnobsImpl<ClientKnobs> {
 public:
 	int TOO_MANY; // FIXME: this should really be split up so we can control these more specifically
@@ -51,6 +56,7 @@ public:
 	int MAX_COMMIT_PROXY_CONNECTIONS;
 	int MAX_GRV_PROXY_CONNECTIONS;
 	double STATUS_IDLE_TIMEOUT;
+	double GRPC_CTL_SERVICE_DEFAULT_TIMEOUT; // Default timeout for gRPC FDBCTL service requests
 	bool SEND_ENTIRE_VERSION_VECTOR;
 
 	// wrong_shard_server sometimes comes from the only nonfailed server, so we need to avoid a fast spin
@@ -58,7 +64,6 @@ public:
 	                                 // mostly wrong (e.g. dumping the database after a test)
 	double FUTURE_VERSION_RETRY_DELAY;
 	double GRV_ERROR_RETRY_DELAY;
-	double UNKNOWN_TENANT_RETRY_DELAY;
 	int REPLY_BYTE_LIMIT;
 	double DEFAULT_BACKOFF;
 	double DEFAULT_MAX_BACKOFF;
@@ -159,6 +164,8 @@ public:
 	int BACKUP_LOCK_BYTES;
 	double BACKUP_RANGE_TIMEOUT;
 	double BACKUP_RANGE_MINWAIT;
+	double BULKDUMP_JOB_TIMEOUT;
+	double BULKLOAD_JOB_TIMEOUT;
 	int BACKUP_SNAPSHOT_DISPATCH_INTERVAL_SEC;
 	int BACKUP_DEFAULT_SNAPSHOT_INTERVAL_SEC;
 	int BACKUP_SHARD_TASK_LIMIT;
@@ -176,7 +183,7 @@ public:
 	int COPY_LOG_BLOCKS_PER_TASK;
 	int COPY_LOG_PREFETCH_BLOCKS;
 	int COPY_LOG_READ_AHEAD_BYTES;
-	double COPY_LOG_TASK_DURATION_NANOS;
+	double COPY_LOG_TASK_DURATION_SECONDS;
 	int BACKUP_TASKS_PER_AGENT;
 	int BACKUP_POLL_PROGRESS_SECONDS;
 	int SIM_BACKUP_TASKS_PER_AGENT;
@@ -203,6 +210,7 @@ public:
 	bool BACKUP_CONTAINER_LOCAL_ALLOW_RELATIVE_PATH;
 	bool ENABLE_REPLICA_CONSISTENCY_CHECK_ON_BACKUP_READS;
 	int BACKUP_CONSISTENCY_CHECK_REQUIRED_REPLICAS;
+	bool BACKUP_READS_USE_LOW_PRIORITY;
 	int BULKLOAD_JOB_HISTORY_COUNT_MAX; // the max number of bulk load job history to keep. The oldest job history will
 	                                    // be removed when the count exceeds this value. Set to 0 to disable history.
 	                                    // Do not set the value to a large number, e.g. <= 10.
@@ -331,42 +339,14 @@ public:
 	int CHANGE_QUORUM_BAD_STATE_RETRY_TIMES;
 	double CHANGE_QUORUM_BAD_STATE_RETRY_DELAY;
 
-	// Tenants and Metacluster
-	int MAX_TENANTS_PER_CLUSTER;
-	int TENANT_TOMBSTONE_CLEANUP_INTERVAL;
-	int MAX_DATA_CLUSTERS;
-	int REMOVE_CLUSTER_TENANT_BATCH_SIZE;
-	int METACLUSTER_ASSIGNMENT_CLUSTERS_TO_CHECK;
-	double METACLUSTER_ASSIGNMENT_FIRST_CHOICE_DELAY;
-	double METACLUSTER_ASSIGNMENT_AVAILABILITY_TIMEOUT;
-	int METACLUSTER_RESTORE_BATCH_SIZE;
-	int TENANT_ENTRY_CACHE_LIST_REFRESH_INTERVAL; // How often the TenantEntryCache is refreshed
-	bool CLIENT_ENABLE_USING_CLUSTER_ID_KEY;
-
-	// Encryption-at-rest
-	bool ENABLE_ENCRYPTION_CPU_TIME_LOGGING;
-	// This Knob will be a comma-delimited string (i.e 0,1,2,3) that specifies which tenants the the EKP should throw
-	// key_not_found errors for. If TenantInfo::INVALID_TENANT is contained within the list then no tenants will be
-	// dropped. This Knob should ONLY be used in simulation for testing purposes
-	std::string SIMULATION_EKP_TENANT_IDS_TO_DROP;
-	int ENCRYPT_HEADER_FLAGS_VERSION;
-	int ENCRYPT_HEADER_AES_CTR_NO_AUTH_VERSION;
-	int ENCRYPT_HEADER_AES_CTR_AES_CMAC_AUTH_VERSION;
-	int ENCRYPT_HEADER_AES_CTR_HMAC_SHA_AUTH_VERSION;
-	double ENCRYPT_GET_CIPHER_KEY_LONG_REQUEST_THRESHOLD;
-
-	// REST KMS configurations
-	bool REST_KMS_ALLOW_NOT_SECURE_CONNECTION;
-	int SIM_KMS_VAULT_MAX_KEYS;
-
 	bool ENABLE_MUTATION_CHECKSUM;
 	// Enable to start accumulative checksum population and validation
 	bool ENABLE_ACCUMULATIVE_CHECKSUM;
 	// Enable to logging verbose trace events related to the accumulative checksum
 	bool ENABLE_ACCUMULATIVE_CHECKSUM_LOGGING;
 
-	ClientKnobs(Randomize randomize);
-	void initialize(Randomize randomize);
+	ClientKnobs(Randomize randomize, IsSimulated isSimulated);
+	void initialize(Randomize randomize, IsSimulated isSimulated);
 };
 
 #endif

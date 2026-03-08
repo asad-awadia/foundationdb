@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,6 @@
 #include "fdbclient/BulkLoading.h"
 #include "fdbclient/NativeAPI.actor.h"
 #include "fdbserver/MoveKeys.actor.h"
-#include "fdbserver/TenantCache.h"
 #include "fdbserver/TCInfo.h"
 #include "fdbclient/RunRYWTransaction.actor.h"
 #include "fdbserver/DDTxnProcessor.h"
@@ -59,7 +58,6 @@ public:
 		MERGE_SHARD,
 		SIZE_SPLIT,
 		WRITE_SPLIT,
-		TENANT_SPLIT,
 		__COUNT
 	};
 	RelocateReason(Value v) : value(v) { ASSERT(value != __COUNT); }
@@ -80,8 +78,6 @@ public:
 			return "SizeSplit";
 		case WRITE_SPLIT:
 			return "WriteSplit";
-		case TENANT_SPLIT:
-			return "TenantSplit";
 		case __COUNT:
 			ASSERT(false);
 		}

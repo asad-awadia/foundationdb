@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,9 @@
 #define WAIT_FAILURE_SERVER_H
 #pragma once
 
+#include "flow/flow.h"
+#include "fdbrpc/fdbrpc.h"
+
 Future<Void> waitFailureServer(const FutureStream<ReplyPromise<Void>>& waitFailure);
 
 // talks to a wait failure server, returns Void on failure
@@ -29,6 +32,7 @@ Future<Void> waitFailureClient(const RequestStream<ReplyPromise<Void>>& waitFail
                                double const& failureReactionTime = 0,
                                double const& failureReactionSlope = 0,
                                bool const& trace = false,
+                               Optional<Standalone<StringRef>> const& traceMsg = Optional<Standalone<StringRef>>(),
                                TaskPriority const& taskID = TaskPriority::DefaultEndpoint);
 
 // talks to a wait failure server, returns Void on failure, reaction time is always waited

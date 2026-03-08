@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -71,7 +71,13 @@ void KnobProtectiveGroup::assignKnobs(const KnobKeyValuePairs& overrideKnobs) {
 
 	for (const auto& [name, value] : overrideKnobs.getKnobs()) {
 		Standalone<KnobValueRef> valueRef = KnobValueRef::create(value);
-		ASSERT(mutableServerKnobs.trySetKnob(name, valueRef));
+		bool success = mutableServerKnobs.trySetKnob(name, valueRef);
+		if (!success) {
+			TraceEvent(SevError, "FailedToAssignKnob")
+			    .detail("KnobName", name)
+			    .detail("KnobValue", valueRef.toString());
+		}
+		ASSERT(success);
 		TraceEvent(SevInfo, "AssignKnobValue").detail("KnobName", name).detail("KnobValue", valueRef.toString());
 	}
 }

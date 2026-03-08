@@ -4,7 +4,7 @@
 #
 # This source file is part of the FoundationDB open source project
 #
-# Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+# Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -75,6 +75,7 @@ API_VERSIONS = [
     720,
     730,
     740,
+    800,
 ]
 
 assert (
@@ -313,11 +314,6 @@ class TestRunner(object):
                 [not tester.directory_snapshot_ops_enabled for tester in self.testers]
             )
         )
-        self.args.no_tenants = (
-            self.args.no_tenants
-            or any([not tester.tenants_enabled for tester in self.testers])
-            or self.args.api_version < 710
-        )
 
     def print_test(self):
         test_instructions = self._generate_test()
@@ -429,19 +425,6 @@ class TestRunner(object):
     def _insert_instructions(self, test_instructions):
         util.get_logger().info("\nInserting test into database...")
         del self.db[:]
-
-        if not self.args.no_tenants:
-            while True:
-                tr = self.db.create_transaction()
-                try:
-                    tr.options.set_special_key_space_enable_writes()
-                    del tr[
-                        b"\xff\xff/management/tenant/map/":b"\xff\xff/management/tenant/map0"
-                    ]
-                    tr.commit().wait()
-                    break
-                except fdb.FDBError as e:
-                    tr.on_error(e).wait()
 
         for subspace, thread in test_instructions.items():
             thread.insert_operations(self.db, subspace)

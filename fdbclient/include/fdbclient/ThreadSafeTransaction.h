@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,7 +28,6 @@
 #include "flow/ThreadHelper.actor.h"
 #include "fdbclient/ClusterInterface.h"
 #include "fdbclient/IClientApi.h"
-#include "fdbclient/ISingleThreadTransaction.h"
 
 // An implementation of IDatabase that serializes operations onto the network thread and interacts with the lower-level
 // client APIs exposed by NativeAPI and ReadYourWrites.
@@ -37,7 +36,6 @@ public:
 	~ThreadSafeDatabase() override;
 	static ThreadFuture<Reference<IDatabase>> createFromExistingDatabase(Database cx);
 
-	Reference<ITenant> openTenant(TenantNameRef tenantName) override;
 	Reference<ITransaction> createTransaction() override;
 
 	void setOption(FDBDatabaseOptions::Option option, Optional<StringRef> value = Optional<StringRef>()) override;
@@ -67,9 +65,7 @@ public:
 	ThreadFuture<Standalone<StringRef>> getClientStatus() override;
 
 private:
-	friend class ThreadSafeTenant;
 	friend class ThreadSafeTransaction;
-	bool isConfigDB{ false };
 	DatabaseContext* db;
 
 public: // Internal use only
@@ -79,32 +75,11 @@ public: // Internal use only
 	DatabaseContext* unsafeGetPtr() const { return db; }
 };
 
-class ThreadSafeTenant : public ITenant, ThreadSafeReferenceCounted<ThreadSafeTenant>, NonCopyable {
-public:
-	ThreadSafeTenant(Reference<ThreadSafeDatabase> db, TenantName name);
-	~ThreadSafeTenant() override;
-
-	Reference<ITransaction> createTransaction() override;
-
-	ThreadFuture<int64_t> getId() override;
-
-	void addref() override { ThreadSafeReferenceCounted<ThreadSafeTenant>::addref(); }
-	void delref() override { ThreadSafeReferenceCounted<ThreadSafeTenant>::delref(); }
-
-private:
-	Reference<ThreadSafeDatabase> db;
-	TenantName name;
-	Tenant* tenant;
-};
-
 // An implementation of ITransaction that serializes operations onto the network thread and interacts with the
-// lower-level client APIs exposed by ISingleThreadTransaction
+// lower-level client APIs exposed by ReadYourWritesTransaction.
 class ThreadSafeTransaction : public ITransaction, ThreadSafeReferenceCounted<ThreadSafeTransaction>, NonCopyable {
 public:
-	explicit ThreadSafeTransaction(DatabaseContext* cx,
-	                               ISingleThreadTransaction::Type type,
-	                               Optional<TenantName> tenantName,
-	                               Tenant* tenantPtr);
+	explicit ThreadSafeTransaction(DatabaseContext* cx);
 	~ThreadSafeTransaction() override;
 
 	// Note: used while refactoring fdbcli, need to be removed later
@@ -178,8 +153,6 @@ public:
 	ThreadFuture<Void> checkDeferredError();
 	ThreadFuture<Void> onError(Error const& e) override;
 
-	Optional<TenantName> getTenant() override;
-
 	// These are to permit use as state variables in actors:
 	ThreadSafeTransaction() : tr(nullptr), initialized(std::make_shared<std::atomic_bool>(false)) {}
 	void operator=(ThreadSafeTransaction&& r) noexcept;
@@ -194,8 +167,7 @@ public:
 	void debugPrint(std::string const& message) override;
 
 private:
-	ISingleThreadTransaction* tr;
-	const Optional<TenantName> tenantName;
+	ReadYourWritesTransaction* tr;
 	std::shared_ptr<std::atomic_bool> initialized;
 };
 

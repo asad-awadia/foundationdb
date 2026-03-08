@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -111,6 +111,9 @@ ACTOR Future<BulkLoadTaskState> getBulkLoadTaskStateFromDataMove(Database cx,
                                                                  Version atLeastVersion,
                                                                  UID logId) {
 	state Transaction tr(cx);
+	state int retryCount = 0;
+	state int metadataRetryCount = 0;
+	state double startTime = now();
 	tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
 	tr.setOption(FDBTransactionOptions::LOCK_AWARE);
 	loop {
@@ -118,6 +121,15 @@ ACTOR Future<BulkLoadTaskState> getBulkLoadTaskStateFromDataMove(Database cx,
 			state Optional<Value> val = wait(tr.get(dataMoveKeyFor(dataMoveId)));
 			ASSERT(tr.getReadVersion().isReady());
 			if (tr.getReadVersion().get() < atLeastVersion) {
+				retryCount++;
+				if (retryCount % 100 == 0) {
+					TraceEvent(SevWarn, "SSBulkLoadTaskWaitingForVersion", logId)
+					    .detail("DataMoveID", dataMoveId)
+					    .detail("ReadVersion", tr.getReadVersion().get())
+					    .detail("AtLeastVersion", atLeastVersion)
+					    .detail("RetryCount", retryCount)
+					    .detail("ElapsedSec", now() - startTime);
+				}
 				wait(delay(0.1));
 				tr.reset();
 				tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
@@ -127,8 +139,24 @@ ACTOR Future<BulkLoadTaskState> getBulkLoadTaskStateFromDataMove(Database cx,
 			if (val.present()) {
 				state DataMoveMetaData dataMoveMetaData = decodeDataMoveValue(val.get());
 				if (dataMoveMetaData.bulkLoadTaskState.present()) {
+					if (metadataRetryCount > 0 || retryCount > 0) {
+						TraceEvent(SevInfo, "SSBulkLoadTaskGotMetadata", logId)
+						    .detail("DataMoveID", dataMoveId)
+						    .detail("MetadataRetryCount", metadataRetryCount)
+						    .detail("VersionRetryCount", retryCount)
+						    .detail("ElapsedSec", now() - startTime);
+					}
 					return dataMoveMetaData.bulkLoadTaskState.get();
 				} else {
+					metadataRetryCount++;
+					if (metadataRetryCount % 100 == 0) {
+						TraceEvent(SevWarn, "SSBulkLoadTaskWaitingForMetadata", logId)
+						    .detail("DataMoveID", dataMoveId)
+						    .detail("DataMovePhase", static_cast<int>(dataMoveMetaData.getPhase()))
+						    .detail("MetadataRetryCount", metadataRetryCount)
+						    .detail("ElapsedSec", now() - startTime)
+						    .detail("Message", "DataMove exists but BulkLoadTaskState not yet written");
+					}
 					wait(delay(0.1));
 					tr.reset();
 					tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
@@ -145,7 +173,8 @@ ACTOR Future<BulkLoadTaskState> getBulkLoadTaskStateFromDataMove(Database cx,
 			    .detail("Message", "This fetchKey is blocked and will be cancelled later")
 			    .detail("DataMoveID", dataMoveId)
 			    .detail("ReadVersion", tr.getReadVersion().get())
-			    .detail("AtLeastVersion", atLeastVersion);
+			    .detail("AtLeastVersion", atLeastVersion)
+			    .detail("ElapsedSec", now() - startTime);
 			wait(Never());
 			throw internal_error(); // does not happen
 		} catch (Error& e) {
@@ -267,15 +296,33 @@ ACTOR Future<Void> bulkLoadTransportBlobstore_impl(BulkLoadFileSet fromRemoteFil
                                                    UID logId) {
 	// Clear existing local folder
 	resetFileFolder(abspath(toLocalFileSet.getFolder()));
+	TraceEvent(SevDebug, "BulkLoadBlobstoreTransportStart", logId)
+	    .detail("FromRemote", fromRemoteFileSet.toString())
+	    .detail("ToLocal", toLocalFileSet.toString())
+	    .detail("HasDataFile", fromRemoteFileSet.hasDataFile());
 	// TODO(BulkLoad): Make use of fileBytesMax
 	// TODO: File-at-a-time costs because we make connection for each.
-	wait(copyDownFile(fromRemoteFileSet.getDataFileFullPath(), abspath(toLocalFileSet.getDataFileFullPath())));
+	// Skip data file download if the range is empty (no data file)
+	if (fromRemoteFileSet.hasDataFile()) {
+		TraceEvent(SevDebug, "BulkLoadBlobstoreBeforeCopyDataFile", logId)
+		    .detail("FromPath", fromRemoteFileSet.getDataFileFullPath())
+		    .detail("ToPath", abspath(toLocalFileSet.getDataFileFullPath()));
+		wait(copyDownFile(fromRemoteFileSet.getDataFileFullPath(), abspath(toLocalFileSet.getDataFileFullPath())));
+		TraceEvent(SevDebug, "BulkLoadBlobstoreAfterCopyDataFile", logId);
+	} else {
+		TraceEvent("BulkLoadBlobstoreSkipEmptyRange", logId).detail("Reason", "No data file for empty range");
+	}
 	// Copy byte sample file if exists
 	if (fromRemoteFileSet.hasByteSampleFile()) {
+		TraceEvent(SevDebug, "BulkLoadBlobstoreBeforeCopySampleFile", logId)
+		    .detail("FromPath", fromRemoteFileSet.getBytesSampleFileFullPath())
+		    .detail("ToPath", abspath(toLocalFileSet.getBytesSampleFileFullPath()));
 		wait(copyDownFile(fromRemoteFileSet.getBytesSampleFileFullPath(),
 		                  abspath(toLocalFileSet.getBytesSampleFileFullPath())));
+		TraceEvent(SevDebug, "BulkLoadBlobstoreAfterCopySampleFile", logId);
 	}
 	// TODO(BulkLoad): Throw error if the date/bytesample file does not exist while the filename is not empty
+	TraceEvent(SevDebug, "BulkLoadBlobstoreTransportEnd", logId);
 	return Void();
 }
 
@@ -286,8 +333,15 @@ ACTOR Future<BulkLoadFileSet> bulkLoadDownloadTaskFileSet(BulkLoadTransportMetho
 	state int retryCount = 0;
 	state double startTime = now();
 	ASSERT(transportMethod != BulkLoadTransportMethod::Invalid);
+	TraceEvent(SevDebug, "BulkLoadDownloadTaskFileSetStart", logId)
+	    .detail("FromRemoteFileSet", fromRemoteFileSet.toString())
+	    .detail("ToLocalRoot", toLocalRoot)
+	    .detail("TransportMethod", transportMethod);
 	loop {
 		try {
+			TraceEvent(SevDebug, "BulkLoadDownloadTaskFileSetAttempt", logId)
+			    .detail("RetryCount", retryCount)
+			    .detail("Elapsed", now() - startTime);
 			// Step 1: Generate local file set based on remote file set by replacing the remote root to the local root.
 			state BulkLoadFileSet toLocalFileSet(toLocalRoot,
 			                                     fromRemoteFileSet.getRelativePath(),
@@ -299,15 +353,19 @@ ACTOR Future<BulkLoadFileSet> bulkLoadDownloadTaskFileSet(BulkLoadTransportMetho
 			// Step 2: Download remote file set to local folder
 			if (transportMethod == BulkLoadTransportMethod::CP) {
 				ASSERT(fromRemoteFileSet.hasDataFile());
+				TraceEvent(SevDebug, "BulkLoadDownloadBeforeCP", logId).detail("Elapsed", now() - startTime);
 				// Copy the data file and the sample file from remote folder to a local folder specified by
 				// fromRemoteFileSet.
 				wait(bulkLoadTransportCP_impl(
 				    fromRemoteFileSet, toLocalFileSet, SERVER_KNOBS->BULKLOAD_FILE_BYTES_MAX, logId));
+				TraceEvent(SevDebug, "BulkLoadDownloadAfterCP", logId).detail("Elapsed", now() - startTime);
 			} else if (transportMethod == BulkLoadTransportMethod::BLOBSTORE) {
+				TraceEvent(SevDebug, "BulkLoadDownloadBeforeBlobstore", logId).detail("Elapsed", now() - startTime);
 				// Copy the data file and the sample file from remote folder to a local folder specified by
 				// fromRemoteFileSet.
 				wait(bulkLoadTransportBlobstore_impl(
 				    fromRemoteFileSet, toLocalFileSet, SERVER_KNOBS->BULKLOAD_FILE_BYTES_MAX, logId));
+				TraceEvent(SevDebug, "BulkLoadDownloadAfterBlobstore", logId).detail("Elapsed", now() - startTime);
 			} else {
 				UNREACHABLE();
 			}
@@ -330,7 +388,21 @@ ACTOR Future<BulkLoadFileSet> bulkLoadDownloadTaskFileSet(BulkLoadTransportMetho
 			    .detail("Duration", now() - startTime)
 			    .detail("RetryCount", retryCount);
 			retryCount++;
-			wait(delay(5.0));
+			if (retryCount > SERVER_KNOBS->BULKLOAD_DOWNLOAD_MAX_RETRIES) {
+				TraceEvent(SevError, "SSBulkLoadTaskDownloadFileSetMaxRetriesExceeded", logId)
+				    .errorUnsuppressed(e)
+				    .detail("FromRemoteFileSet", fromRemoteFileSet.toString())
+				    .detail("ToLocalRoot", toLocalRoot)
+				    .detail("Duration", now() - startTime)
+				    .detail("RetryCount", retryCount)
+				    .detail("MaxRetries", SERVER_KNOBS->BULKLOAD_DOWNLOAD_MAX_RETRIES)
+				    .detail("OriginalError", e.code())
+				    .detail("OriginalErrorName", e.name());
+				// Throw bulkload_task_failed to signal fetchKeys that this is a retryable bulk load error
+				// This allows the data movement to be retried at the DD level instead of killing the SS
+				throw bulkload_task_failed();
+			}
+			wait(delay(SERVER_KNOBS->BULKLOAD_DOWNLOAD_RETRY_DELAY));
 		}
 	}
 }
@@ -345,7 +417,19 @@ ACTOR Future<Void> bulkLoadDownloadTaskFileSets(BulkLoadTransportMethod transpor
 	for (; iter != fromRemoteFileSets->end(); iter++) {
 		keys = iter->first;
 		if (!iter->second.hasDataFile()) {
-			// Ignore the remote fileSet if it does not have data file
+			// For empty ranges (no data file), create an empty local fileSet entry so FetchKeys knows this range was
+			// processed
+			TraceEvent("BulkLoadDownloadSkipEmptyRange", logId)
+			    .detail("Keys", keys)
+			    .detail("Reason", "No data file for empty range");
+			// Create a local fileSet with the same structure but no data/sample files (empty range marker)
+			BulkLoadFileSet emptyLocalFileSet(toLocalRoot,
+			                                  iter->second.getRelativePath(),
+			                                  iter->second.getManifestFileName(),
+			                                  "", // Empty data file name
+			                                  "", // Empty sample file name
+			                                  BulkLoadChecksum());
+			localFileSets->push_back(std::make_pair(keys, emptyLocalFileSet));
 			continue;
 		}
 		BulkLoadFileSet localFileSet =
@@ -361,8 +445,15 @@ ACTOR Future<Void> downloadManifestFile(BulkLoadTransportMethod transportMethod,
                                         UID logId) {
 	state int retryCount = 0;
 	state double startTime = now();
+	TraceEvent(SevDebug, "BulkLoadDownloadManifestStart", logId)
+	    .detail("FromRemotePath", fromRemotePath)
+	    .detail("ToLocalPath", toLocalPath)
+	    .detail("TransportMethod", transportMethod);
 	loop {
 		try {
+			TraceEvent(SevDebug, "BulkLoadDownloadManifestAttempt", logId)
+			    .detail("RetryCount", retryCount)
+			    .detail("Elapsed", now() - startTime);
 			if (transportMethod == BulkLoadTransportMethod::CP) {
 				wait(
 				    copyBulkFile(abspath(fromRemotePath), abspath(toLocalPath), SERVER_KNOBS->BULKLOAD_FILE_BYTES_MAX));
@@ -397,7 +488,7 @@ ACTOR Future<Void> downloadManifestFile(BulkLoadTransportMethod transportMethod,
 			if (retryCount > 10) {
 				throw e;
 			}
-			wait(delay(5.0));
+			wait(delay(SERVER_KNOBS->BULKLOAD_DOWNLOAD_RETRY_DELAY));
 		}
 	}
 	return Void();

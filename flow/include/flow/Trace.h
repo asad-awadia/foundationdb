@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,8 +37,17 @@
 #include "flow/ITrace.h"
 #include "flow/Traceable.h"
 
-#define TRACE_DEFAULT_ROLL_SIZE (10 << 20)
-#define TRACE_DEFAULT_MAX_LOGS_SIZE (10 * TRACE_DEFAULT_ROLL_SIZE)
+// Note: this default only applies to non-simulation fdbserver process invocations
+//       i.e. when -r is not set to simulation
+#define TRACE_DEFAULT_ROLL_SIZE (10ULL << 20)
+
+// Same as above, but default for when -r is set to simulation
+// Having a higher default (1GiB) is useful because you don't have to
+// grep multiple trace files when debugging.
+#define TRACE_DEFAULT_ROLL_SIZE_SIM (1ULL << 30)
+
+#define TRACE_DEFAULT_MAX_LOGS_SIZE (10ULL * TRACE_DEFAULT_ROLL_SIZE)
+#define TRACE_DEFAULT_MAX_LOGS_SIZE_SIM (10ULL * TRACE_DEFAULT_ROLL_SIZE_SIM)
 
 FDB_BOOLEAN_PARAM(InitializeTraceMetrics);
 
@@ -307,6 +316,9 @@ struct SWIFT_CXX_IMPORT_OWNED BaseTraceEvent {
 		return *this;
 	}
 	BaseTraceEvent& detailf(std::string key, const char* valueFormat, ...);
+	// Logs a formatted message with a fixed key ("LogMessage") for the case
+	// where all you want to do is log a message.
+	BaseTraceEvent& log(const char* format, ...);
 
 protected:
 	class State {
@@ -407,7 +419,12 @@ public:
 
 	explicit operator bool() const { return static_cast<bool>(enabled); }
 
-	void log();
+	// Writes the event to the underlying log file.
+	void writeEvent();
+	// Legacy `log` method to force writing. This can be done by the destructor,
+	// but lots of legacy code (~500 calls) explicitly calls `log`, so leave this in
+	// to pacify those call sites.
+	void log(void) { writeEvent(); }
 
 	void disable() { enabled.suppress(); } // Disables the trace event so it doesn't get logged
 

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,9 +40,6 @@ public:
 
 	// Current FDB database
 	virtual fdb::Database db() = 0;
-
-	// Current FDB tenant
-	virtual fdb::Tenant tenant() = 0;
 
 	// Current FDB IDatabaseOps
 	virtual std::shared_ptr<fdb::IDatabaseOps> dbOps() = 0;
@@ -101,9 +98,6 @@ struct TransactionExecutorOptions {
 	// The size of the database instance pool
 	int numDatabases = 1;
 
-	// The number of tenants to create in the cluster. If 0, no tenants are used.
-	int numTenants = 0;
-
 	// Maximum number of retries per transaction (0 - unlimited)
 	int transactionRetryLimit = 0;
 
@@ -120,11 +114,7 @@ class ITransactionExecutor {
 public:
 	virtual ~ITransactionExecutor() {}
 	virtual void init(IScheduler* sched, const char* clusterFile, const std::string& bgBasePath) = 0;
-	virtual void execute(TOpStartFct start,
-	                     TOpContFct cont,
-	                     std::optional<fdb::BytesRef> tenantName,
-	                     bool transactional,
-	                     bool restartOnTimeout) = 0;
+	virtual void execute(TOpStartFct start, TOpContFct cont, bool transactional, bool restartOnTimeout) = 0;
 	virtual fdb::Database selectDatabase() = 0;
 	virtual std::string getClusterFileForErrorInjection() = 0;
 	virtual const TransactionExecutorOptions& getOptions() = 0;

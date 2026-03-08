@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@
 
 package fdb
 
-// #define FDB_API_VERSION 740
+// #define FDB_API_VERSION 800
 // #include <foundationdb/fdb_c.h>
 import "C"
 
@@ -160,6 +160,13 @@ func (d Database) GetClientStatus() ([]byte, error) {
 	}
 
 	return b, nil
+}
+
+// GetMainThreadBusyness return network thread busyness (updated every 1s)
+// A value of 0 indicates that the client is more or less idle
+// A value of 1 (or more) indicates that the client is saturated
+func (d Database) GetMainThreadBusyness() float64 {
+	return float64(C.fdb_database_get_main_thread_busyness(d.database.ptr))
 }
 
 func retryable(wrapped func() (interface{}, error), onError func(Error) FutureNil) (ret interface{}, err error) {

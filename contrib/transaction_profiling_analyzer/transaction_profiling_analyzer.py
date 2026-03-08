@@ -4,7 +4,7 @@
 #
 # This source file is part of the FoundationDB open source project
 #
-# Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+# Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -52,6 +52,7 @@ PROTOCOL_VERSION_7_1 = 0x0FDB00B071010000
 PROTOCOL_VERSION_7_2 = 0x0FDB00B072000000
 PROTOCOL_VERSION_7_3 = 0x0FDB00B073000000
 PROTOCOL_VERSION_7_4 = 0x0FDB00B074000000
+PROTOCOL_VERSION_8_0 = 0x0FDB00B080000000
 supported_protocol_versions = frozenset(
     [
         PROTOCOL_VERSION_5_2,
@@ -64,6 +65,7 @@ supported_protocol_versions = frozenset(
         PROTOCOL_VERSION_7_2,
         PROTOCOL_VERSION_7_3,
         PROTOCOL_VERSION_7_4,
+        PROTOCOL_VERSION_8_0,
     ]
 )
 
@@ -214,6 +216,7 @@ class BaseInfo(object):
             self.dc_id = bb.get_bytes_with_length()
         if protocol_version >= PROTOCOL_VERSION_7_1:
             if bb.get_bool():
+                # Well it's unfortunate that this garbage is present.
                 self.tenant = bb.get_bytes_with_length()
 
 

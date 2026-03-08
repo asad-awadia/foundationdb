@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2024 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,8 +55,6 @@ void DatabaseConfiguration::resetInternal() {
 	perpetualStorageWiggleSpeed = 0;
 	perpetualStorageWiggleLocality = "0";
 	storageMigrationType = StorageMigrationType::DEFAULT;
-	tenantMode = TenantMode::DISABLED;
-	encryptionAtRestMode = EncryptionAtRestMode::DISABLED;
 }
 
 int toInt(ValueRef const& v) {
@@ -209,6 +207,42 @@ void DatabaseConfiguration::setDefaultReplicationPolicy() {
 	}
 }
 
+int32_t DatabaseConfiguration::maxZoneFailuresTolerated(int fullyReplicatedRegions, bool forAvailability) const {
+	int worstSatelliteTLogReplicationFactor = regions.size() ? std::numeric_limits<int>::max() : 0;
+	int regionsWithNonNegativePriority = 0;
+	for (auto& r : regions) {
+		if (r.priority >= 0) {
+			regionsWithNonNegativePriority++;
+		}
+		worstSatelliteTLogReplicationFactor = std::min(
+		    worstSatelliteTLogReplicationFactor, r.satelliteTLogReplicationFactor - r.satelliteTLogWriteAntiQuorum);
+		if (r.satelliteTLogUsableDcsFallback > 0) {
+			worstSatelliteTLogReplicationFactor =
+			    std::min(worstSatelliteTLogReplicationFactor,
+			             r.satelliteTLogReplicationFactorFallback - r.satelliteTLogWriteAntiQuorumFallback);
+		}
+	}
+
+	if (worstSatelliteTLogReplicationFactor <= 0) {
+		// HA is not enabled in this database. Return single cluster zone failures to tolerate.
+		return std::min(tLogReplicationFactor - 1 - tLogWriteAntiQuorum, storageTeamSize - 1);
+	}
+
+	// Compute HA enabled database zone failure tolerance.
+	auto isGeoReplicatedData = [this, &fullyReplicatedRegions]() {
+		return usableRegions > 1 && fullyReplicatedRegions > 1;
+	};
+
+	if (isGeoReplicatedData() && (!forAvailability || regionsWithNonNegativePriority > 1)) {
+		return 1 + std::min(std::max(tLogReplicationFactor - 1 - tLogWriteAntiQuorum,
+		                             worstSatelliteTLogReplicationFactor - 1),
+		                    storageTeamSize - 1);
+	}
+	// Primary and Satellite tLogs are synchronously replicated, hence we can lose all but 1.
+	return std::min(tLogReplicationFactor + worstSatelliteTLogReplicationFactor - 1 - tLogWriteAntiQuorum,
+	                storageTeamSize - 1);
+}
+
 bool DatabaseConfiguration::isValid() const {
 	// enable this via `fdbcli --knob_cli_print_invalid_configuration=1` command line parameter
 	auto log_test = [](const char* text, bool val) {
@@ -240,10 +274,7 @@ bool DatabaseConfiguration::isValid() const {
 	      // We cannot specify regions with three_datacenter replication
 	      LOG_TEST((perpetualStorageWiggleSpeed == 0 || perpetualStorageWiggleSpeed == 1)) &&
 	      LOG_TEST(isValidPerpetualStorageWiggleLocality(perpetualStorageWiggleLocality)) &&
-	      LOG_TEST(storageMigrationType != StorageMigrationType::UNSET) &&
-	      LOG_TEST(tenantMode >= TenantMode::DISABLED) && LOG_TEST(tenantMode < TenantMode::END) &&
-	      LOG_TEST(encryptionAtRestMode >= EncryptionAtRestMode::DISABLED) &&
-	      LOG_TEST(encryptionAtRestMode < EncryptionAtRestMode::END))) {
+	      LOG_TEST(storageMigrationType != StorageMigrationType::UNSET))) {
 		return false;
 	}
 #undef LOG_TEST
@@ -405,8 +436,6 @@ StatusObject DatabaseConfiguration::toJSON(bool noPolicies) const {
 		result["perpetual_storage_wiggle_engine"] = perpetualStoreType.toString();
 	}
 	result["storage_migration_type"] = storageMigrationType.toString();
-	result["tenant_mode"] = tenantMode.toString();
-	result["encryption_at_rest_mode"] = encryptionAtRestMode.toString();
 	return result;
 }
 
@@ -430,8 +459,7 @@ std::string DatabaseConfiguration::configureStringFromJSON(const StatusObject& j
 			// For string values, some properties can set with a "<name>=<value>" syntax in "configure"
 			// Such properties are listed here:
 			static std::set<std::string> directSet = {
-				"storage_migration_type", "tenant_mode", "encryption_at_rest_mode",
-				"storage_engine",         "log_engine",  "perpetual_storage_wiggle_engine"
+				"storage_migration_type", "storage_engine", "log_engine", "perpetual_storage_wiggle_engine"
 			};
 
 			if (directSet.contains(kv.first)) {
@@ -449,7 +477,7 @@ std::string DatabaseConfiguration::configureStringFromJSON(const StatusObject& j
 			          json_spirit::write_string(json_spirit::mValue(kv.second.get_array()),
 			                                    json_spirit::Output_options::none);
 		} else {
-			throw invalid_config_db_key();
+			throw invalid_option_value();
 		}
 	}
 
@@ -691,12 +719,8 @@ bool DatabaseConfiguration::setInternal(KeyRef key, ValueRef value) {
 	} else if (ck == "storage_migration_type"_sr) {
 		parse((&type), value);
 		storageMigrationType = (StorageMigrationType::MigrationType)type;
-	} else if (ck == "tenant_mode"_sr) {
-		tenantMode = TenantMode::fromValue(value);
 	} else if (ck == "proxies"_sr) {
 		overwriteProxiesCount();
-	} else if (ck == "encryption_at_rest_mode"_sr) {
-		encryptionAtRestMode = EncryptionAtRestMode::fromValueRef(Optional<ValueRef>(value));
 	} else if (ck.startsWith("excluded/"_sr)) {
 		// excluded servers: don't keep the state internally
 	} else {
