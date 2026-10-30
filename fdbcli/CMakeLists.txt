@@ -2,7 +2,7 @@ include(AddFdbTest)
 fdb_find_sources(FDBCLI_SRCS)
 
 add_flow_target(EXECUTABLE NAME fdbcli SRCS ${FDBCLI_SRCS})
-target_include_directories(fdbcli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_BINARY_DIR}/include")
+target_include_directories(fdbcli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(fdbcli PRIVATE fdbctl fdbclient SimpleOpt)
 
 if (USE_UBSAN)
@@ -18,12 +18,8 @@ if(NOT WIN32)
 endif()
 
 if(NOT OPEN_FOR_IDE)
-  if(GENERATE_DEBUG_PACKAGES)
-    fdb_install(TARGETS fdbcli DESTINATION bin COMPONENT clients)
-  else()
-    add_custom_target(prepare_fdbcli_install ALL DEPENDS strip_only_fdbcli)
-    fdb_install(PROGRAMS ${CMAKE_BINARY_DIR}/packages/bin/fdbcli DESTINATION bin COMPONENT clients)
-  endif()
+  add_custom_target(stripped_fdbcli ALL DEPENDS strip_only_fdbcli)
+  fdb_install(TARGETS fdbcli DESTINATION bin COMPONENT clients)
 endif()
 
 if (NOT WIN32 AND NOT OPEN_FOR_IDE)
@@ -38,14 +34,18 @@ if (NOT WIN32 AND NOT OPEN_FOR_IDE)
               @CLUSTER_FILE@
               )
   endif()
-  add_fdbclient_test(
-    NAME multi_process_fdbcli_tests
-    PROCESS_NUMBER 5
-    COMMAND ${CMAKE_SOURCE_DIR}/fdbcli/tests/fdbcli_tests.py
-            ${CMAKE_BINARY_DIR}
-            @CLUSTER_FILE@
-            5
-            )
+  if(NOT USE_ASAN)
+    # multi_process fdbcli tests take >40 minutes under ASAN, exceeding
+    # any reasonable timeout for CI
+    add_fdbclient_test(
+      NAME multi_process_fdbcli_tests
+      PROCESS_NUMBER 5
+      COMMAND ${CMAKE_SOURCE_DIR}/fdbcli/tests/fdbcli_tests.py
+              ${CMAKE_BINARY_DIR}
+              @CLUSTER_FILE@
+              5
+              )
+  endif()
   if(NOT USE_ASAN)
     # TODO: this is known to fail with ASAN, fix needed
     add_fdbclient_test(
@@ -56,13 +56,16 @@ if (NOT WIN32 AND NOT OPEN_FOR_IDE)
             --external-client-library ${CMAKE_BINARY_DIR}/bindings/c/libfdb_c_external.so
     )
   endif()
-  add_fdbclient_test(
-  NAME multi_process_external_client_fdbcli_tests
-  PROCESS_NUMBER 5
-  COMMAND ${CMAKE_SOURCE_DIR}/fdbcli/tests/fdbcli_tests.py
-          ${CMAKE_BINARY_DIR}
-          @CLUSTER_FILE@
-          5
-          --external-client-library ${CMAKE_BINARY_DIR}/bindings/c/libfdb_c_external.so
-          )
+  if(NOT USE_ASAN)
+    # multi_process fdbcli tests take >40 minutes under ASAN
+    add_fdbclient_test(
+    NAME multi_process_external_client_fdbcli_tests
+    PROCESS_NUMBER 5
+    COMMAND ${CMAKE_SOURCE_DIR}/fdbcli/tests/fdbcli_tests.py
+            ${CMAKE_BINARY_DIR}
+            @CLUSTER_FILE@
+            5
+            --external-client-library ${CMAKE_BINARY_DIR}/bindings/c/libfdb_c_external.so
+            )
+  endif()
 endif()

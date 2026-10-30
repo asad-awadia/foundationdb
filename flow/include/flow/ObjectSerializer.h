@@ -32,7 +32,7 @@ template <class Ar>
 struct LoadContext {
 	Ar* ar;
 
-	LoadContext(Ar* ar) : ar(ar) {}
+	explicit LoadContext(Ar* ar) : ar(ar) {}
 
 	Arena& arena() { return ar->arena(); }
 
@@ -147,6 +147,12 @@ public:
 		vo.read(*this);
 	}
 
+	template <class VersionOptions>
+	ArenaObjectReader(Arena&& arena, const StringRef& input, VersionOptions vo)
+	  : _data(input.begin()), _arena(std::move(arena)) {
+		vo.read(*this);
+	}
+
 	const uint8_t* data() { return _data; }
 
 	Arena& arena() { return _arena; }
@@ -231,10 +237,10 @@ public:
 	};
 
 	// takes (object size, allocator context pointer), returns pointer to allocated memory
-	typedef uint8_t* (*AllocatorFuncType)(const size_t, void*);
+	using AllocatorFuncType = uint8_t* (*)(const size_t, void*);
 
 	// takes (wipe begin pointer, wipe length, allocator context pointer)
-	typedef void (*MarkForWipeFuncType)(uint8_t*, size_t, void*);
+	using MarkForWipeFuncType = void (*)(uint8_t*, size_t, void*);
 
 	// Overload that enables serializer traits to mark the buffers for wiping (zeroing out) after use.
 	// MarkForWipeFunc shares allocator context with allocatorFunc
@@ -307,7 +313,7 @@ namespace detail {
 
 template <class T, class Context>
 struct LoadSaveHelper<Standalone<T>, Context> : Context {
-	LoadSaveHelper(const Context& context) : Context(context), helper(context) {}
+	explicit LoadSaveHelper(const Context& context) : Context(context), helper(context) {}
 
 	void load(Standalone<T>& member, const uint8_t* current) {
 		helper.load(member.contents(), current);

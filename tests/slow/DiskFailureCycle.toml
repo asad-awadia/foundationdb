@@ -3,8 +3,7 @@ buggify = false
 minimumReplication = 3
 minimumRegions = 3
 logAntiQuorum = 0
-storageEngineExcludeTypes = [1, 2, 4, 5]
-disableRemoteKVS = true
+storageEngineExcludeTypes = ["memory", "memory-radixtree", "ssd-rocksdb-v1", "ssd-sharded-rocksdb"]
 
 [[test]]
 testTitle = 'DiskFailureCycle'
@@ -13,7 +12,6 @@ testTitle = 'DiskFailureCycle'
     testName = 'Cycle'
     transactionsPerSecond = 2500.0
     testDuration = 30.0
-    expectedRate = 0
 
     [[test.workload]]
     testName = 'DiskFailureInjection'

@@ -44,9 +44,11 @@ public:
 	BulkDumpState(KeyRange jobRange,
 	              BulkLoadType loadType,
 	              BulkLoadTransportMethod transportMethod,
-	              std::string jobRoot)
-	  : jobId(deterministicRandom()->randomUniqueID()), jobRange(jobRange), phase(BulkDumpPhase::Submitted) {
+	              std::string jobRoot,
+	              Optional<UID> fixedJobId)
+	  : jobRange(jobRange), phase(BulkDumpPhase::Submitted) {
 		manifest = BulkLoadManifest(loadType, transportMethod, jobRoot);
+		jobId = fixedJobId.orDefault(deterministicRandom()->randomUniqueID());
 		ASSERT(isValid());
 	}
 
@@ -140,6 +142,8 @@ public:
 	}
 
 	BulkLoadManifest getManifest() const { return manifest; }
+
+	double getSubmitTime() const { return now(); }
 
 	template <class Ar>
 	void serialize(Ar& ar) {

@@ -13,10 +13,8 @@
         -- Volker Grabsch <vog@notjusthosting.com>
 */
 
-#include "fdbclient/sha1/SHA1.h"
+#include "SHA1.h"
 #include <sstream>
-#include <iomanip>
-#include <fstream>
 
 /* Help macros */
 #define SHA1_ROL(value, bits) (((value) << (bits)) | (((value) & 0xffffffff) >> (32 - (bits))))
@@ -71,7 +69,7 @@ std::string SHA1::final() {
 	uint64 total_bits = (transforms * BLOCK_BYTES + buffer.size()) * 8;
 
 	/* Padding */
-	buffer += 0x80;
+	buffer += static_cast<char>(0x80);
 	std::string::size_type orig_size = (unsigned int)buffer.size();
 	while (buffer.size() < BLOCK_BYTES) {
 		buffer += (char)0x00;

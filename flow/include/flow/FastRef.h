@@ -114,12 +114,12 @@ public:
 	Reference(Reference&& r) noexcept : ptr(r.getPtr()) { r.ptr = nullptr; }
 
 	template <class Q>
-	Reference(const Reference<Q>& r) : ptr(r.getPtr()) {
+	explicit(false) Reference(const Reference<Q>& r) : ptr(r.getPtr()) {
 		if (ptr)
 			addref(ptr);
 	}
 	template <class Q>
-	Reference(Reference<Q>&& r) : ptr(r.getPtr()) {
+	explicit(false) Reference(Reference<Q>&& r) : ptr(r.getPtr()) {
 		r.setPtrUnsafe(nullptr);
 	}
 
@@ -127,6 +127,8 @@ public:
 		if (ptr)
 			delref(ptr);
 	}
+	// Comparing pointees also handles self-assignment.
+	// NOLINTNEXTLINE(bugprone-unhandled-self-assignment)
 	Reference& operator=(const Reference& r) {
 		P* oldPtr = ptr;
 		P* newPtr = r.ptr;

@@ -21,28 +21,31 @@
 #ifndef DatabaseContext_h
 #define DatabaseContext_h
 #include "fdbclient/Notified.h"
+#include "fdbclient/ClientLocationCache.h"
 #include "flow/ApiVersion.h"
 #include "flow/FastAlloc.h"
 #include "flow/FastRef.h"
-#include "fdbclient/GlobalConfig.actor.h"
+#include "fdbclient/GlobalConfig.h"
 #include "fdbclient/StorageServerInterface.h"
 #include "flow/IRandom.h"
-#include "flow/genericactors.actor.h"
+#include "flow/genericactors.h"
+#include <compare>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #pragma once
 
 #include "fdbclient/FDBTypes.h"
-#include "fdbclient/NativeAPI.actor.h"
+#include "fdbclient/NativeAPI.h"
 #include "fdbclient/KeyRangeMap.h"
 #include "fdbclient/CommitProxyInterface.h"
-#include "fdbclient/SpecialKeySpace.actor.h"
+#include "fdbclient/ProxyLoadBalanceMetrics.h"
+#include "fdbclient/SpecialKeySpace.h"
 #include "fdbclient/VersionVector.h"
-#include "fdbclient/IKeyValueStore.actor.h"
 #include "fdbrpc/QueueModel.h"
 #include "fdbrpc/MultiInterface.h"
-#include "flow/TDMetric.actor.h"
-#include "fdbclient/EventTypes.actor.h"
+#include "flow/TDMetric.h"
+#include "fdbclient/EventTypes.h"
 #include "fdbrpc/Smoother.h"
 #include "fdbrpc/DDSketch.h"
 
@@ -61,22 +64,8 @@ private:
 	  : ReferencedInterface<StorageServerInterface>(interf, locality), cx(cx) {}
 };
 
-struct LocationInfo : MultiInterface<ReferencedInterface<StorageServerInterface>>, FastAllocated<LocationInfo> {
-	using Locations = MultiInterface<ReferencedInterface<StorageServerInterface>>;
-	explicit LocationInfo(const std::vector<Reference<ReferencedInterface<StorageServerInterface>>>& v)
-	  : Locations(v) {}
-	LocationInfo(const std::vector<Reference<ReferencedInterface<StorageServerInterface>>>& v, bool hasCaches)
-	  : Locations(v), hasCaches(hasCaches) {}
-	LocationInfo(const LocationInfo&) = delete;
-	LocationInfo(LocationInfo&&) = delete;
-	LocationInfo& operator=(const LocationInfo&) = delete;
-	LocationInfo& operator=(LocationInfo&&) = delete;
-	bool hasCaches = false;
-	Reference<Locations> locations() { return Reference<Locations>::addRef(this); }
-};
-
-using CommitProxyInfo = ModelInterface<CommitProxyInterface>;
-using GrvProxyInfo = ModelInterface<GrvProxyInterface>;
+using CommitProxyInfo = ModelInterface<CommitProxyInterface, ProxyCpuMetric>;
+using GrvProxyInfo = ModelInterface<GrvProxyInterface, ProxyGrvMetric>;
 
 class ClientTagThrottleData : NonCopyable {
 private:
@@ -89,7 +78,7 @@ private:
 	Smoother smoothReleased;
 
 public:
-	ClientTagThrottleData(ClientTagThrottleLimits const& limits)
+	explicit ClientTagThrottleData(ClientTagThrottleLimits const& limits)
 	  : tpsRate(limits.tpsRate), expiration(limits.expiration), lastCheck(now()),
 	    smoothRate(CLIENT_KNOBS->TAG_THROTTLE_SMOOTHING_WINDOW),
 	    smoothReleased(CLIENT_KNOBS->TAG_THROTTLE_SMOOTHING_WINDOW) {
@@ -152,7 +141,7 @@ public:
 
 	Reference<const WatchParameters> parameters;
 
-	WatchMetadata(Reference<const WatchParameters> parameters) : parameters(parameters) {}
+	explicit WatchMetadata(Reference<const WatchParameters> parameters) : parameters(parameters) {}
 };
 
 struct MutationAndVersionStream {
@@ -164,14 +153,6 @@ struct MutationAndVersionStream {
 struct EndpointFailureInfo {
 	double startTime = 0;
 	double lastRefreshTime = 0;
-};
-
-struct KeyRangeLocationInfo {
-	KeyRange range;
-	Reference<LocationInfo> locations;
-
-	KeyRangeLocationInfo() {}
-	KeyRangeLocationInfo(KeyRange range, Reference<LocationInfo> locations) : range(range), locations(locations) {}
 };
 
 class DatabaseContext : public ReferenceCounted<DatabaseContext>, public FastAllocated<DatabaseContext>, NonCopyable {
@@ -237,7 +218,7 @@ public:
 	Future<HealthMetrics> getHealthMetrics(bool detailed);
 	// Get storage stats of a storage server from the cached healthy metrics if now() - lastUpdate < maxStaleness.
 	// Otherwise, ask GRVProxy for the up-to-date health metrics.
-	Future<Optional<HealthMetrics::StorageStats>> getStorageStats(const UID& id, double maxStaleness);
+	Future<Optional<HealthMetrics::StorageStats>> getStorageStats(UID id, double maxStaleness);
 	// Pass a negative value for `shardLimit` to indicate no limit on the shard number.
 	Future<StorageMetrics> getStorageMetrics(
 	    KeyRange const& keys,
@@ -370,7 +351,7 @@ public:
 	bool proxyProvisional; // Provisional commit proxy and grv proxy are used at the same time.
 	UID proxiesLastChange;
 	LocalityData clientLocality;
-	QueueModel queueModel;
+	StorageServerQueueModel queueModel;
 	EnableLocalityLoadBalance enableLocalityLoadBalance{ EnableLocalityLoadBalance::False };
 
 	struct VersionRequest {
@@ -379,7 +360,9 @@ public:
 		TagSet tags;
 		Optional<UID> debugID;
 
-		VersionRequest(SpanContext spanContext, TagSet tags = TagSet(), Optional<UID> debugID = Optional<UID>())
+		explicit VersionRequest(SpanContext spanContext,
+		                        TagSet tags = TagSet(),
+		                        Optional<UID> debugID = Optional<UID>())
 		  : spanContext(spanContext), tags(tags), debugID(debugID) {}
 	};
 
@@ -388,7 +371,16 @@ public:
 		PromiseStream<VersionRequest> stream;
 		Future<Void> actor;
 	};
-	std::map<uint32_t, VersionBatcher> versionBatcher;
+	struct VersionBatcherKey {
+		uint32_t flags;
+		Optional<int64_t> maxGrvQueueDelayMS;
+
+		VersionBatcherKey(uint32_t flags, Optional<int64_t> maxGrvQueueDelayMS)
+		  : flags(flags), maxGrvQueueDelayMS(maxGrvQueueDelayMS) {}
+
+		std::strong_ordering operator<=>(VersionBatcherKey const& rhs) const = default;
+	};
+	std::map<VersionBatcherKey, VersionBatcher> versionBatcher;
 
 	AsyncTrigger connectionFileChangedTrigger;
 
@@ -407,20 +399,19 @@ public:
 	ClientStatusUpdater clientStatusUpdater;
 
 	// Cache of location information
-	int locationCacheSize;
-	CoalescedKeyRangeMap<Reference<LocationInfo>> locationCache;
+	ClientLocationCache locationCache;
 	std::unordered_map<Endpoint, EndpointFailureInfo> failedEndpointsOnHealthyServersInfo;
 
 	std::map<UID, StorageServerInfo*> server_interf;
+
+	// Periodically samples FlowTransport per-address connect-failed counts and evicts
+	// location-cache entries for any address whose count advanced (a dead/flapping peer).
+	Future<Void> locationCachePeerEvictor;
 
 	// map from ssid -> tss interface
 	std::unordered_map<UID, StorageServerInterface> tssMapping;
 	// map from tssid -> metrics for that tss pair
 	std::unordered_map<UID, Reference<TSSMetrics>> tssMetrics;
-
-	IKeyValueStore* storage = nullptr;
-
-	void setStorage(IKeyValueStore* storage);
 
 	// map from ssid -> ss tag
 	// @note this map allows the client to identify the latest commit versions
@@ -515,7 +506,7 @@ public:
 	TaskPriority taskID;
 
 	Int64MetricHandle getValueSubmitted;
-	EventMetricHandle<GetValueComplete> getValueCompleted;
+	EventMetricHandle<GetValueCompleteDescriptor> getValueCompleted;
 
 	Reference<AsyncVar<ClientDBInfo>> clientInfo;
 	Future<Void> clientInfoMonitor;
@@ -540,8 +531,6 @@ public:
 
 	UniqueOrderedOptionList<FDBTransactionOptions> transactionDefaults;
 
-	Future<Void> cacheListMonitor;
-	AsyncTrigger updateCache;
 	std::vector<std::unique_ptr<SpecialKeyRangeReadImpl>> specialKeySpaceModules;
 	std::unique_ptr<SpecialKeySpace> specialKeySpace;
 	void registerSpecialKeysImpl(SpecialKeySpace::MODULE module,
@@ -670,7 +659,8 @@ private:
 
 // Similar to tr.onError(), but doesn't require a DatabaseContext.
 struct Backoff {
-	Backoff(double backoff = CLIENT_KNOBS->DEFAULT_BACKOFF, double maxBackoff = CLIENT_KNOBS->DEFAULT_MAX_BACKOFF)
+	explicit Backoff(double backoff = CLIENT_KNOBS->DEFAULT_BACKOFF,
+	                 double maxBackoff = CLIENT_KNOBS->DEFAULT_MAX_BACKOFF)
 	  : backoff(backoff), maxBackoff(maxBackoff) {}
 
 	Future<Void> onError() {

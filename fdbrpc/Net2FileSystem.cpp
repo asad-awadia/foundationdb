@@ -20,11 +20,9 @@
 
 #include "fdbrpc/Net2FileSystem.h"
 
-// Define boost::asio::io_service
 #include <algorithm>
-#ifndef BOOST_SYSTEM_NO_LIB
-#define BOOST_SYSTEM_NO_LIB
-#endif
+
+// Define boost::asio::io_context
 #ifndef BOOST_DATE_TIME_NO_LIB
 #define BOOST_DATE_TIME_NO_LIB
 #endif
@@ -35,25 +33,282 @@
 
 #define FILESYSTEM_IMPL 1
 
-#include "fdbrpc/AsyncFileCached.actor.h"
-#include "fdbrpc/AsyncFileChaos.h"
-#include "fdbrpc/AsyncFileEIO.actor.h"
-#include "fdbrpc/AsyncFileEncrypted.h"
-#include "fdbrpc/AsyncFileWinASIO.actor.h"
-#include "fdbrpc/AsyncFileKAIO.actor.h"
+#include "fdbrpc/AsyncFileCached.h"
+#include "AsyncFileChaos.h"
+#include "AsyncFileEIO.h"
+#include "AsyncFileWinASIO.h"
+#include "AsyncFileKAIO.h"
 #include "flow/AsioReactor.h"
 #include "flow/Platform.h"
-#include "fdbrpc/AsyncFileWriteChecker.actor.h"
+#include "AsyncFileWriteChecker.h"
+#include "flow/UnitTest.h"
+
+#ifdef __linux__
+#include <cerrno>
+#include <cstdlib>
+
+namespace {
+Future<Void> runAsyncFileKAIOTestOps(Reference<IAsyncFile> f, int numIterations, int fileSize, bool expectedToSucceed) {
+	void* buf = FastAllocator<4096>::allocate(); // we leak this if there is an error, but that shouldn't be a big deal
+
+	bool opTimedOut = false;
+
+	for (int iteration = 0; iteration < numIterations; ++iteration) {
+		std::vector<Future<Void>> futures;
+		for (int numOps = deterministicRandom()->randomInt(1, 20); numOps > 0; --numOps) {
+			if (deterministicRandom()->coinflip()) {
+				futures.push_back(success(f->read(
+				    buf, 4096, static_cast<int64_t>(deterministicRandom()->randomInt(0, fileSize)) / 4096 * 4096)));
+			} else {
+				futures.push_back(f->write(
+				    buf, 4096, static_cast<int64_t>(deterministicRandom()->randomInt(0, fileSize)) / 4096 * 4096));
+			}
+		}
+		for (int fIndex = 0; fIndex < futures.size(); ++fIndex) {
+			try {
+				co_await futures[fIndex];
+			} catch (Error& e) {
+				ASSERT(!expectedToSucceed);
+				ASSERT(e.code() == error_code_io_timeout);
+				opTimedOut = true;
+			}
+		}
+
+		try {
+			co_await (f->sync() && delay(0.1));
+			ASSERT(expectedToSucceed);
+		} catch (Error& e) {
+			ASSERT(!expectedToSucceed && e.code() == error_code_io_timeout);
+		}
+	}
+
+	FastAllocator<4096>::release(buf);
+
+	ASSERT(expectedToSucceed || opTimedOut);
+}
+} // namespace
+
+TEST_CASE("/fdbrpc/AsyncFileKAIO/RequestList") {
+	// This test does nothing in simulation because simulation doesn't support AsyncFileKAIO
+	if (!g_network->isSimulated()) {
+		Reference<IAsyncFile> f;
+		Optional<Error> err;
+		try {
+			f = co_await AsyncFileKAIO::open("/tmp/__KAIO_TEST_FILE__",
+			                                 IAsyncFile::OPEN_UNBUFFERED | IAsyncFile::OPEN_READWRITE |
+			                                     IAsyncFile::OPEN_CREATE,
+			                                 0666,
+			                                 nullptr);
+			int fileSize = 2 << 27; // ~100MB
+			co_await f->truncate(fileSize);
+
+			// Test that the request list works as intended with default timeout
+			AsyncFileKAIO::setTimeout(0.0);
+			co_await runAsyncFileKAIOTestOps(f, 100, fileSize, true);
+			ASSERT(!((AsyncFileKAIO*)f.getPtr())->failed);
+
+			// Test that the request list works as intended with long timeout
+			AsyncFileKAIO::setTimeout(20.0);
+			co_await runAsyncFileKAIOTestOps(f, 100, fileSize, true);
+			ASSERT(!((AsyncFileKAIO*)f.getPtr())->failed);
+
+			// Test that requests timeout correctly
+			AsyncFileKAIO::setTimeout(0.0001);
+			co_await runAsyncFileKAIOTestOps(f, 10, fileSize, false);
+			ASSERT(((AsyncFileKAIO*)f.getPtr())->failed);
+		} catch (Error& e) {
+			err = e;
+		}
+		AsyncFileKAIO::setTimeout(0.0);
+		if (err.present()) {
+			if (f) {
+				co_await AsyncFileEIO::deleteFile(f->getFilename(), true);
+			}
+			throw err.get();
+		}
+
+		co_await AsyncFileEIO::deleteFile(f->getFilename(), true);
+	}
+}
+
+TEST_CASE("/fdbrpc/AsyncFileKAIO/TruncateEINTR") {
+	bool fallocateSupported = true;
+	int fallocateCalls = 0;
+	auto fallback = [](int, off_t) {
+		errno = EIO;
+		return -1;
+	};
+
+	auto interrupted = kaio_detail::truncateSyscalls(
+	    -1,
+	    8192,
+	    0,
+	    fallocateSupported,
+	    [&](int, int, off_t, off_t) {
+		    if (++fallocateCalls <= 2) {
+			    errno = EINTR;
+			    return -1;
+		    }
+		    return 0;
+	    },
+	    fallback);
+	ASSERT(interrupted.result == 0);
+	ASSERT(interrupted.fallocateRetries == 2);
+	ASSERT(fallocateCalls == 3);
+
+	fallocateCalls = 0;
+	auto exhausted = kaio_detail::truncateSyscalls(
+	    -1,
+	    8192,
+	    0,
+	    fallocateSupported,
+	    [&](int, int, off_t, off_t) {
+		    ++fallocateCalls;
+		    errno = EINTR;
+		    return -1;
+	    },
+	    fallback);
+	ASSERT(exhausted.result == -1);
+	ASSERT(exhausted.errorCode == EINTR);
+	ASSERT(exhausted.fallocateRetries == kaio_detail::MAX_EINTR_RETRIES);
+	ASSERT(fallocateCalls == kaio_detail::MAX_EINTR_RETRIES + 1);
+
+	fallocateCalls = 0;
+	auto permanent = kaio_detail::truncateSyscalls(
+	    -1,
+	    8192,
+	    0,
+	    fallocateSupported,
+	    [&](int, int, off_t, off_t) {
+		    ++fallocateCalls;
+		    errno = EIO;
+		    return -1;
+	    },
+	    fallback);
+	ASSERT(permanent.result == -1);
+	ASSERT(permanent.errorCode == EIO);
+	ASSERT(permanent.fallocateRetries == 0);
+	ASSERT(fallocateCalls == 1);
+
+	int ftruncateCalls = 0;
+	auto unsupported = kaio_detail::truncateSyscalls(
+	    -1,
+	    8192,
+	    0,
+	    fallocateSupported,
+	    [&](int, int, off_t, off_t) {
+		    errno = EOPNOTSUPP;
+		    return -1;
+	    },
+	    [&](int, off_t) {
+		    ++ftruncateCalls;
+		    return 0;
+	    });
+	ASSERT(unsupported.result == 0);
+	ASSERT(unsupported.fallocateErrorCode == EOPNOTSUPP);
+	ASSERT(!fallocateSupported);
+	ASSERT(ftruncateCalls == 1);
+
+	ftruncateCalls = 0;
+	auto truncateFailure = kaio_detail::truncateSyscalls(
+	    -1,
+	    4096,
+	    8192,
+	    fallocateSupported,
+	    [&](int, int, off_t, off_t) {
+		    ASSERT(false);
+		    return 0;
+	    },
+	    [&](int, off_t) {
+		    ++ftruncateCalls;
+		    errno = EIO;
+		    return -1;
+	    });
+	ASSERT(truncateFailure.result == -1);
+	ASSERT(truncateFailure.errorCode == EIO);
+	ASSERT(ftruncateCalls == 1);
+
+	ftruncateCalls = 0;
+	auto truncateExhausted = kaio_detail::truncateSyscalls(
+	    -1,
+	    4096,
+	    8192,
+	    fallocateSupported,
+	    [&](int, int, off_t, off_t) {
+		    ASSERT(false);
+		    return 0;
+	    },
+	    [&](int, off_t) {
+		    ++ftruncateCalls;
+		    errno = EINTR;
+		    return -1;
+	    });
+	ASSERT(truncateExhausted.result == -1);
+	ASSERT(truncateExhausted.errorCode == EINTR);
+	ASSERT(truncateExhausted.ftruncateRetries == kaio_detail::MAX_EINTR_RETRIES);
+	ASSERT(ftruncateCalls == kaio_detail::MAX_EINTR_RETRIES + 1);
+
+	// Exercise the same syscall path on a real file when running outside simulation.
+	if (!g_network->isSimulated()) {
+		char filename[] = "/tmp/__KAIO_TRUNCATE_EINTR_TEST_FILE__.XXXXXX";
+		int fd = ::mkstemp(filename);
+		ASSERT(fd >= 0);
+		ASSERT(::unlink(filename) == 0);
+
+		fallocateSupported = true;
+		fallocateCalls = 0;
+		auto growth = kaio_detail::truncateSyscalls(
+		    fd,
+		    8192,
+		    0,
+		    fallocateSupported,
+		    [&](int fd, int mode, off_t offset, off_t length) {
+			    if (++fallocateCalls == 1) {
+				    errno = EINTR;
+				    return -1;
+			    }
+			    return ::fallocate(fd, mode, offset, length);
+		    },
+		    ::ftruncate);
+		ASSERT(growth.result == 0);
+		ASSERT(fallocateCalls == 2);
+		ASSERT(growth.fallocateRetries == 1);
+		struct stat fileStat;
+		ASSERT(::fstat(fd, &fileStat) == 0);
+		ASSERT(fileStat.st_size == 8192);
+
+		ftruncateCalls = 0;
+		auto shrink =
+		    kaio_detail::truncateSyscalls(fd, 4096, 8192, fallocateSupported, ::fallocate, [&](int fd, off_t length) {
+			    if (++ftruncateCalls == 1) {
+				    errno = EINTR;
+				    return -1;
+			    }
+			    return ::ftruncate(fd, length);
+		    });
+		ASSERT(shrink.result == 0);
+		ASSERT(shrink.ftruncateRetries == 1);
+		ASSERT(ftruncateCalls == 2);
+		ASSERT(::fstat(fd, &fileStat) == 0);
+		ASSERT(fileStat.st_size == 4096);
+		ASSERT(::close(fd) == 0);
+	}
+	return Void();
+}
+#endif // __linux__
 
 // Opens a file for asynchronous I/O
 Future<Reference<class IAsyncFile>> Net2FileSystem::open(const std::string& filename, int64_t flags, int64_t mode) {
 #ifdef __linux__
 	if (checkFileSystem) {
 		dev_t fileDeviceId = getDeviceId(filename);
-		if (fileDeviceId != this->fileSystemDeviceId) {
-			TraceEvent(SevError, "DeviceIdMismatched")
-			    .detail("FileSystemDeviceId", this->fileSystemDeviceId)
-			    .detail("FileDeviceId", fileDeviceId);
+		if (std::find(this->fileSystemDeviceIds.begin(), this->fileSystemDeviceIds.end(), fileDeviceId) ==
+		    this->fileSystemDeviceIds.end()) {
+			TraceEvent te(SevError, "DeviceIdMismatched");
+			te.detail("FileDeviceId", fileDeviceId);
+			for (size_t i = 0; i < this->fileSystemDeviceIds.size(); ++i) {
+				te.detail(format("AllowedFileSystemDeviceId%zu", i).c_str(), this->fileSystemDeviceIds[i]);
+			}
 			throw io_error();
 		}
 	}
@@ -76,21 +331,20 @@ Future<Reference<class IAsyncFile>> Net2FileSystem::open(const std::string& file
 		f = AsyncFileKAIO::open(filename, flags, mode, nullptr);
 	else
 #endif
+	{
 		f = Net2AsyncFile::open(
 		    filename,
 		    flags,
 		    mode,
-		    static_cast<boost::asio::io_service*>((void*)g_network->global(INetwork::enASIOService)));
-	if (FLOW_KNOBS->PAGE_WRITE_CHECKSUM_HISTORY > 0)
-		f = map(f, [=](Reference<IAsyncFile> r) { return Reference<IAsyncFile>(new AsyncFileWriteChecker(r)); });
-	if (FLOW_KNOBS->ENABLE_CHAOS_FEATURES)
-		f = map(f, [=](Reference<IAsyncFile> r) { return Reference<IAsyncFile>(new AsyncFileChaos(r)); });
-	if (flags & IAsyncFile::OPEN_ENCRYPTED)
-		f = map(f, [flags](Reference<IAsyncFile> r) {
-			auto mode = flags & IAsyncFile::OPEN_READWRITE ? AsyncFileEncrypted::Mode::APPEND_ONLY
-			                                               : AsyncFileEncrypted::Mode::READ_ONLY;
-			return Reference<IAsyncFile>(new AsyncFileEncrypted(r, mode));
+		    static_cast<boost::asio::io_context*>((void*)g_network->global(INetwork::enASIOService)));
+	}
+	if (FLOW_KNOBS->PAGE_WRITE_CHECKSUM_HISTORY > 0) {
+		f = map(f, [=](Reference<IAsyncFile> r) -> Reference<IAsyncFile> {
+			return makeReference<AsyncFileWriteChecker>(r);
 		});
+	}
+	if (FLOW_KNOBS->ENABLE_CHAOS_FEATURES)
+		f = map(f, [=](Reference<IAsyncFile> r) -> Reference<IAsyncFile> { return makeReference<AsyncFileChaos>(r); });
 	return f;
 }
 
@@ -110,36 +364,52 @@ ActorLineageSet& Net2FileSystem::getActorLineageSet() {
 }
 #endif
 
-void Net2FileSystem::newFileSystem(double ioTimeout, const std::string& fileSystemPath) {
-	g_network->setGlobal(INetwork::enFileSystem, (flowGlobalType) new Net2FileSystem(ioTimeout, fileSystemPath));
+void Net2FileSystem::newFileSystem(double ioTimeout, const std::vector<std::string>& fileSystemPaths) {
+	g_network->setGlobal(INetwork::enFileSystem, (flowGlobalType) new Net2FileSystem(ioTimeout, fileSystemPaths));
 }
 
-Net2FileSystem::Net2FileSystem(double ioTimeout, const std::string& fileSystemPath) {
+void Net2FileSystem::newFileSystem(double ioTimeout, const std::string& fileSystemPath) {
+	newFileSystem(ioTimeout,
+	              fileSystemPath.empty() ? std::vector<std::string>() : std::vector<std::string>{ fileSystemPath });
+}
+
+Net2FileSystem::Net2FileSystem(double ioTimeout, const std::string& fileSystemPath)
+  : Net2FileSystem(ioTimeout,
+                   fileSystemPath.empty() ? std::vector<std::string>() : std::vector<std::string>{ fileSystemPath }) {}
+
+Net2FileSystem::Net2FileSystem(double ioTimeout, const std::vector<std::string>& fileSystemPaths) {
 	Net2AsyncFile::init();
 #ifdef __linux__
 	if (!FLOW_KNOBS->DISABLE_POSIX_KERNEL_AIO)
 		AsyncFileKAIO::init(Reference<IEventFD>(N2::ASIOReactor::getEventFD()), ioTimeout);
 
-	if (fileSystemPath.empty()) {
+	if (fileSystemPaths.empty()) {
 		checkFileSystem = false;
 	} else {
 		checkFileSystem = true;
 
-		try {
-			this->fileSystemDeviceId = getDeviceId(fileSystemPath);
-			if (fileSystemPath != "/") {
-				dev_t fileSystemParentDeviceId = getDeviceId(parentDirectory(fileSystemPath));
-				if (this->fileSystemDeviceId == fileSystemParentDeviceId) {
-					criticalError(FDB_EXIT_ERROR,
-					              "FileSystemError",
-					              format("`%s' is not a mount point", fileSystemPath.c_str()).c_str());
+		for (const auto& fileSystemPath : fileSystemPaths) {
+			try {
+				dev_t fileSystemDeviceId = getDeviceId(fileSystemPath);
+				if (fileSystemPath != "/") {
+					dev_t fileSystemParentDeviceId = getDeviceId(parentDirectory(fileSystemPath));
+					if (fileSystemDeviceId == fileSystemParentDeviceId) {
+						criticalError(FDB_EXIT_ERROR,
+						              "FileSystemError",
+						              format("`%s' is not a mount point", fileSystemPath.c_str()).c_str());
+					}
 				}
+				this->fileSystemDeviceIds.push_back(fileSystemDeviceId);
+			} catch (Error&) {
+				criticalError(FDB_EXIT_ERROR,
+				              "FileSystemError",
+				              format("Could not get device id from `%s'", fileSystemPath.c_str()).c_str());
 			}
-		} catch (Error&) {
-			criticalError(FDB_EXIT_ERROR,
-			              "FileSystemError",
-			              format("Could not get device id from `%s'", fileSystemPath.c_str()).c_str());
 		}
+
+		std::sort(this->fileSystemDeviceIds.begin(), this->fileSystemDeviceIds.end());
+		this->fileSystemDeviceIds.erase(std::unique(this->fileSystemDeviceIds.begin(), this->fileSystemDeviceIds.end()),
+		                                this->fileSystemDeviceIds.end());
 	}
 #endif
 }

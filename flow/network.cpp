@@ -17,6 +17,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <limits>
+#include <stdexcept>
+
 #include <boost/asio.hpp>
 
 #include "flow/Arena.h"
@@ -142,8 +145,8 @@ std::string IPAddress::toString() const {
 
 Optional<IPAddress> IPAddress::parse(std::string const& str) {
 	try {
-		auto addr = boost::asio::ip::address::from_string(str);
-		return addr.is_v6() ? IPAddress(addr.to_v6().to_bytes()) : IPAddress(addr.to_v4().to_ulong());
+		auto addr = boost::asio::ip::make_address(str);
+		return addr.is_v6() ? IPAddress(addr.to_v6().to_bytes()) : IPAddress(addr.to_v4().to_uint());
 	} catch (...) {
 		return Optional<IPAddress>();
 	}
@@ -182,7 +185,19 @@ NetworkAddress NetworkAddress::parse(std::string const& s) {
 			throw connection_string_invalid();
 		}
 
-		auto port = std::stoi(f.substr(addrEnd + 2));
+		std::string portString = f.substr(addrEnd + 2);
+		size_t parsedLength = 0;
+		int port;
+		try {
+			port = std::stoi(portString, &parsedLength);
+		} catch (const std::invalid_argument&) {
+			throw connection_string_invalid();
+		} catch (const std::out_of_range&) {
+			throw connection_string_invalid();
+		}
+		if (parsedLength != portString.size() || port < 0 || port > std::numeric_limits<uint16_t>::max()) {
+			throw connection_string_invalid();
+		}
 		auto addr = IPAddress::parse(f.substr(1, addrEnd - 1));
 		if (!addr.present()) {
 			throw connection_string_invalid();
@@ -253,37 +268,69 @@ std::string formatIpPort(const IPAddress& ip, uint16_t port) {
 	return format(patt, ip.toString().c_str(), port);
 }
 
+DNSCache::DNSCache(const std::map<std::string, std::vector<NetworkAddress>>& dnsCache) {
+	for (const auto& [key, addresses] : dnsCache) {
+		entries[key].addresses = addresses;
+	}
+}
+
 Optional<std::vector<NetworkAddress>> DNSCache::find(const std::string& host, const std::string& service) {
-	auto it = hostnameToAddresses.find(host + ":" + service);
-	if (it != hostnameToAddresses.end()) {
-		return it->second;
+	auto it = entries.find(host + ":" + service);
+	if (it != entries.end()) {
+		it->second.lastAccess = g_network->now();
+		return it->second.addresses;
 	}
 	return {};
 }
 
 void DNSCache::add(const std::string& host, const std::string& service, const std::vector<NetworkAddress>& addresses) {
-	hostnameToAddresses[host + ":" + service] = addresses;
+	Entry& entry = entries[host + ":" + service];
+	entry.addresses = addresses;
+	entry.lastAccess = g_network->now();
+}
+
+void DNSCache::update(const std::string& host,
+                      const std::string& service,
+                      const std::vector<NetworkAddress>& addresses) {
+	entries[host + ":" + service].addresses = addresses;
 }
 
 void DNSCache::remove(const std::string& host, const std::string& service) {
-	auto it = hostnameToAddresses.find(host + ":" + service);
-	if (it != hostnameToAddresses.end()) {
-		hostnameToAddresses.erase(it);
+	auto it = entries.find(host + ":" + service);
+	if (it != entries.end()) {
+		entries.erase(it);
 	}
 }
 
 void DNSCache::clear() {
-	hostnameToAddresses.clear();
+	entries.clear();
+}
+
+std::vector<std::string> DNSCache::getKeys() const {
+	std::vector<std::string> keys;
+	keys.reserve(entries.size());
+	for (const auto& [key, _] : entries) {
+		keys.push_back(key);
+	}
+	return keys;
+}
+
+Optional<double> DNSCache::getLastAccess(const std::string& host, const std::string& service) const {
+	auto it = entries.find(host + ":" + service);
+	if (it != entries.end()) {
+		return it->second.lastAccess;
+	}
+	return {};
 }
 
 std::string DNSCache::toString() {
 	std::string ret;
-	for (auto it = hostnameToAddresses.begin(); it != hostnameToAddresses.end(); ++it) {
-		if (it != hostnameToAddresses.begin()) {
+	for (auto it = entries.begin(); it != entries.end(); ++it) {
+		if (it != entries.begin()) {
 			ret += ';';
 		}
 		ret += it->first + ',';
-		const std::vector<NetworkAddress>& addresses = it->second;
+		const std::vector<NetworkAddress>& addresses = it->second.addresses;
 		for (int i = 0; i < addresses.size(); ++i) {
 			ret += addresses[i].toString();
 			if (i != addresses.size() - 1) {
@@ -390,12 +437,39 @@ Future<Reference<IConnection>> INetworkConnections::connect(const std::string& h
 	});
 }
 
-IUDPSocket::~IUDPSocket() {}
+IUDPSocket::~IUDPSocket() = default;
 
 const std::vector<int> NetworkMetrics::starvationBins = { 1, 3500, 7000, 7500, 8500, 8900, 10500 };
 
 TEST_CASE("/flow/network/ipaddress") {
 	ASSERT(NetworkAddress::parse("[::1]:4800").toString() == "[::1]:4800");
+
+	for (const auto& [input, expected] : std::vector<std::pair<std::string, std::string>>{
+	         { "[::1]:0", "[::1]:0" },
+	         { "[::1]:65535:tls(fromHostname)", "[::1]:65535:tls(fromHostname)" },
+	         { "[::1]:+080", "[::1]:80" },
+	         { "[::1]: 80", "[::1]:80" },
+	     }) {
+		ASSERT(NetworkAddress::parse(input).toString() == expected);
+	}
+
+	for (const auto& input : { "[::1]:",
+	                           "[::1]:abc",
+	                           "[::1]:80junk",
+	                           "[::1]:-1",
+	                           "[::1]:65536",
+	                           "[::1]:9999999999999999999999999",
+	                           "[::1]:80junk:tls(fromHostname)" }) {
+		bool rejected = false;
+		try {
+			NetworkAddress::parse(input);
+		} catch (const Error& e) {
+			ASSERT(e.code() == error_code_connection_string_invalid);
+			rejected = true;
+		}
+		ASSERT(rejected);
+		ASSERT(!NetworkAddress::parseOptional(input).present());
+	}
 
 	{
 		auto addr = "[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:4800";

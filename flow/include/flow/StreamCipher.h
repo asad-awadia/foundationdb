@@ -32,19 +32,18 @@
 #include <vector>
 
 #define AES_256_KEY_LENGTH 32
+#define GCM_TAG_LEN 16
 
 // Wrapper class for openssl implementation of AES GCM
 // encryption/decryption
 class StreamCipherKey : NonCopyable {
-	static UID globalKeyId;
-	static std::unique_ptr<StreamCipherKey> globalKey;
 	static std::unordered_map<UID, StreamCipherKey*> cipherKeys;
 	UID id;
 	std::unique_ptr<uint8_t[]> arr;
 	int keySize;
 
 public:
-	StreamCipherKey(int size);
+	explicit StreamCipherKey(int size);
 	~StreamCipherKey();
 
 	int size() const { return keySize; }
@@ -69,7 +68,7 @@ class StreamCipher final : NonCopyable {
 
 public:
 	StreamCipher();
-	StreamCipher(int KeySize);
+	explicit StreamCipher(int KeySize);
 	~StreamCipher();
 	EVP_CIPHER_CTX* getCtx();
 	HMAC_CTX* getHmacCtx();
@@ -93,7 +92,7 @@ class DecryptionStreamCipher final : NonCopyable, public ReferenceCounted<Decryp
 public:
 	DecryptionStreamCipher(const StreamCipherKey* key, const StreamCipher::IV& iv);
 	StringRef decrypt(unsigned char const* ciphertext, int len, Arena&);
-	StringRef finish(Arena&);
+	StringRef finish(const uint8_t* tag, Arena&);
 };
 
 class HmacSha256StreamCipher final : NonCopyable, public ReferenceCounted<HmacSha256StreamCipher> {

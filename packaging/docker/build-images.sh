@@ -35,6 +35,9 @@ function create_fake_website_directory () {
     fi
     local stripped_binaries_and_from_where="${1}"
     fdb_binaries=( 'fdbbackup' 'fdbcli' 'fdbserver' 'fdbmonitor' )
+    if [ -x "${build_output_directory}/packages/bin/mako" ]; then
+        fdb_binaries+=( 'mako' )
+    fi
     logg "PREPARING WEBSITE"
     website_directory="${script_dir}/website"
     rm -rf "${website_directory}"
@@ -208,6 +211,7 @@ function build_and_push_images () {
               [ "${image}" == 'foundationdb-kubernetes-sidecar' ] || \
               [ "${image}" == 'fdb-aws-s3-credentials-fetcher-sidecar' ] || \
               [ "${image}" == 'ycsb' ] || \
+              [ "${image}" == 'mako' ] || \
               [ "${image}" == 'fdb-kubernetes-monitor' ]; then
             tags_to_push+=("${image_tag}")
         fi
@@ -262,6 +266,7 @@ image_list=(
     'foundationdb-kubernetes-sidecar'
     'ycsb'
 )
+# mako is added below once build_output_directory is finalized.
 registry=""
 tag_base="foundationdb/"
 
@@ -286,6 +291,9 @@ if [ -n "${OKTETO_NAMESPACE+x}" ]; then
     fi
 
     # build regular images
+    if [ -x "${build_output_directory}/packages/bin/mako" ]; then
+        image_list+=( 'mako' )
+    fi
     create_fake_website_directory stripped_local
     build_and_push_images true true false
 

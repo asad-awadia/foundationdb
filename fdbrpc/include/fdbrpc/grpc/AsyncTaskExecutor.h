@@ -59,7 +59,6 @@ concept IsVoidReturn = std::is_void_v<std::invoke_result_t<Func>>;
 //     });
 //
 // - TODO: Move this to more standard location inside codebase.
-// - TODO: Remove AsyncTaskThread which has similar purpose however implemented differently?
 class AsyncTaskExecutor {
 public:
 	explicit AsyncTaskExecutor(int num_threads) {
@@ -106,7 +105,7 @@ public:
 private:
 	// Serves no purpose for us, but needed for `IThreadPool`.
 	struct Receiver : IThreadPoolReceiver {
-		void init() {}
+		void init() override {}
 	};
 
 	template <typename Func, class __Enable = void>
@@ -119,7 +118,8 @@ private:
 
 // `ThreadAction` implementation for tasks that return non-void values.
 template <typename Func>
-struct AsyncTaskExecutor::Action<Func, typename std::enable_if_t<!IsVoidReturn<Func>>> : ThreadAction {
+    requires(!IsVoidReturn<Func>)
+struct AsyncTaskExecutor::Action<Func> : ThreadAction {
 	using Ret = typename std::invoke_result<Func>::type;
 
 	Action(Func&& fn) : fn_(std::move(fn)) {}
@@ -156,7 +156,8 @@ private:
 
 // `ThreadAction` implementation for tasks that return void.
 template <typename Func>
-struct AsyncTaskExecutor::Action<Func, typename std::enable_if_t<IsVoidReturn<Func>>> : ThreadAction {
+    requires(IsVoidReturn<Func>)
+struct AsyncTaskExecutor::Action<Func> : ThreadAction {
 	using Ret = typename std::invoke_result<Func>::type;
 
 	Action(Func&& fn) : fn_(std::move(fn)) {}

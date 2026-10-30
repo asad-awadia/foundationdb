@@ -26,7 +26,7 @@
 #include <flow/flow.h>
 #include <flow/FastAlloc.h>
 #include <flow/ThreadPrimitives.h>
-#include <flow/ThreadHelper.actor.h>
+#include <flow/ThreadHelper.h>
 #include <flow/ScopeExit.h>
 
 // NOTE: Currently futures should only be used from main thread.
@@ -184,9 +184,9 @@ public:
 
 	virtual void destroy() { delete this; }
 	virtual void cancel() {}
-	virtual void unwait() override { delFutureRef(); }
-	virtual void fire(T const&) override { ASSERT(false); }
-	virtual void fire(T&&) override { ASSERT(false); }
+	void unwait() override { delFutureRef(); }
+	void fire(T const&) override { ASSERT(false); }
+	void fire(T&&) override { ASSERT(false); }
 
 protected:
 	bool shouldFireImmediatelyUnsafe() { return SingleCallback<T>::next != this; }
@@ -218,6 +218,9 @@ public:
 	}
 
 	void operator=(const ThreadFutureStream& rhs) {
+		if (this == &rhs) {
+			return;
+		}
 		rhs.queue->addFutureRef();
 		if (queue)
 			queue->delFutureRef();
@@ -271,6 +274,8 @@ public:
 		return ThreadFutureStream<T>(queue);
 	}
 
+	// The incoming queue reference is acquired before the old one is released.
+	// NOLINTNEXTLINE(bugprone-unhandled-self-assignment)
 	void operator=(const ThreadReturnPromiseStream& rhs) {
 		rhs.queue->addPromiseRef();
 		if (queue)
@@ -293,11 +298,5 @@ public:
 private:
 	ThreadNotifiedQueue<T>* queue;
 };
-
-// Fixes IDE build.
-#ifndef NO_INTELLISENSE
-template <class T>
-T waitNext(const ThreadFutureStream<T>&);
-#endif
 
 #endif

@@ -18,12 +18,12 @@
  * limitations under the License.
  */
 
-#include "fdbclient/KeyBackedTypes.actor.h"
+#include "fdbclient/KeyBackedTypes.h"
 #include "fdbclient/SystemData.h"
 #include "fdbclient/FDBTypes.h"
 #include "fdbclient/StorageServerInterface.h"
 #include "flow/Arena.h"
-#include "flow/TDMetric.actor.h"
+#include "flow/TDMetric.h"
 #include "flow/serialize.h"
 #include "flow/UnitTest.h"
 
@@ -66,13 +66,13 @@ const KeyRef keyServersKeyServersKey = keyServersKeyServersKeys.begin;
 const UID anonymousShardId = UID(0x666666, 0x88888888);
 const uint64_t emptyShardId = 0x2222222;
 
-const Key keyServersKey(const KeyRef& k) {
+Key keyServersKey(const KeyRef& k) {
 	return k.withPrefix(keyServersPrefix);
 }
-const KeyRef keyServersKey(const KeyRef& k, Arena& arena) {
+KeyRef keyServersKey(const KeyRef& k, Arena& arena) {
 	return k.withPrefix(keyServersPrefix, arena);
 }
-const Value keyServersValue(RangeResult result, const std::vector<UID>& src, const std::vector<UID>& dest) {
+Value keyServersValue(RangeResult result, const std::vector<UID>& src, const std::vector<UID>& dest) {
 	if (!CLIENT_KNOBS->TAG_ENCODE_KEY_SERVERS) {
 		BinaryWriter wr(IncludeVersion(ProtocolVersion::withKeyServerValue()));
 		wr << src << dest;
@@ -97,10 +97,7 @@ const Value keyServersValue(RangeResult result, const std::vector<UID>& src, con
 	return keyServersValue(srcTag, destTag);
 }
 
-const Value keyServersValue(const std::vector<UID>& src,
-                            const std::vector<UID>& dest,
-                            const UID& srcID,
-                            const UID& destID) {
+Value keyServersValue(const std::vector<UID>& src, const std::vector<UID>& dest, const UID& srcID, const UID& destID) {
 	BinaryWriter wr(IncludeVersion(ProtocolVersion::withShardEncodeLocationMetaData()));
 	if (dest.empty()) {
 		ASSERT(!destID.isValid());
@@ -111,7 +108,7 @@ const Value keyServersValue(const std::vector<UID>& src,
 	return wr.toValue();
 }
 
-const Value keyServersValue(const std::vector<Tag>& srcTag, const std::vector<Tag>& destTag) {
+Value keyServersValue(const std::vector<Tag>& srcTag, const std::vector<Tag>& destTag) {
 	// src and dest are expected to be sorted
 	BinaryWriter wr(IncludeVersion(ProtocolVersion::withKeyServerValueV2()));
 	wr << srcTag << destTag;
@@ -123,7 +120,7 @@ void decodeKeyServersValue(RangeResult result,
                            std::vector<UID>& src,
                            std::vector<UID>& dest,
                            bool missingIsError) {
-	if (value.size() == 0) {
+	if (value.empty()) {
 		src.clear();
 		dest.clear();
 		return;
@@ -186,7 +183,7 @@ void decodeKeyServersValue(RangeResult result,
 	srcID = UID();
 	destID = UID();
 
-	if (value.size() == 0) {
+	if (value.empty()) {
 		return;
 	}
 
@@ -217,7 +214,7 @@ void decodeKeyServersValue(std::map<Tag, UID> const& tag_uid,
 	static std::vector<Tag> srcTag, destTag;
 	src.clear();
 	dest.clear();
-	if (value.size() == 0) {
+	if (value.empty()) {
 		return;
 	}
 
@@ -275,7 +272,7 @@ void decodeKeyServersValue(std::map<Tag, UID> const& tag_uid,
 }
 
 bool isSystemKey(KeyRef key) {
-	return key.size() && key[0] == systemKeys.begin[0];
+	return !key.empty() && key[0] == systemKeys.begin[0];
 }
 
 const KeyRangeRef conflictingKeysRange =
@@ -291,7 +288,7 @@ const KeyRangeRef writeConflictRangeKeysRange = KeyRangeRef("\xff\xff/transactio
 
 const KeyRef accumulativeChecksumKey = "\xff\xff/accumulativeChecksum"_sr;
 
-const Value accumulativeChecksumValue(const AccumulativeChecksumState& acsState) {
+Value accumulativeChecksumValue(const AccumulativeChecksumState& acsState) {
 	return ObjectWriter::toValue(acsState, IncludeVersion());
 }
 
@@ -309,7 +306,7 @@ const KeyRef auditRangePrefix = auditRanges.begin;
 const KeyRangeRef auditServers = KeyRangeRef("\xff/auditServers/"_sr, "\xff/auditServers0"_sr);
 const KeyRef auditServerPrefix = auditServers.begin;
 
-const Key auditKey(const AuditType type, const UID& auditId) {
+Key auditKey(const AuditType type, const UID& auditId) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(auditPrefix);
 	wr << static_cast<uint8_t>(type);
@@ -318,7 +315,7 @@ const Key auditKey(const AuditType type, const UID& auditId) {
 	return wr.toValue();
 }
 
-const KeyRange auditKeyRange(const AuditType type) {
+KeyRange auditKeyRange(const AuditType type) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(auditPrefix);
 	wr << static_cast<uint8_t>(type);
@@ -326,7 +323,7 @@ const KeyRange auditKeyRange(const AuditType type) {
 	return prefixRange(wr.toValue());
 }
 
-const Key auditRangeBasedProgressPrefixFor(const AuditType type, const UID& auditId) {
+Key auditRangeBasedProgressPrefixFor(const AuditType type, const UID& auditId) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(auditRangePrefix);
 	wr << static_cast<uint8_t>(type);
@@ -336,7 +333,7 @@ const Key auditRangeBasedProgressPrefixFor(const AuditType type, const UID& audi
 	return wr.toValue();
 }
 
-const KeyRange auditRangeBasedProgressRangeFor(const AuditType type, const UID& auditId) {
+KeyRange auditRangeBasedProgressRangeFor(const AuditType type, const UID& auditId) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(auditRangePrefix);
 	wr << static_cast<uint8_t>(type);
@@ -346,7 +343,7 @@ const KeyRange auditRangeBasedProgressRangeFor(const AuditType type, const UID& 
 	return prefixRange(wr.toValue());
 }
 
-const KeyRange auditRangeBasedProgressRangeFor(const AuditType type) {
+KeyRange auditRangeBasedProgressRangeFor(const AuditType type) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(auditRangePrefix);
 	wr << static_cast<uint8_t>(type);
@@ -354,7 +351,7 @@ const KeyRange auditRangeBasedProgressRangeFor(const AuditType type) {
 	return prefixRange(wr.toValue());
 }
 
-const Key auditServerBasedProgressPrefixFor(const AuditType type, const UID& auditId, const UID& serverId) {
+Key auditServerBasedProgressPrefixFor(const AuditType type, const UID& auditId, const UID& serverId) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(auditServerPrefix);
 	wr << static_cast<uint8_t>(type);
@@ -366,7 +363,7 @@ const Key auditServerBasedProgressPrefixFor(const AuditType type, const UID& aud
 	return wr.toValue();
 }
 
-const KeyRange auditServerBasedProgressRangeFor(const AuditType type, const UID& auditId) {
+KeyRange auditServerBasedProgressRangeFor(const AuditType type, const UID& auditId) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(auditServerPrefix);
 	wr << static_cast<uint8_t>(type);
@@ -376,7 +373,7 @@ const KeyRange auditServerBasedProgressRangeFor(const AuditType type, const UID&
 	return prefixRange(wr.toValue());
 }
 
-const KeyRange auditServerBasedProgressRangeFor(const AuditType type) {
+KeyRange auditServerBasedProgressRangeFor(const AuditType type) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(auditServerPrefix);
 	wr << static_cast<uint8_t>(type);
@@ -384,7 +381,7 @@ const KeyRange auditServerBasedProgressRangeFor(const AuditType type) {
 	return prefixRange(wr.toValue());
 }
 
-const Value auditStorageStateValue(const AuditStorageState& auditStorageState) {
+Value auditStorageStateValue(const AuditStorageState& auditStorageState) {
 	return ObjectWriter::toValue(auditStorageState, IncludeVersion());
 }
 
@@ -397,14 +394,14 @@ AuditStorageState decodeAuditStorageState(const ValueRef& value) {
 
 const KeyRef checkpointPrefix = "\xff/checkpoint/"_sr;
 
-const Key checkpointKeyFor(UID checkpointID) {
+Key checkpointKeyFor(UID checkpointID) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(checkpointPrefix);
 	wr << checkpointID;
 	return wr.toValue();
 }
 
-const Value checkpointValue(const CheckpointMetaData& checkpoint) {
+Value checkpointValue(const CheckpointMetaData& checkpoint) {
 	return ObjectWriter::toValue(checkpoint, IncludeVersion());
 }
 
@@ -424,14 +421,22 @@ CheckpointMetaData decodeCheckpointValue(const ValueRef& value) {
 
 // "\xff/dataMoves/[[UID]] := [[DataMoveMetaData]]"
 const KeyRangeRef dataMoveKeys("\xff/dataMoves/"_sr, "\xff/dataMoves0"_sr);
-const Key dataMoveKeyFor(UID dataMoveId) {
+
+// See declaration in SystemData.h. Written ("old") and cleared by DD from
+// rewriteShardEncodedMetadata; cleared on re-forward by
+// clearStaleShardEncodedRewriteSentinel.
+const KeyRef shardEncodeMigrationCompleteKey = "\xff/dd/shard_encode_migration_complete"_sr;
+const ValueRef shardEncodeMigrationValueOld = "old"_sr;
+const ValueRef shardEncodeMigrationValueNew = "new"_sr;
+
+Key dataMoveKeyFor(UID dataMoveId) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(dataMoveKeys.begin);
 	wr << dataMoveId;
 	return wr.toValue();
 }
 
-const Value dataMoveValue(const DataMoveMetaData& dataMoveMetaData) {
+Value dataMoveValue(const DataMoveMetaData& dataMoveMetaData) {
 	return ObjectWriter::toValue(dataMoveMetaData, IncludeVersion());
 }
 
@@ -452,8 +457,8 @@ DataMoveMetaData decodeDataMoveValue(const ValueRef& value) {
 const KeyRangeRef ddStatsRange =
     KeyRangeRef("\xff\xff/metrics/data_distribution_stats/"_sr, "\xff\xff/metrics/data_distribution_stats/\xff\xff"_sr);
 
-const Value logsValue(const std::vector<std::pair<UID, NetworkAddress>>& logs,
-                      const std::vector<std::pair<UID, NetworkAddress>>& oldLogs) {
+Value logsValue(const std::vector<std::pair<UID, NetworkAddress>>& logs,
+                const std::vector<std::pair<UID, NetworkAddress>>& oldLogs) {
 	BinaryWriter wr(IncludeVersion(ProtocolVersion::withLogsValue()));
 	wr << logs;
 	wr << oldLogs;
@@ -475,11 +480,11 @@ const ValueRef serverKeysTrue = "1"_sr, // compatible with what was serverKeysTr
     serverKeysTrueEmptyRange = "3"_sr, // the server treats the range as empty.
     serverKeysFalse;
 
-const UID newDataMoveId(const uint64_t physicalShardId,
-                        AssignEmptyRange assignEmptyRange,
-                        const DataMoveType type,
-                        const DataMovementReason reason,
-                        UnassignShard unassignShard) {
+UID newDataMoveId(const uint64_t physicalShardId,
+                  AssignEmptyRange assignEmptyRange,
+                  const DataMoveType type,
+                  const DataMovementReason reason,
+                  UnassignShard unassignShard) {
 	uint64_t split = 0;
 	if (assignEmptyRange) {
 		split = emptyShardId;
@@ -499,7 +504,7 @@ const UID newDataMoveId(const uint64_t physicalShardId,
 	return UID(physicalShardId, split);
 }
 
-const Key serverKeysKey(UID serverID, const KeyRef& key) {
+Key serverKeysKey(UID serverID, const KeyRef& key) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(serverKeysPrefix);
 	wr << serverID;
@@ -507,7 +512,7 @@ const Key serverKeysKey(UID serverID, const KeyRef& key) {
 	wr.serializeBytes(key);
 	return wr.toValue();
 }
-const Key serverKeysPrefixFor(UID serverID) {
+Key serverKeysPrefixFor(UID serverID) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(serverKeysPrefix);
 	wr << serverID;
@@ -541,7 +546,19 @@ bool serverHasKey(ValueRef storedValue) {
 	return assigned;
 }
 
-const Value serverKeysValue(const UID& id) {
+// See declaration in SystemData.h.
+bool isServerKeysUnassigned(const ValueRef& value) {
+	// Empty values are KRM boundary sentinels. serverKeysFalse ("not
+	// assigned") is written by both flavors on the drop-side of a move.
+	return value.empty() || value == serverKeysFalse;
+}
+
+// See declaration in SystemData.h.
+bool isServerKeysOldFormatAssigned(const ValueRef& value) {
+	return value == serverKeysTrue || value == serverKeysTrueEmptyRange;
+}
+
+Value serverKeysValue(const UID& id) {
 	if (!id.isValid()) {
 		return serverKeysFalse;
 	}
@@ -607,7 +624,7 @@ void decodeServerKeysValue(const ValueRef& value,
                            DataMovementReason& dataMoveReason) {
 	dataMoveType = DataMoveType::LOGICAL;
 	dataMoveReason = DataMovementReason::INVALID;
-	if (value.size() == 0) {
+	if (value.empty() || value == serverKeysFalse) {
 		assigned = false;
 		emptyRange = false;
 		id = UID();
@@ -619,10 +636,6 @@ void decodeServerKeysValue(const ValueRef& value,
 		assigned = true;
 		emptyRange = true;
 		id = anonymousShardId;
-	} else if (value == serverKeysFalse) {
-		assigned = false;
-		emptyRange = false;
-		id = UID();
 	} else {
 		BinaryReader rd(value, IncludeVersion());
 		ASSERT(rd.protocolVersion().hasShardEncodeLocationMetaData());
@@ -631,54 +644,11 @@ void decodeServerKeysValue(const ValueRef& value,
 	}
 }
 
-const KeyRef cacheKeysPrefix = "\xff\x02/cacheKeys/"_sr;
-
-const Key cacheKeysKey(uint16_t idx, const KeyRef& key) {
-	BinaryWriter wr(Unversioned());
-	wr.serializeBytes(cacheKeysPrefix);
-	wr << idx;
-	wr.serializeBytes("/"_sr);
-	wr.serializeBytes(key);
-	return wr.toValue();
-}
-const Key cacheKeysPrefixFor(uint16_t idx) {
-	BinaryWriter wr(Unversioned());
-	wr.serializeBytes(cacheKeysPrefix);
-	wr << idx;
-	wr.serializeBytes("/"_sr);
-	return wr.toValue();
-}
-uint16_t cacheKeysDecodeIndex(const KeyRef& key) {
-	uint16_t idx;
-	BinaryReader rd(key.removePrefix(cacheKeysPrefix), Unversioned());
-	rd >> idx;
-	return idx;
-}
-KeyRef cacheKeysDecodeKey(const KeyRef& key) {
-	return key.substr(cacheKeysPrefix.size() + sizeof(uint16_t) + 1);
-}
-
-const KeyRef cacheChangeKey = "\xff\x02/cacheChangeKey"_sr;
-const KeyRangeRef cacheChangeKeys("\xff\x02/cacheChangeKeys/"_sr, "\xff\x02/cacheChangeKeys0"_sr);
-const KeyRef cacheChangePrefix = cacheChangeKeys.begin;
-const Key cacheChangeKeyFor(uint16_t idx) {
-	BinaryWriter wr(Unversioned());
-	wr.serializeBytes(cacheChangePrefix);
-	wr << idx;
-	return wr.toValue();
-}
-uint16_t cacheChangeKeyDecodeIndex(const KeyRef& key) {
-	uint16_t idx;
-	BinaryReader rd(key.removePrefix(cacheChangePrefix), Unversioned());
-	rd >> idx;
-	return idx;
-}
-
 const KeyRangeRef tssMappingKeys("\xff/tss/"_sr, "\xff/tss0"_sr);
 
 const KeyRangeRef tssQuarantineKeys("\xff/tssQ/"_sr, "\xff/tssQ0"_sr);
 
-const Key tssQuarantineKeyFor(UID serverID) {
+Key tssQuarantineKeyFor(UID serverID) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(tssQuarantineKeys.begin);
 	wr << serverID;
@@ -720,28 +690,28 @@ const KeyRef serverTagConflictPrefix = serverTagConflictKeys.begin;
 const KeyRangeRef serverTagHistoryKeys("\xff/serverTagHistory/"_sr, "\xff/serverTagHistory0"_sr);
 const KeyRef serverTagHistoryPrefix = serverTagHistoryKeys.begin;
 
-const Key serverTagKeyFor(UID serverID) {
+Key serverTagKeyFor(UID serverID) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(serverTagKeys.begin);
 	wr << serverID;
 	return wr.toValue();
 }
 
-const Key serverTagHistoryKeyFor(UID serverID) {
+Key serverTagHistoryKeyFor(UID serverID) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(serverTagHistoryKeys.begin);
 	wr << serverID;
 	return addVersionStampAtEnd(wr.toValue());
 }
 
-const KeyRange serverTagHistoryRangeFor(UID serverID) {
+KeyRange serverTagHistoryRangeFor(UID serverID) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(serverTagHistoryKeys.begin);
 	wr << serverID;
 	return prefixRange(wr.toValue());
 }
 
-const KeyRange serverTagHistoryRangeBefore(UID serverID, Version version) {
+KeyRange serverTagHistoryRangeBefore(UID serverID, Version version) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(serverTagHistoryKeys.begin);
 	wr << serverID;
@@ -754,7 +724,7 @@ const KeyRange serverTagHistoryRangeBefore(UID serverID, Version version) {
 	return KeyRangeRef(wr.toValue(), versionStr.withPrefix(wr.toValue()));
 }
 
-const Value serverTagValue(Tag tag) {
+Value serverTagValue(Tag tag) {
 	BinaryWriter wr(IncludeVersion(ProtocolVersion::withServerTagValue()));
 	wr << tag;
 	return wr.toValue();
@@ -782,7 +752,7 @@ Tag decodeServerTagValue(ValueRef const& value) {
 	return s;
 }
 
-const Key serverTagConflictKeyFor(Tag tag) {
+Key serverTagConflictKeyFor(Tag tag) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(serverTagConflictKeys.begin);
 	wr << tag;
@@ -792,14 +762,14 @@ const Key serverTagConflictKeyFor(Tag tag) {
 const KeyRangeRef tagLocalityListKeys("\xff/tagLocalityList/"_sr, "\xff/tagLocalityList0"_sr);
 const KeyRef tagLocalityListPrefix = tagLocalityListKeys.begin;
 
-const Key tagLocalityListKeyFor(Optional<Value> dcID) {
+Key tagLocalityListKeyFor(Optional<Value> dcID) {
 	BinaryWriter wr(AssumeVersion(currentProtocolVersion()));
 	wr.serializeBytes(tagLocalityListKeys.begin);
 	wr << dcID;
 	return wr.toValue();
 }
 
-const Value tagLocalityListValue(int8_t const& tagLocality) {
+Value tagLocalityListValue(int8_t const& tagLocality) {
 	BinaryWriter wr(IncludeVersion(ProtocolVersion::withTagLocalityListValue()));
 	wr << tagLocality;
 	return wr.toValue();
@@ -817,17 +787,279 @@ int8_t decodeTagLocalityListValue(ValueRef const& value) {
 	return s;
 }
 
+const KeyRangeRef cdcStreamNameKeys("\xff/cdc/name/"_sr, "\xff/cdc/name0"_sr);
+const KeyRef cdcMaxStreamIdKey = "\xff/cdc/maxStreamId"_sr;
+const KeyRangeRef cdcStreamKeys("\xff/cdc/keys/"_sr, "\xff/cdc/keys0"_sr);
+const KeyRangeRef cdcTagHistoryKeys("\xff/cdc/tagHistory/"_sr, "\xff/cdc/tagHistory0"_sr);
+const KeyRangeRef cdcTagLoadKeys("\xff\x02/cdc/tagLoad/"_sr, "\xff\x02/cdc/tagLoad0"_sr);
+const KeyRangeRef cdcTagOwnerKeys("\xff\x02/cdc/tagOwner/"_sr, "\xff\x02/cdc/tagOwner0"_sr);
+const KeyRangeRef cdcMinVersionKeys("\xff\x02/cdc/minVersion/"_sr, "\xff\x02/cdc/minVersion0"_sr);
+const KeyRangeRef cdcRetiredTagPopKeys("\xff/cdc/retiredTagPop/"_sr, "\xff/cdc/retiredTagPop0"_sr);
+const KeyRangeRef cdcRetiredTagPopVersionKeys("\xff\x02/cdc/retiredTagPopVersion/"_sr,
+                                              "\xff\x02/cdc/retiredTagPopVersion0"_sr);
+const KeyRangeRef cdcProxyKeys("\xff/cdc/proxies/"_sr, "\xff/cdc/proxies0"_sr);
+const KeyRef cdcProxyAssignmentChangeKey = "\xff/cdc/proxyAssignmentChange"_sr;
+
+Key cdcStreamNameKeyFor(KeyRef const& streamName) {
+	return streamName.withPrefix(cdcStreamNameKeys.begin);
+}
+
+Key decodeCDCStreamNameKey(KeyRef const& key) {
+	return key.removePrefix(cdcStreamNameKeys.begin);
+}
+
+Value cdcStreamNameValue(CDCStreamId streamId) {
+	BinaryWriter wr(IncludeVersion(ProtocolVersion::withNativeCdc()));
+	wr << streamId;
+	return wr.toValue();
+}
+
+CDCStreamId decodeCDCStreamNameValue(ValueRef const& value) {
+	CDCStreamId streamId;
+	BinaryReader reader(value, IncludeVersion());
+	ASSERT_WE_THINK(reader.protocolVersion().hasNativeCdc());
+	reader >> streamId;
+	return streamId;
+}
+
+Value cdcMaxStreamIdValue(CDCStreamId streamId) {
+	return cdcStreamNameValue(streamId);
+}
+
+CDCStreamId decodeCDCMaxStreamIdValue(ValueRef const& value) {
+	return decodeCDCStreamNameValue(value);
+}
+
+Key cdcStreamKeyFor(CDCStreamId streamId) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(cdcStreamKeys.begin);
+	wr << streamId;
+	return wr.toValue();
+}
+
+CDCStreamId decodeCDCStreamKey(KeyRef const& key) {
+	CDCStreamId streamId;
+	BinaryReader reader(key.removePrefix(cdcStreamKeys.begin), Unversioned());
+	reader >> streamId;
+	return streamId;
+}
+
+Value cdcStreamKeysValue(std::vector<KeyRange> const& ranges) {
+	BinaryWriter wr(IncludeVersion(ProtocolVersion::withNativeCdc()));
+	wr << ranges;
+	return wr.toValue();
+}
+
+std::vector<KeyRange> decodeCDCStreamKeysValue(ValueRef const& value) {
+	std::vector<KeyRange> ranges;
+	BinaryReader reader(value, IncludeVersion());
+	ASSERT_WE_THINK(reader.protocolVersion().hasNativeCdc());
+	reader >> ranges;
+	return ranges;
+}
+
+static Key cdcTagHistoryPrefixFor(CDCStreamId streamId) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(cdcTagHistoryKeys.begin);
+	wr << streamId;
+	return wr.toValue();
+}
+
+Key cdcTagHistoryKeyFor(CDCStreamId streamId, Version version, Tag tag) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(cdcTagHistoryPrefixFor(streamId));
+
+	Version encodedVersion = bigEndian64(version);
+	Key versionBytes = makeString(sizeof(encodedVersion));
+	memcpy(mutateString(versionBytes), &encodedVersion, sizeof(encodedVersion));
+	wr.serializeBytes(versionBytes);
+	wr << tag;
+	return wr.toValue();
+}
+
+KeyRange cdcTagHistoryRangeFor(CDCStreamId streamId) {
+	return prefixRange(cdcTagHistoryPrefixFor(streamId));
+}
+
+CDCTagHistoryEntry decodeCDCTagHistoryKey(KeyRef const& key) {
+	CDCStreamId streamId;
+	Version encodedVersion;
+	Tag tag;
+	BinaryReader reader(key.removePrefix(cdcTagHistoryKeys.begin), Unversioned());
+	reader >> streamId >> encodedVersion >> tag;
+	return CDCTagHistoryEntry(streamId, bigEndian64(encodedVersion), tag);
+}
+
+CDCTagHistoryEntry decodeCDCTagHistoryEntry(KeyRef const& key, ValueRef const& value) {
+	CDCTagHistoryEntry result = decodeCDCTagHistoryKey(key);
+	if (!value.empty()) {
+		if (value.size() != sizeof(Version) + sizeof(uint16_t)) {
+			throw serialization_failed();
+		}
+		const Version committedVersion = decodeCDCMinVersionValue(value);
+		if (committedVersion <= result.version) {
+			throw serialization_failed();
+		}
+		result.version = committedVersion;
+	}
+	return result;
+}
+
+Key cdcTagLoadKeyFor(Tag tag) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(cdcTagLoadKeys.begin);
+	wr << tag;
+	return wr.toValue();
+}
+
+Tag decodeCDCTagLoadKey(KeyRef const& key) {
+	Tag tag;
+	BinaryReader reader(key.removePrefix(cdcTagLoadKeys.begin), Unversioned());
+	reader >> tag;
+	return tag;
+}
+
+Value cdcTagLoadValue(CDCTagLoadSample const& sample) {
+	BinaryWriter wr(IncludeVersion(ProtocolVersion::withNativeCdc()));
+	wr << sample.assignmentChange << sample.sampleVersion << sample.validThrough << sample.bytesWrittenPerKSecond;
+	return wr.toValue();
+}
+
+CDCTagLoadSample decodeCDCTagLoadValue(ValueRef const& value) {
+	CDCTagLoadSample sample;
+	BinaryReader reader(value, IncludeVersion());
+	ASSERT_WE_THINK(reader.protocolVersion().hasNativeCdc());
+	reader >> sample.assignmentChange >> sample.sampleVersion >> sample.validThrough >> sample.bytesWrittenPerKSecond;
+	return sample;
+}
+
+Key cdcTagOwnerKeyFor(Tag tag) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(cdcTagOwnerKeys.begin);
+	wr << tag;
+	return wr.toValue();
+}
+
+Tag decodeCDCTagOwnerKey(KeyRef const& key) {
+	Tag tag;
+	BinaryReader reader(key.removePrefix(cdcTagOwnerKeys.begin), Unversioned());
+	reader >> tag;
+	return tag;
+}
+
+Value cdcTagOwnerValue(CDCStreamId streamId) {
+	return cdcStreamNameValue(streamId);
+}
+
+CDCStreamId decodeCDCTagOwnerValue(ValueRef const& value) {
+	return decodeCDCStreamNameValue(value);
+}
+
+Key cdcMinVersionKeyFor(CDCStreamId streamId) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(cdcMinVersionKeys.begin);
+	wr << streamId;
+	return wr.toValue();
+}
+
+CDCStreamId decodeCDCMinVersionKey(KeyRef const& key) {
+	CDCStreamId streamId;
+	BinaryReader reader(key.removePrefix(cdcMinVersionKeys.begin), Unversioned());
+	reader >> streamId;
+	return streamId;
+}
+
+Value cdcMinVersionValue(Version version) {
+	BinaryWriter wr(IncludeVersion(ProtocolVersion::withNativeCdc()));
+	wr << version;
+	return wr.toValue();
+}
+
+Value cdcVersionstampedMinVersionValue() {
+	// Ten placeholder bytes followed by the versionstamp offset at byte zero.
+	return "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"_sr;
+}
+
+Version decodeCDCMinVersionValue(ValueRef const& value) {
+	if (value.size() == sizeof(Version) + sizeof(uint16_t)) {
+		Versionstamp versionstamp;
+		BinaryReader reader(value, Unversioned());
+		reader >> versionstamp;
+		return versionstamp.version;
+	}
+
+	Version version;
+	BinaryReader reader(value, IncludeVersion());
+	ASSERT_WE_THINK(reader.protocolVersion().hasNativeCdc());
+	reader >> version;
+	return version;
+}
+
+Key cdcRetiredTagPopKeyFor(Tag tag) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(cdcRetiredTagPopKeys.begin);
+	wr << tag;
+	return wr.toValue();
+}
+
+Tag decodeCDCRetiredTagPopKey(KeyRef const& key) {
+	Tag tag;
+	BinaryReader reader(key.removePrefix(cdcRetiredTagPopKeys.begin), Unversioned());
+	reader >> tag;
+	return tag;
+}
+
+Key cdcRetiredTagPopVersionKeyFor(Tag tag) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(cdcRetiredTagPopVersionKeys.begin);
+	wr << tag;
+	return wr.toValue();
+}
+
+Tag decodeCDCRetiredTagPopVersionKey(KeyRef const& key) {
+	Tag tag;
+	BinaryReader reader(key.removePrefix(cdcRetiredTagPopVersionKeys.begin), Unversioned());
+	reader >> tag;
+	return tag;
+}
+
+static Key cdcProxyPrefixFor(CDCStreamId streamId) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(cdcProxyKeys.begin);
+	wr << streamId;
+	return wr.toValue();
+}
+
+Key cdcProxyKeyFor(CDCStreamId streamId, UID proxyId) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(cdcProxyPrefixFor(streamId));
+	wr << proxyId;
+	return wr.toValue();
+}
+
+KeyRange cdcProxyRangeFor(CDCStreamId streamId) {
+	return prefixRange(cdcProxyPrefixFor(streamId));
+}
+
+std::pair<CDCStreamId, UID> decodeCDCProxyKey(KeyRef const& key) {
+	CDCStreamId streamId;
+	UID proxyId;
+	BinaryReader reader(key.removePrefix(cdcProxyKeys.begin), Unversioned());
+	reader >> streamId >> proxyId;
+	return { streamId, proxyId };
+}
+
 const KeyRangeRef datacenterReplicasKeys("\xff\x02/datacenterReplicas/"_sr, "\xff\x02/datacenterReplicas0"_sr);
 const KeyRef datacenterReplicasPrefix = datacenterReplicasKeys.begin;
 
-const Key datacenterReplicasKeyFor(Optional<Value> dcID) {
+Key datacenterReplicasKeyFor(Optional<Value> dcID) {
 	BinaryWriter wr(AssumeVersion(currentProtocolVersion()));
 	wr.serializeBytes(datacenterReplicasKeys.begin);
 	wr << dcID;
 	return wr.toValue();
 }
 
-const Value datacenterReplicasValue(int const& replicas) {
+Value datacenterReplicasValue(int const& replicas) {
 	BinaryWriter wr(IncludeVersion(ProtocolVersion::withDatacenterReplicasValue()));
 	wr << replicas;
 	return wr.toValue();
@@ -848,12 +1080,12 @@ int decodeDatacenterReplicasValue(ValueRef const& value) {
 //    "\xff\x02/tLogDatacenters/[[datacenterID]]"
 extern const KeyRangeRef tLogDatacentersKeys;
 extern const KeyRef tLogDatacentersPrefix;
-const Key tLogDatacentersKeyFor(Optional<Value> dcID);
+Key tLogDatacentersKeyFor(Optional<Value> dcID);
 
 const KeyRangeRef tLogDatacentersKeys("\xff\x02/tLogDatacenters/"_sr, "\xff\x02/tLogDatacenters0"_sr);
 const KeyRef tLogDatacentersPrefix = tLogDatacentersKeys.begin;
 
-const Key tLogDatacentersKeyFor(Optional<Value> dcID) {
+Key tLogDatacentersKeyFor(Optional<Value> dcID) {
 	BinaryWriter wr(AssumeVersion(currentProtocolVersion()));
 	wr.serializeBytes(tLogDatacentersKeys.begin);
 	wr << dcID;
@@ -872,14 +1104,14 @@ const KeyRef primaryDatacenterKey = "\xff/primaryDatacenter"_sr;
 const KeyRangeRef serverListKeys("\xff/serverList/"_sr, "\xff/serverList0"_sr);
 const KeyRef serverListPrefix = serverListKeys.begin;
 
-const Key serverListKeyFor(UID serverID) {
+Key serverListKeyFor(UID serverID) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(serverListKeys.begin);
 	wr << serverID;
 	return wr.toValue();
 }
 
-const Value serverListValue(StorageServerInterface const& server) {
+Value serverListValue(StorageServerInterface const& server) {
 	auto protocolVersion = currentProtocolVersion();
 	protocolVersion.addObjectSerializerFlag();
 	return ObjectWriter::toValue(server, IncludeVersion(protocolVersion));
@@ -928,14 +1160,14 @@ const KeyRef processClassChangeKey = "\xff/processClassChanges"_sr;
 const KeyRef processClassVersionKey = "\xff/processClassChangesVersion"_sr;
 const ValueRef processClassVersionValue = "1"_sr;
 
-const Key processClassKeyFor(StringRef processID) {
+Key processClassKeyFor(StringRef processID) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(processClassKeys.begin);
 	wr << processID;
 	return wr.toValue();
 }
 
-const Value processClassValue(ProcessClass const& processClass) {
+Value processClassValue(ProcessClass const& processClass) {
 	BinaryWriter wr(IncludeVersion(ProtocolVersion::withProcessClassValue()));
 	wr << processClass;
 	return wr.toValue();
@@ -966,6 +1198,7 @@ const KeyRangeRef configKeys("\xff/conf/"_sr, "\xff/conf0"_sr);
 const KeyRef configKeysPrefix = configKeys.begin;
 
 const KeyRef backupWorkerEnabledKey("\xff/conf/backup_worker_enabled"_sr);
+const KeyRef rangePartitionedBackupWorkerEnabledKey("\xff/conf/range_partitioned_backup_worker_enabled"_sr);
 const KeyRef perpetualStorageWiggleKey("\xff/conf/perpetual_storage_wiggle"_sr);
 const KeyRef perpetualStorageWiggleLocalityKey("\xff/conf/perpetual_storage_wiggle_locality"_sr);
 // The below two are there for compatible upgrade and downgrade. After 7.3, the perpetual wiggle related keys should use
@@ -1046,14 +1279,14 @@ const KeyRef globalConfigVersionKey = "\xff/globalConfig/v"_sr;
 const KeyRangeRef workerListKeys("\xff/worker/"_sr, "\xff/worker0"_sr);
 const KeyRef workerListPrefix = workerListKeys.begin;
 
-const Key workerListKeyFor(StringRef processID) {
+Key workerListKeyFor(StringRef processID) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(workerListKeys.begin);
 	wr << processID;
 	return wr.toValue();
 }
 
-const Value workerListValue(ProcessData const& processData) {
+Value workerListValue(ProcessData const& processData) {
 	BinaryWriter wr(IncludeVersion(ProtocolVersion::withWorkerListValue()));
 	wr << processData;
 	return wr.toValue();
@@ -1078,14 +1311,14 @@ const KeyRef backupProgressPrefix = backupProgressKeys.begin;
 const KeyRef backupStartedKey = "\xff\x02/backupStarted"_sr;
 extern const KeyRef backupPausedKey = "\xff\x02/backupPaused"_sr;
 
-const Key backupProgressKeyFor(UID workerID) {
+Key backupProgressKeyFor(UID workerID) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(backupProgressPrefix);
 	wr << workerID;
 	return wr.toValue();
 }
 
-const Value backupProgressValue(const WorkerBackupStatus& status) {
+Value backupProgressValue(const WorkerBackupStatus& status) {
 	BinaryWriter wr(IncludeVersion(ProtocolVersion::withBackupProgressValue()));
 	wr << status;
 	return wr.toValue();
@@ -1105,6 +1338,32 @@ WorkerBackupStatus decodeBackupProgressValue(const ValueRef& value) {
 	return status;
 }
 
+const KeyRangeRef backupPartitionMapHistoryKeys("\xff\x02/backupPartitionMap/"_sr, "\xff\x02/backupPartitionMap0"_sr);
+
+Key backupPartitionMapHistoryKeyFor(LogEpoch epoch, Version version) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(backupPartitionMapHistoryKeys.begin);
+	wr << bigEndian64(epoch) << bigEndian64(version);
+	return wr.toValue();
+}
+
+KeyRange backupPartitionMapHistoryRangeFor(LogEpoch epoch) {
+	BinaryWriter beginW(Unversioned());
+	beginW.serializeBytes(backupPartitionMapHistoryKeys.begin);
+	beginW << bigEndian64(epoch);
+	BinaryWriter endW(Unversioned());
+	endW.serializeBytes(backupPartitionMapHistoryKeys.begin);
+	endW << bigEndian64(epoch + 1);
+	return KeyRangeRef(beginW.toValue(), endW.toValue());
+}
+
+std::pair<LogEpoch, Version> decodeBackupPartitionMapHistoryKey(const KeyRef& key) {
+	BinaryReader rd(key.removePrefix(backupPartitionMapHistoryKeys.begin), Unversioned());
+	int64_t epoch, version;
+	rd >> epoch >> version;
+	return { fromBigEndian64(epoch), fromBigEndian64(version) };
+}
+
 Value encodeBackupStartedValue(const std::vector<std::pair<UID, Version>>& ids) {
 	BinaryWriter wr(IncludeVersion(ProtocolVersion::withBackupStartValue()));
 	wr << ids;
@@ -1114,9 +1373,42 @@ Value encodeBackupStartedValue(const std::vector<std::pair<UID, Version>>& ids) 
 std::vector<std::pair<UID, Version>> decodeBackupStartedValue(const ValueRef& value) {
 	std::vector<std::pair<UID, Version>> ids;
 	BinaryReader reader(value, IncludeVersion());
-	if (value.size() > 0)
+	if (!value.empty())
 		reader >> ids;
 	return ids;
+}
+
+const KeyRef backupPartitionRequiredKey = "\xff\x02/backupPartitionRequired"_sr;
+const KeyRef backupPartitionListKey = "\xff\x02/backupPartitionList"_sr;
+
+Value backupPartitionRequiredValue(int8_t requestType) {
+	BinaryWriter wr(Unversioned());
+	wr << requestType;
+	return wr.toValue();
+}
+
+int8_t decodeBackupPartitionRequiredValue(const ValueRef& value) {
+	int8_t requestType = 0;
+	if (!value.empty()) {
+		BinaryReader reader(value, Unversioned());
+		reader >> requestType;
+	}
+	return requestType;
+}
+
+Value encodeBackupPartitionListValue(const std::vector<KeyRange>& partitions) {
+	BinaryWriter wr(IncludeVersion());
+	wr << partitions;
+	return wr.toValue();
+}
+
+std::vector<KeyRange> decodeBackupPartitionListValue(const ValueRef& value) {
+	std::vector<KeyRange> partitions;
+	if (!value.empty()) {
+		BinaryReader reader(value, IncludeVersion());
+		reader >> partitions;
+	}
+	return partitions;
 }
 
 bool mutationForKey(const MutationRef& m, const KeyRef& key) {
@@ -1156,7 +1448,7 @@ const KeyRef bulkLoadModeKey = "\xff/bulkLoadMode"_sr;
 const KeyRangeRef bulkLoadTaskKeys = KeyRangeRef("\xff/bulkLoadTask/"_sr, "\xff/bulkLoadTask0"_sr);
 const KeyRef bulkLoadTaskPrefix = bulkLoadTaskKeys.begin;
 
-const Value bulkLoadTaskStateValue(const BulkLoadTaskState& bulkLoadTaskState) {
+Value bulkLoadTaskStateValue(const BulkLoadTaskState& bulkLoadTaskState) {
 	return ObjectWriter::toValue(bulkLoadTaskState, IncludeVersion());
 }
 
@@ -1167,7 +1459,7 @@ BulkLoadTaskState decodeBulkLoadTaskState(const ValueRef& value) {
 	return bulkLoadTaskState;
 }
 
-const Value ssBulkLoadMetadataValue(const SSBulkLoadMetadata& ssBulkLoadMetadata) {
+Value ssBulkLoadMetadataValue(const SSBulkLoadMetadata& ssBulkLoadMetadata) {
 	return ObjectWriter::toValue(ssBulkLoadMetadata, IncludeVersion());
 }
 
@@ -1181,7 +1473,7 @@ SSBulkLoadMetadata decodeSSBulkLoadMetadata(const ValueRef& value) {
 const KeyRangeRef bulkLoadJobKeys = KeyRangeRef("\xff/bulkLoadJob/"_sr, "\xff/bulkLoadJob0"_sr);
 const KeyRef bulkLoadJobPrefix = bulkLoadJobKeys.begin;
 
-const Value bulkLoadJobValue(const BulkLoadJobState& bulkLoadJobState) {
+Value bulkLoadJobValue(const BulkLoadJobState& bulkLoadJobState) {
 	return ObjectWriter::toValue(bulkLoadJobState, IncludeVersion());
 }
 
@@ -1197,7 +1489,7 @@ const KeyRef bulkLoadJobHistoryPrefix = bulkLoadJobHistoryKeys.begin;
 
 // BulkLoad job with the same jobId can run for multiple times, we only keep the latest one
 // in the history.
-const Key bulkLoadJobHistoryKeyFor(const UID& jobId) {
+Key bulkLoadJobHistoryKeyFor(const UID& jobId) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(bulkLoadJobHistoryPrefix);
 	wr.serializeBytes(StringRef(jobId.toString()));
@@ -1209,7 +1501,7 @@ const KeyRef bulkDumpModeKey = "\xff/bulkDumpMode"_sr;
 const KeyRangeRef bulkDumpKeys = KeyRangeRef("\xff/bulkDump/"_sr, "\xff/bulkDump0"_sr);
 const KeyRef bulkDumpPrefix = bulkDumpKeys.begin;
 
-const Value bulkDumpStateValue(const BulkDumpState& bulkDumpState) {
+Value bulkDumpStateValue(const BulkDumpState& bulkDumpState) {
 	return ObjectWriter::toValue(bulkDumpState, IncludeVersion());
 }
 
@@ -1220,13 +1512,35 @@ BulkDumpState decodeBulkDumpState(const ValueRef& value) {
 	return bulkDumpState;
 }
 
+// BulkDump owner tracking - stored separately for backward compatibility
+const KeyRangeRef bulkDumpOwnerKeys = KeyRangeRef("\xff/bulkDumpOwner/"_sr, "\xff/bulkDumpOwner0"_sr);
+const KeyRef bulkDumpOwnerPrefix = bulkDumpOwnerKeys.begin;
+
+Key bulkDumpOwnerKeyFor(const UID& jobId) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(bulkDumpOwnerPrefix);
+	wr << jobId;
+	return wr.toValue();
+}
+
+// BulkLoad owner tracking - stored separately for backward compatibility
+const KeyRangeRef bulkLoadOwnerKeys = KeyRangeRef("\xff/bulkLoadOwner/"_sr, "\xff/bulkLoadOwner0"_sr);
+const KeyRef bulkLoadOwnerPrefix = bulkLoadOwnerKeys.begin;
+
+Key bulkLoadOwnerKeyFor(const UID& jobId) {
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes(bulkLoadOwnerPrefix);
+	wr << jobId;
+	return wr.toValue();
+}
+
 // Range Lock
 const std::string rangeLockNameForBulkLoad = "BulkLoad";
 
 const KeyRangeRef rangeLockKeys = KeyRangeRef("\xff/rangeLock/"_sr, "\xff/rangeLock0"_sr);
 const KeyRef rangeLockPrefix = rangeLockKeys.begin;
 
-const Value rangeLockStateSetValue(const RangeLockStateSet& rangeLockStateSet) {
+Value rangeLockStateSetValue(const RangeLockStateSet& rangeLockStateSet) {
 	return ObjectWriter::toValue(rangeLockStateSet, IncludeVersion());
 }
 
@@ -1240,14 +1554,14 @@ RangeLockStateSet decodeRangeLockStateSet(const ValueRef& value) {
 const KeyRangeRef rangeLockOwnerKeys = KeyRangeRef("\xff/rangeLockOwner/"_sr, "\xff/rangeLockOwner0"_sr);
 const KeyRef rangeLockOwnerPrefix = rangeLockOwnerKeys.begin;
 
-const Key rangeLockOwnerKeyFor(const RangeLockOwnerName& ownerUniqueID) {
+Key rangeLockOwnerKeyFor(const RangeLockOwnerName& ownerUniqueID) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(rangeLockOwnerPrefix);
 	wr.serializeBytes(StringRef(ownerUniqueID));
 	return wr.toValue();
 }
 
-const Value rangeLockOwnerValue(const RangeLockOwner& rangeLockOwner) {
+Value rangeLockOwnerValue(const RangeLockOwner& rangeLockOwner) {
 	return ObjectWriter::toValue(rangeLockOwner, IncludeVersion());
 }
 
@@ -1269,7 +1583,7 @@ const KeyRef tagThrottleCountKey = "\xff\x02/throttledTags/manualThrottleCount"_
 
 // Client status info prefix
 const KeyRangeRef fdbClientInfoPrefixRange("\xff\x02/fdbClientInfo/"_sr, "\xff\x02/fdbClientInfo0"_sr);
-// See remaining fields in GlobalConfig.actor.h
+// See remaining fields in GlobalConfig.h
 
 // ConsistencyCheck settings
 const KeyRef fdbShouldConsistencyCheckBeSuspended = "\xff\x02/ConsistencyCheck/Suspend"_sr;
@@ -1476,13 +1790,12 @@ const KeyRef mustContainSystemMutationsKey = "\xff/mustContainSystemMutations"_s
 
 const KeyRangeRef monitorConfKeys("\xff\x02/monitorConf/"_sr, "\xff\x02/monitorConf0"_sr);
 
-const KeyRef restoreRequestDoneKey = "\xff\x02/restoreRequestDone"_sr;
-
 const KeyRef healthyZoneKey = "\xff\x02/healthyZone"_sr;
 const StringRef ignoreSSFailuresZoneString = "IgnoreSSFailures"_sr;
+const KeyRef healthyZoneStartVersionKey = "\xff\x02/healthyZoneStartVersion"_sr;
 const KeyRef rebalanceDDIgnoreKey = "\xff\x02/rebalanceDDIgnored"_sr;
 
-const Value healthyZoneValue(StringRef const& zoneId, Version version) {
+Value healthyZoneValue(StringRef const& zoneId, Version version) {
 	BinaryWriter wr(IncludeVersion(ProtocolVersion::withHealthyZoneValue()));
 	wr << zoneId;
 	wr << version;
@@ -1533,7 +1846,7 @@ void testSSISerdes(StorageServerInterface const& ssi) {
 	ASSERT(ssi.isTss() == ssi2.isTss());
 	ASSERT(ssi.isAcceptingRequests() == ssi2.isAcceptingRequests());
 	if (ssi.isTss()) {
-		ASSERT(ssi2.tssPairID.get() == ssi2.tssPairID.get());
+		ASSERT(ssi.tssPairID.get() == ssi2.tssPairID.get());
 	}
 	ASSERT(ssi.address() == ssi2.address());
 	ASSERT(ssi.getValue.getEndpoint().token == ssi2.getValue.getEndpoint().token);
@@ -1551,7 +1864,9 @@ TEST_CASE("/SystemData/SerDes/SSI") {
 	StorageServerInterface ssi;
 	ssi.uniqueID = UID(0x1234123412341234, 0x5678567856785678);
 	ssi.locality = localityData;
-	ssi.initEndpoints();
+	// This test only needs a serializable endpoint; registering one requires a FlowTransport instance.
+	ssi.getValue =
+	    PublicRequestStream<GetValueRequest>(Endpoint({ NetworkAddress(IPAddress(0x01010101), 1) }, UID(1, 2)));
 
 	testSSISerdes(ssi);
 
@@ -1670,6 +1985,85 @@ TEST_CASE("noSim/SystemData/DataMoveId") {
 	ASSERT(type == decodeType && reason == decodeReason);
 
 	printf("testing data move ID encoding/decoding complete\n");
+
+	return Void();
+}
+
+TEST_CASE("/SystemData/NativeCDC") {
+	const Key name = "orders"_sr;
+	const CDCStreamId streamId = 42;
+	const std::vector<KeyRange> ranges{ KeyRangeRef("a"_sr, "c"_sr), KeyRangeRef("x"_sr, "z"_sr) };
+	const Version minVersion = 123456789;
+	const Tag tag(tagLocalityCDC, 9);
+	const UID proxyId(1, 2);
+
+	ASSERT_EQ(decodeCDCStreamNameKey(cdcStreamNameKeyFor(name)), name);
+	ASSERT_EQ(decodeCDCStreamNameValue(cdcStreamNameValue(streamId)), streamId);
+	ASSERT_EQ(decodeCDCMaxStreamIdValue(cdcMaxStreamIdValue(streamId)), streamId);
+	ASSERT_EQ(decodeCDCStreamKey(cdcStreamKeyFor(streamId)), streamId);
+	ASSERT(decodeCDCStreamKeysValue(cdcStreamKeysValue(ranges)) == ranges);
+	const Key tagOwnerKey = cdcTagOwnerKeyFor(tag);
+	ASSERT_EQ(decodeCDCTagOwnerKey(tagOwnerKey), tag);
+	ASSERT(cdcTagOwnerKeys.contains(tagOwnerKey));
+	ASSERT(nonMetadataSystemKeys.contains(tagOwnerKey));
+	ASSERT_EQ(decodeCDCTagOwnerValue(cdcTagOwnerValue(streamId)), streamId);
+	ASSERT_EQ(decodeCDCMinVersionKey(cdcMinVersionKeyFor(streamId)), streamId);
+	ASSERT_EQ(decodeCDCMinVersionValue(cdcMinVersionValue(minVersion)), minVersion);
+	ASSERT(nonMetadataSystemKeys.contains(cdcMinVersionKeyFor(streamId)));
+	ASSERT_EQ(cdcVersionstampedMinVersionValue().size(), sizeof(Version) + sizeof(uint16_t) + sizeof(int32_t));
+	ASSERT_EQ(decodeCDCRetiredTagPopKey(cdcRetiredTagPopKeyFor(tag)), tag);
+	ASSERT(cdcRetiredTagPopKeys.contains(cdcRetiredTagPopKeyFor(tag)));
+	ASSERT_EQ(decodeCDCRetiredTagPopVersionKey(cdcRetiredTagPopVersionKeyFor(tag)), tag);
+	ASSERT(cdcRetiredTagPopVersionKeys.contains(cdcRetiredTagPopVersionKeyFor(tag)));
+	ASSERT(nonMetadataSystemKeys.contains(cdcRetiredTagPopVersionKeyFor(tag)));
+
+	const Key tagHistoryKey = cdcTagHistoryKeyFor(streamId, minVersion, tag);
+	const CDCTagHistoryEntry decodedTagHistory = decodeCDCTagHistoryKey(tagHistoryKey);
+	ASSERT_EQ(decodedTagHistory.streamId, streamId);
+	ASSERT_EQ(decodedTagHistory.version, minVersion);
+	ASSERT_EQ(decodedTagHistory.tag, tag);
+	ASSERT(cdcTagHistoryRangeFor(streamId).contains(tagHistoryKey));
+	// Current-tag lookup reads this range in reverse, so version ordering must
+	// remain lexicographic even across a byte boundary.
+	const Key earlierTagHistoryKey = cdcTagHistoryKeyFor(streamId, 255, Tag(tagLocalityCDC, 9));
+	const Key laterTagHistoryKey = cdcTagHistoryKeyFor(streamId, 256, Tag(tagLocalityCDC, 0));
+	ASSERT(earlierTagHistoryKey < laterTagHistoryKey);
+	ASSERT(cdcTagHistoryRangeFor(streamId).contains(laterTagHistoryKey));
+	ASSERT_EQ(decodeCDCTagHistoryEntry(tagHistoryKey, ValueRef()).version, minVersion);
+	const Value committedBoundary = BinaryWriter::toValue(Versionstamp(minVersion + 20, 3), Unversioned());
+	const CDCTagHistoryEntry committedHistory = decodeCDCTagHistoryEntry(tagHistoryKey, committedBoundary);
+	ASSERT_EQ(committedHistory.version, minVersion + 20);
+	ASSERT_EQ(committedHistory.tag, tag);
+	ASSERT_EQ(committedHistory.streamId, streamId);
+	bool invalidBoundaryRejected = false;
+	try {
+		decodeCDCTagHistoryEntry(tagHistoryKey, BinaryWriter::toValue(Versionstamp(minVersion, 0), Unversioned()));
+	} catch (Error& e) {
+		ASSERT_EQ(e.code(), error_code_serialization_failed);
+		invalidBoundaryRejected = true;
+	}
+	ASSERT(invalidBoundaryRejected);
+
+	const CDCTagLoadSample sample{ "assignment"_sr, minVersion, minVersion + 100, 123000 };
+	const CDCTagLoadSample decodedSample = decodeCDCTagLoadValue(cdcTagLoadValue(sample));
+	ASSERT_EQ(decodeCDCTagLoadKey(cdcTagLoadKeyFor(tag)), tag);
+	ASSERT(nonMetadataSystemKeys.contains(cdcTagLoadKeyFor(tag)));
+	ASSERT_EQ(decodedSample.assignmentChange, sample.assignmentChange);
+	ASSERT_EQ(decodedSample.sampleVersion, sample.sampleVersion);
+	ASSERT_EQ(decodedSample.validThrough, sample.validThrough);
+	ASSERT_EQ(decodedSample.bytesWrittenPerKSecond, sample.bytesWrittenPerKSecond);
+
+	const Value serializedTagHistory = ObjectWriter::toValue(decodedTagHistory, Unversioned());
+	const auto deserializedTagHistory =
+	    ObjectReader::fromStringRef<CDCTagHistoryEntry>(serializedTagHistory, Unversioned());
+	ASSERT_EQ(deserializedTagHistory.streamId, streamId);
+	ASSERT_EQ(deserializedTagHistory.version, minVersion);
+	ASSERT_EQ(deserializedTagHistory.tag, tag);
+
+	const auto [proxyStreamId, decodedProxyId] = decodeCDCProxyKey(cdcProxyKeyFor(streamId, proxyId));
+	ASSERT_EQ(proxyStreamId, streamId);
+	ASSERT_EQ(decodedProxyId, proxyId);
+	ASSERT(cdcProxyRangeFor(streamId).contains(cdcProxyKeyFor(streamId, proxyId)));
 
 	return Void();
 }

@@ -53,7 +53,7 @@ struct MapHarness {
 	struct result {
 		typename map::const_iterator it;
 
-		result(typename map::const_iterator it) : it(it) {}
+		explicit result(typename map::const_iterator it) : it(it) {}
 
 		result& operator++() {
 			it++;
@@ -89,6 +89,7 @@ void treeBenchmark(T& tree, F generateKey) {
 	int keyCount = 1000000;
 
 	std::vector<key> keys;
+	keys.reserve(keyCount);
 	for (int i = 0; i < keyCount; i++) {
 		keys.push_back(generateKey());
 	}

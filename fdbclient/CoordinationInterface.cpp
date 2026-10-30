@@ -18,30 +18,23 @@
  * limitations under the License.
  */
 
-#include "flow/Platform.h"
-#include <algorithm>
-
-#ifndef BOOST_SYSTEM_NO_LIB
-#define BOOST_SYSTEM_NO_LIB
-#endif
 #ifndef BOOST_DATE_TIME_NO_LIB
 #define BOOST_DATE_TIME_NO_LIB
 #endif
 #ifndef BOOST_REGEX_NO_LIB
 #define BOOST_REGEX_NO_LIB
 #endif
-#include "boost/asio.hpp"
+#include <boost/asio.hpp>
 #include "fdbclient/CoordinationInterface.h"
-#include "flow/actorcompiler.h"
 
 IPAddress ClusterConnectionString::determineLocalSourceIP() const {
 	int size = coords.size() + hostnames.size();
 	int index = 0;
-	loop {
+	while (true) {
 		try {
 			using namespace boost::asio;
 
-			io_service ioService;
+			io_context ioService;
 			ip::udp::socket socket(ioService);
 
 			NetworkAddress coordAddr;
@@ -62,7 +55,7 @@ IPAddress ClusterConnectionString::determineLocalSourceIP() const {
 			ip::udp::endpoint endpoint(boostIp, coordAddr.port);
 			socket.connect(endpoint);
 			IPAddress ip = coordAddr.ip.isV6() ? IPAddress(socket.local_endpoint().address().to_v6().to_bytes())
-			                                   : IPAddress(socket.local_endpoint().address().to_v4().to_ulong());
+			                                   : IPAddress(socket.local_endpoint().address().to_v4().to_uint());
 			socket.close();
 
 			return ip;

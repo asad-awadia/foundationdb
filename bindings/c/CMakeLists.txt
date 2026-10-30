@@ -55,6 +55,7 @@ if(OPEN_FOR_IDE)
 else()
   add_library(fdb_c SHARED ${FDB_C_SRCS} ${fdb_c_apiversion_file} ${asm_file})
   strip_debug_symbols(fdb_c)
+  add_custom_target(stripped_fdb_c ALL DEPENDS strip_only_fdb_c)
 endif()
 add_dependencies(fdb_c fdb_c_generated fdb_c_options)
 add_dependencies(fdbclient fdb_c_options)
@@ -178,7 +179,9 @@ if(NOT WIN32)
     add_library(fdb_c_ryw_benchmark OBJECT test/ryw_benchmark.c test/test.h)
     add_library(fdb_c_txn_size_test OBJECT test/txn_size_test.c test/test.h)
     add_library(fdb_c_client_memory_test OBJECT test/client_memory_test.cpp test/unit/fdb_api.cpp test/unit/fdb_api.hpp)
-    add_library(mako OBJECT ${MAKO_SRCS})
+    if(BUILD_MAKO)
+      add_library(mako OBJECT ${MAKO_SRCS})
+    endif()
     add_library(fdb_c_setup_tests OBJECT test/unit/setup_tests.cpp)
     add_library(fdb_c_unit_tests_version_510 OBJECT ${UNIT_TEST_VERSION_510_SRCS})
     add_library(trace_partial_file_suffix_test OBJECT ${TRACE_PARTIAL_FILE_SUFFIX_TEST_SRCS})
@@ -189,7 +192,9 @@ if(NOT WIN32)
     add_executable(fdb_c_ryw_benchmark test/ryw_benchmark.c test/test.h)
     add_executable(fdb_c_txn_size_test test/txn_size_test.c test/test.h)
     add_executable(fdb_c_client_memory_test test/client_memory_test.cpp test/unit/fdb_api.cpp test/unit/fdb_api.hpp)
-    add_executable(mako ${MAKO_SRCS})
+    if(BUILD_MAKO)
+      add_executable(mako ${MAKO_SRCS})
+    endif()
     add_executable(fdb_c_setup_tests test/unit/setup_tests.cpp)
     add_executable(fdb_c_unit_tests)
     target_link_libraries(fdb_c_unit_tests PRIVATE fdb_c fdb_c_unit_tests_impl)
@@ -211,7 +216,7 @@ if(NOT WIN32)
   target_link_libraries(fdb_c_client_memory_test PRIVATE fdb_c Threads::Threads)
 
   target_include_directories(fdb_c_api_tester_impl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/foundationdb/ ${CMAKE_SOURCE_DIR}/flow/include ${CMAKE_BINARY_DIR}/flow/include)
-  target_link_libraries(fdb_c_api_tester_impl PRIVATE fdb_cpp toml11_target Threads::Threads fmt::fmt boost_target)
+  target_link_libraries(fdb_c_api_tester_impl PRIVATE fdb_cpp toml11::toml11 Threads::Threads fmt::fmt boost_target)
   if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_link_libraries(fdb_c_api_tester_impl PRIVATE stdc++fs)
   endif()
@@ -227,9 +232,15 @@ if(NOT WIN32)
   target_link_libraries(fdb_c_client_config_tester PRIVATE SimpleOpt fdb_cpp fdb_c fdbclient Threads::Threads fmt::fmt)
   target_include_directories(fdb_c_client_config_tester PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/foundationdb/)
 
-  # do not set RPATH for mako
-  set_property(TARGET mako PROPERTY SKIP_BUILD_RPATH TRUE)
-  target_link_libraries(mako PRIVATE fdb_c fdbclient fmt::fmt Threads::Threads fdb_cpp boost_target rapidjson)
+  if(BUILD_MAKO)
+    # do not set RPATH for mako
+    set_property(TARGET mako PROPERTY SKIP_BUILD_RPATH TRUE)
+    target_link_libraries(mako PRIVATE fdb_c fdbclient fmt::fmt Threads::Threads fdb_cpp boost_target rapidjson)
+    if(NOT OPEN_FOR_IDE)
+      strip_debug_symbols(mako)
+      add_custom_target(prepare_mako_install ALL DEPENDS strip_only_mako)
+    endif()
+  endif()
 
   if(NOT OPEN_FOR_IDE)
     # Make sure that fdb_c.h is compatible with c90
@@ -260,6 +271,20 @@ if(NOT WIN32)
     add_fdbclient_test(
       NAME fdb_c_setup_tests
       COMMAND $<TARGET_FILE:fdb_c_setup_tests>)
+    if(NOT USE_SANITIZER)
+      if(APPLE)
+        set(FDB_BLOB_GRANULE_LIBRARY_PATH_ENV "DYLD_LIBRARY_PATH")
+      else()
+        set(FDB_BLOB_GRANULE_LIBRARY_PATH_ENV "LD_LIBRARY_PATH")
+      endif()
+      add_test(NAME fdb_c_blob_granule_fatal_exports
+        COMMAND ${CMAKE_COMMAND} -E env
+        "${FDB_BLOB_GRANULE_LIBRARY_PATH_ENV}=${CMAKE_BINARY_DIR}/lib:$ENV{${FDB_BLOB_GRANULE_LIBRARY_PATH_ENV}}"
+        $<TARGET_FILE:Python3::Interpreter> ${CMAKE_CURRENT_SOURCE_DIR}/test/fdb_c_blob_granule_fatal_exports.py
+        --library $<TARGET_FILE:fdb_c>
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+      set_tests_properties(fdb_c_blob_granule_fatal_exports PROPERTIES TIMEOUT 120)
+    endif()
     add_fdbclient_test(
       NAME fdb_c_unit_tests
       COMMAND $<TARGET_FILE:fdb_c_unit_tests>
@@ -282,16 +307,30 @@ if(NOT WIN32)
       fdb
       ${CMAKE_CURRENT_BINARY_DIR}/libfdb_c_external.so
     )
+    # The CDC API test exercises both the direct and external-client paths.
+    # Enable admission on only these temporary clusters.
+    set_property(TEST fdb_c_unit_tests fdb_c_external_client_unit_tests APPEND PROPERTY ENVIRONMENT
+      "FDB_KNOB_enable_native_cdc=true")
     add_unavailable_fdbclient_test(
       NAME disconnected_timeout_unit_tests
       COMMAND $<TARGET_FILE:disconnected_timeout_unit_tests>
       @CLUSTER_FILE@
     )
+    # Legacy GRV futures ignore transaction timeouts; only the commit regressions apply.
+    add_unavailable_fdbclient_test(
+      NAME disconnected_timeout_legacy_api_unit_tests
+      COMMAND $<TARGET_FILE:disconnected_timeout_unit_tests>
+      @CLUSTER_FILE@
+      --api-version=100
+      --test-case=500ms_commit_timeout_with_client_buggify,commit_cancel_with_client_buggify
+    )
+    # A disconnected multi-version client has no native transaction to cancel.
     add_unavailable_fdbclient_test(
       NAME disconnected_timeout_external_client_unit_tests
       COMMAND $<TARGET_FILE:disconnected_timeout_unit_tests>
       @CLUSTER_FILE@
       ${CMAKE_CURRENT_BINARY_DIR}/libfdb_c_external.so
+      --test-case-exclude=commit_cancel_with_client_buggify
     )
 
     file(GLOB API_TEST_FILES "${CMAKE_CURRENT_SOURCE_DIR}/test/apitester/tests/*.toml")
@@ -328,15 +367,17 @@ if(NOT WIN32)
       )
     endforeach()
 
-    add_python_venv_test(NAME fdb_c_upgrade_to_future_version
-      COMMAND python -m fdb_test_runner.upgrade_test
-      --build-dir ${CMAKE_BINARY_DIR}
-      --test-file ${CMAKE_SOURCE_DIR}/bindings/c/test/apitester/tests/upgrade/MixedApiWorkloadMultiThr.toml
-      --upgrade-path "${FDB_CURRENT_VERSION}" "${FDB_FUTURE_VERSION}" "${FDB_CURRENT_VERSION}"
-      --process-number 3
-      )
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      add_python_venv_test(NAME fdb_c_upgrade_to_future_version
+        COMMAND python -m fdb_test_runner.upgrade_test
+        --build-dir ${CMAKE_BINARY_DIR}
+        --test-file ${CMAKE_SOURCE_DIR}/bindings/c/test/apitester/tests/upgrade/MixedApiWorkloadMultiThr.toml
+        --upgrade-path "${FDB_CURRENT_VERSION}" "${FDB_FUTURE_VERSION}" "${FDB_CURRENT_VERSION}"
+        --process-number 3
+        )
+    endif()
 
-    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" AND NOT USE_SANITIZER)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" AND NOT USE_SANITIZER)
       add_python_venv_test(NAME fdb_c_client_config_tests
         COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/test/fdb_c_client_config_tests.py
         --build-dir ${CMAKE_BINARY_DIR}
@@ -373,7 +414,10 @@ if(NOT WIN32)
         --test-file ${CMAKE_SOURCE_DIR}/bindings/c/test/apitester/tests/upgrade/MixedApiWorkloadMultiThr.toml
         --upgrade-path "${FDB_CURRENT_VERSION}" "wiggle"
         --disable-log-dump
-        --process-number 3
+        # A wiggle replaces every storage server; with only 3 processes the cluster
+        # has no spare capacity to recruit the replacements, so recovery can stall
+        # past the progress-check window. 5 processes gives the wiggle headroom.
+        --process-number 5
         --redundancy double
         )
 
@@ -383,9 +427,24 @@ if(NOT WIN32)
         --test-file ${CMAKE_SOURCE_DIR}/bindings/c/test/apitester/tests/upgrade/MixedApiWorkloadMultiThr.toml
         --upgrade-path "${FDB_PREV_RELEASE_VERSION}" "wiggle" "${FDB_CURRENT_VERSION}"
         --disable-log-dump
-        --process-number 3
+        # See fdb_c_wiggle_only: a wiggle needs spare process capacity to recruit
+        # replacement storage servers.
+        --process-number 5
         --redundancy double
         )
+
+      # These tests replace every process in a local cluster. Running them with
+      # other CTests can starve recovery long enough to trip the progress check.
+      # Worst-case budget: cluster startup + exclude/remove (120s) +
+      # wait_for_cluster_healthy (180s) + progress checks 3x30s (90s) = ~450s.
+      # Use 900s to leave margin for slow machines.
+      set_tests_properties(fdb_c_upgrade_to_future_version
+        fdb_c_upgrade_from_prev2_gradual
+        fdb_c_upgrade_from_prev2_direct
+        fdb_c_upgrade_from_prev
+        fdb_c_wiggle_only
+        fdb_c_wiggle_and_upgrade
+        PROPERTIES RUN_SERIAL TRUE TIMEOUT 900)
 
     endif()
   endif()
@@ -522,6 +581,8 @@ elseif(NOT WIN32 AND NOT APPLE) # Linux Only
     --api-test-dir ${CMAKE_SOURCE_DIR}/bindings/c/test/apitester/tests
     ${SHIM_LIB_TEST_EXTRA_OPTIONS}
     )
+  set_property(TEST fdb_c_shim_library_tests APPEND PROPERTY ENVIRONMENT
+    "FDB_KNOB_enable_native_cdc=true")
 
 endif() # End Linux only
 

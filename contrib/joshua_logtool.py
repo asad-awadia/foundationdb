@@ -15,12 +15,11 @@ import subprocess
 import tempfile
 import sys
 
-import fdb
 import joshua.joshua_model as joshua
 
 from typing import List, Union
 
-# Defined in SimulatedCluster.actor.cpp:SimulationConfig::setStorageEngine
+# Defined in SimulatedCluster.cpp:SimulationConfig::setStorageEngine
 ROCKSDB_TRACEEVENT_STRING = ["RocksDBNonDeterminism", "ShardedRocksDBNonDeterminism"]
 
 # e.g. /var/joshua/ensembles/20230221-051349-xiaogesu-c9fc5b230dcd91cf

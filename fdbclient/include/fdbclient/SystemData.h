@@ -22,14 +22,18 @@
 #define FDBCLIENT_SYSTEMDATA_H
 #pragma once
 
+#include <tuple>
+
 // Functions and constants documenting the organization of the reserved keyspace in the database beginning with "\xFF"
 
 #include "fdbclient/AccumulativeChecksum.h"
 #include "fdbclient/BulkLoading.h"
 #include "fdbclient/BulkDumping.h"
 #include "fdbclient/FDBTypes.h"
+#include "fdbclient/ProcessClass.h"
 #include "fdbclient/RangeLock.h"
 #include "fdbclient/StorageServerInterface.h"
+#include "flow/FileIdentifier.h"
 
 // Don't warn on constants being defined in this file.
 #pragma clang diagnostic push
@@ -79,12 +83,8 @@ enum class DataMovementReason : uint8_t {
 // SystemKey is just a Key but with a special type so that instances of it can be found easily throughput the code base
 // and in simulation constructions will verify that no SystemKey is a direct prefix of any other.
 struct SystemKey : Key {
-	SystemKey(Key const& k);
+	explicit SystemKey(Key const& k);
 };
-
-struct RestoreLoaderInterface;
-struct RestoreApplierInterface;
-struct RestoreMasterInterface;
 
 extern const KeyRangeRef normalKeys; // '' to systemKeys.begin
 extern const KeyRangeRef systemKeys; // [FF] to [FF][FF]
@@ -109,16 +109,13 @@ extern const KeyRef keyServersPrefix, keyServersEnd, keyServersKeyServersKey;
 // temporary ID, until a permanent ID is assigned to it.
 extern const UID anonymousShardId;
 extern const uint64_t assignedEmptyShardId;
-const Key keyServersKey(const KeyRef& k);
-const KeyRef keyServersKey(const KeyRef& k, Arena& arena);
-const Value keyServersValue(RangeResult result,
-                            const std::vector<UID>& src,
-                            const std::vector<UID>& dest = std::vector<UID>());
-const Value keyServersValue(const std::vector<Tag>& srcTag, const std::vector<Tag>& destTag = std::vector<Tag>());
-const Value keyServersValue(const std::vector<UID>& src,
-                            const std::vector<UID>& dest,
-                            const UID& srcID,
-                            const UID& destID);
+Key keyServersKey(const KeyRef& k);
+KeyRef keyServersKey(const KeyRef& k, Arena& arena);
+Value keyServersValue(RangeResult result,
+                      const std::vector<UID>& src,
+                      const std::vector<UID>& dest = std::vector<UID>());
+Value keyServersValue(const std::vector<Tag>& srcTag, const std::vector<Tag>& destTag = std::vector<Tag>());
+Value keyServersValue(const std::vector<UID>& src, const std::vector<UID>& dest, const UID& srcID, const UID& destID);
 // `result` must be the full result of getting serverTagKeys
 void decodeKeyServersValue(RangeResult result,
                            const ValueRef& value,
@@ -139,7 +136,7 @@ void decodeKeyServersValue(RangeResult result,
 bool isSystemKey(KeyRef key);
 
 extern const KeyRef accumulativeChecksumKey;
-const Value accumulativeChecksumValue(const AccumulativeChecksumState& acsState);
+Value accumulativeChecksumValue(const AccumulativeChecksumState& acsState);
 AccumulativeChecksumState decodeAccumulativeChecksum(const ValueRef& value);
 
 extern const KeyRangeRef auditKeys;
@@ -148,36 +145,62 @@ extern const KeyRangeRef auditRanges;
 extern const KeyRef auditRangePrefix;
 
 // Key for a particular audit
-const Key auditKey(const AuditType type, const UID& auditId);
+Key auditKey(const AuditType type, const UID& auditId);
 // KeyRange for whole audit
-const KeyRange auditKeyRange(const AuditType type);
+KeyRange auditKeyRange(const AuditType type);
 // Prefix for audit work progress by range
-const Key auditRangeBasedProgressPrefixFor(const AuditType type, const UID& auditId);
+Key auditRangeBasedProgressPrefixFor(const AuditType type, const UID& auditId);
 // Range for audit work progress by range
-const KeyRange auditRangeBasedProgressRangeFor(const AuditType type, const UID& auditId);
-const KeyRange auditRangeBasedProgressRangeFor(const AuditType type);
+KeyRange auditRangeBasedProgressRangeFor(const AuditType type, const UID& auditId);
+KeyRange auditRangeBasedProgressRangeFor(const AuditType type);
 // Prefix for audit work progress by server
-const Key auditServerBasedProgressPrefixFor(const AuditType type, const UID& auditId, const UID& serverId);
+Key auditServerBasedProgressPrefixFor(const AuditType type, const UID& auditId, const UID& serverId);
 // Range for audit work progress by server
-const KeyRange auditServerBasedProgressRangeFor(const AuditType type, const UID& auditId);
-const KeyRange auditServerBasedProgressRangeFor(const AuditType type);
+KeyRange auditServerBasedProgressRangeFor(const AuditType type, const UID& auditId);
+KeyRange auditServerBasedProgressRangeFor(const AuditType type);
 
-const Value auditStorageStateValue(const AuditStorageState& auditStorageState);
+Value auditStorageStateValue(const AuditStorageState& auditStorageState);
 AuditStorageState decodeAuditStorageState(const ValueRef& value);
 
 // "\xff/checkpoint/[[UID]] := [[CheckpointMetaData]]"
 extern const KeyRef checkpointPrefix;
-const Key checkpointKeyFor(UID checkpointID);
-const Value checkpointValue(const CheckpointMetaData& checkpoint);
+Key checkpointKeyFor(UID checkpointID);
+Value checkpointValue(const CheckpointMetaData& checkpoint);
 UID decodeCheckpointKey(const KeyRef& key);
 CheckpointMetaData decodeCheckpointValue(const ValueRef& value);
 
 // "\xff/dataMoves/[[UID]] := [[DataMoveMetaData]]"
 extern const KeyRangeRef dataMoveKeys;
-const Key dataMoveKeyFor(UID dataMoveId);
-const Value dataMoveValue(const DataMoveMetaData& dataMove);
+Key dataMoveKeyFor(UID dataMoveId);
+Value dataMoveValue(const DataMoveMetaData& dataMove);
 UID decodeDataMoveKey(const KeyRef& key);
 DataMoveMetaData decodeDataMoveValue(const ValueRef& value);
+
+// Migration-state sentinel: written by DD after a shard-encode
+// migration rewrite pass completes with no more work in the current
+// direction. Fast-path skip for subsequent DD inits — a single-key
+// read tells DD whether the metadata is already at the target
+// encoding for the effective shard_metadata_format target (config, or
+// the SHARD_ENCODE_LOCATION_METADATA knob when the config is UNSET).
+//
+// Values:
+//   "old"    -> rollback (tag-based) rewrite drained; safe to downgrade.
+//   "new"    -> reserved for a sealed forward completion; NOT currently
+//               written (see below).
+//   absent   -> unknown / in-progress. In the rollback direction DD does
+//               the full scan. In the forward direction DD does not scan;
+//               it only clears a stale "old" sentinel if present.
+//
+// The rollback rewriter CLEARS this key as the first commit of its pass
+// (so an audit tool observing the cluster during a rewrite doesn't see a
+// stale "complete" marker) and SETS it to "old" only when a pass finds no
+// more new-format entries anywhere. The forward path does NOT seal a
+// "new" value — it only clears any stale "old"
+// (clearStaleShardEncodedRewriteSentinel); forward completion is reached
+// lazily by natural DD moves and is not marked here.
+extern const KeyRef shardEncodeMigrationCompleteKey;
+extern const ValueRef shardEncodeMigrationValueOld;
+extern const ValueRef shardEncodeMigrationValueNew;
 
 //    "\xff/serverKeys/[[serverID]]/[[begin]]" := "[[serverKeysTrue]]" |" [[serverKeysFalse]]"
 //	An internal mapping of what shards any given server currently has ownership of
@@ -187,17 +210,28 @@ DataMoveMetaData decodeDataMoveValue(const ValueRef& value);
 extern const KeyRangeRef serverKeysRange;
 extern const KeyRef serverKeysPrefix;
 extern const ValueRef serverKeysTrue, serverKeysTrueEmptyRange, serverKeysFalse;
-const UID newDataMoveId(const uint64_t physicalShardId,
-                        AssignEmptyRange assignEmptyRange,
-                        const DataMoveType type,
-                        const DataMovementReason reason,
-                        UnassignShard unassignShard = UnassignShard::False);
-const Key serverKeysKey(UID serverID, const KeyRef& keys);
-const Key serverKeysPrefixFor(UID serverID);
+// Returns true iff `value` is a format-neutral serverKeys entry — i.e.
+// serverKeysFalse ("this server does not own this range") or the empty
+// value that KRM uses as a range-boundary sentinel. Both are written by
+// both the tag-based (finishMoveKeys) and the shard-encoded
+// (finishMoveShards) paths, so they carry no format signal.
+bool isServerKeysUnassigned(const ValueRef& value);
+// Returns true iff `value` is an old-format (tag-based) serverKeys
+// "assigned" marker. Excludes serverKeysFalse and empty (see
+// isServerKeysUnassigned). New-format entries encode a UID and won't
+// equal these constants.
+bool isServerKeysOldFormatAssigned(const ValueRef& value);
+UID newDataMoveId(const uint64_t physicalShardId,
+                  AssignEmptyRange assignEmptyRange,
+                  const DataMoveType type,
+                  const DataMovementReason reason,
+                  UnassignShard unassignShard = UnassignShard::False);
+Key serverKeysKey(UID serverID, const KeyRef& keys);
+Key serverKeysPrefixFor(UID serverID);
 UID serverKeysDecodeServer(const KeyRef& key);
 std::pair<UID, Key> serverKeysDecodeServerBegin(const KeyRef& key);
 bool serverHasKey(ValueRef storedValue);
-const Value serverKeysValue(const UID& id);
+Value serverKeysValue(const UID& id);
 void decodeDataMoveId(const UID& id,
                       bool& assigned,
                       bool& emptyRange,
@@ -223,7 +257,7 @@ extern const KeyRangeRef tssMappingKeys;
 // For quarantining a misbehaving TSS.
 extern const KeyRangeRef tssQuarantineKeys;
 
-const Key tssQuarantineKeyFor(UID serverID);
+Key tssQuarantineKeyFor(UID serverID);
 UID decodeTssQuarantineKey(KeyRef const&);
 
 // \xff/tssMismatch/[[Tuple<TSSStorageUID, timestamp, mismatchUID>]] := [[TraceEventString]]
@@ -251,33 +285,134 @@ extern const KeyRef serverTagConflictPrefix;
 extern const KeyRangeRef serverTagHistoryKeys;
 extern const KeyRef serverTagHistoryPrefix;
 
-const Key serverTagKeyFor(UID serverID);
-const Key serverTagHistoryKeyFor(UID serverID);
-const KeyRange serverTagHistoryRangeFor(UID serverID);
-const KeyRange serverTagHistoryRangeBefore(UID serverID, Version version);
-const Value serverTagValue(Tag);
+Key serverTagKeyFor(UID serverID);
+Key serverTagHistoryKeyFor(UID serverID);
+KeyRange serverTagHistoryRangeFor(UID serverID);
+KeyRange serverTagHistoryRangeBefore(UID serverID, Version version);
+Value serverTagValue(Tag);
 UID decodeServerTagKey(KeyRef const&);
 Version decodeServerTagHistoryKey(KeyRef const&);
 Tag decodeServerTagValue(ValueRef const&);
-const Key serverTagConflictKeyFor(Tag);
+Key serverTagConflictKeyFor(Tag);
 
 //    "\xff/tagLocalityList/[[datacenterID]]" := "[[tagLocality]]"
 //	Provides the tagLocality for the given datacenterID
 //	See "FDBTypes.h" struct Tag for more details on tagLocality
 extern const KeyRangeRef tagLocalityListKeys;
 extern const KeyRef tagLocalityListPrefix;
-const Key tagLocalityListKeyFor(Optional<Value> dcID);
-const Value tagLocalityListValue(int8_t const&);
+Key tagLocalityListKeyFor(Optional<Value> dcID);
+Value tagLocalityListValue(int8_t const&);
 Optional<Value> decodeTagLocalityListKey(KeyRef const&);
 int8_t decodeTagLocalityListValue(ValueRef const&);
+
+// Native CDC stream routing and lifecycle metadata persisted in the transaction state store.
+// See design/cdc.md for the durable metadata layout and lifecycle semantics.
+// "\xff/cdc/name/[[streamName]]" := "[[CDCStreamId]]"
+extern const KeyRangeRef cdcStreamNameKeys;
+Key cdcStreamNameKeyFor(KeyRef const& streamName);
+Key decodeCDCStreamNameKey(KeyRef const& key);
+Value cdcStreamNameValue(CDCStreamId streamId);
+CDCStreamId decodeCDCStreamNameValue(ValueRef const& value);
+
+// "\xff/cdc/maxStreamId" := "[[CDCStreamId]]"
+extern const KeyRef cdcMaxStreamIdKey;
+Value cdcMaxStreamIdValue(CDCStreamId streamId);
+CDCStreamId decodeCDCMaxStreamIdValue(ValueRef const& value);
+
+// "\xff/cdc/keys/[[CDCStreamId]]" := "[[vector<KeyRange>]]"
+extern const KeyRangeRef cdcStreamKeys;
+Key cdcStreamKeyFor(CDCStreamId streamId);
+CDCStreamId decodeCDCStreamKey(KeyRef const& key);
+Value cdcStreamKeysValue(std::vector<KeyRange> const& ranges);
+std::vector<KeyRange> decodeCDCStreamKeysValue(ValueRef const& value);
+
+// "\xff/cdc/tagHistory/[[CDCStreamId]][[Version]][[Tag]]" := "" | commit versionstamp
+// Empty values use the key's version. A pending live retag stores its exact commit
+// boundary in the value; the key retains the transaction read version for ordering.
+struct CDCTagHistoryEntry {
+	constexpr static FileIdentifier file_identifier = 13091844;
+
+	CDCStreamId streamId = 0;
+	Version version = invalidVersion;
+	Tag tag;
+
+	CDCTagHistoryEntry() = default;
+	CDCTagHistoryEntry(CDCStreamId streamId, Version version, Tag tag)
+	  : streamId(streamId), version(version), tag(tag) {}
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, streamId, version, tag);
+	}
+};
+
+extern const KeyRangeRef cdcTagHistoryKeys;
+Key cdcTagHistoryKeyFor(CDCStreamId streamId, Version version, Tag tag);
+KeyRange cdcTagHistoryRangeFor(CDCStreamId streamId);
+CDCTagHistoryEntry decodeCDCTagHistoryKey(KeyRef const& key);
+CDCTagHistoryEntry decodeCDCTagHistoryEntry(KeyRef const& key, ValueRef const& value);
+
+// Advisory producer-write samples. The assignment generation invalidates every
+// comparison when registrations, tag histories, or durable ownership change.
+struct CDCTagLoadSample {
+	Value assignmentChange;
+	Version sampleVersion = invalidVersion;
+	Version validThrough = invalidVersion;
+	int64_t bytesWrittenPerKSecond = 0;
+};
+
+extern const KeyRangeRef cdcTagLoadKeys;
+Key cdcTagLoadKeyFor(Tag tag);
+Tag decodeCDCTagLoadKey(KeyRef const& key);
+Value cdcTagLoadValue(CDCTagLoadSample const& sample);
+CDCTagLoadSample decodeCDCTagLoadValue(ValueRef const& value);
+
+// "\xff\x02/cdc/tagOwner/[[Tag]]" := "[[CDCStreamId]]"
+// Derived lookup hint, not authoritative ownership. Validate the stream is active
+// on this tag and read its durable proxy assignment in the same transaction.
+extern const KeyRangeRef cdcTagOwnerKeys;
+Key cdcTagOwnerKeyFor(Tag tag);
+Tag decodeCDCTagOwnerKey(KeyRef const& key);
+Value cdcTagOwnerValue(CDCStreamId streamId);
+CDCStreamId decodeCDCTagOwnerValue(ValueRef const& value);
+
+// Native CDC acknowledgement progress is regular storage-server-backed system data.
+// "\xff\x02/cdc/minVersion/[[CDCStreamId]]" := "[[Version]]"
+// The initial value is versionstamped at stream registration commit.
+extern const KeyRangeRef cdcMinVersionKeys;
+Key cdcMinVersionKeyFor(CDCStreamId streamId);
+CDCStreamId decodeCDCMinVersionKey(KeyRef const& key);
+Value cdcMinVersionValue(Version version);
+Value cdcVersionstampedMinVersionValue();
+Version decodeCDCMinVersionValue(ValueRef const& value);
+
+// "\xff/cdc/retiredTagPop/[[Tag]]" := ""
+// Marks tags with durable final-pop work, so recovery keeps a CDC proxy available.
+extern const KeyRangeRef cdcRetiredTagPopKeys;
+Key cdcRetiredTagPopKeyFor(Tag tag);
+Tag decodeCDCRetiredTagPopKey(KeyRef const& key);
+
+// "\xff\x02/cdc/retiredTagPopVersion/[[Tag]]" := "[[Version]]"
+// Stores bounded storage-backed final-pop watermarks for removed streams.
+extern const KeyRangeRef cdcRetiredTagPopVersionKeys;
+Key cdcRetiredTagPopVersionKeyFor(Tag tag);
+Tag decodeCDCRetiredTagPopVersionKey(KeyRef const& key);
+
+// "\xff/cdc/proxies/[[CDCStreamId]][[proxyUID]]" := ""
+extern const KeyRangeRef cdcProxyKeys;
+// Changed whenever durable CDC stream-to-proxy assignments change.
+extern const KeyRef cdcProxyAssignmentChangeKey;
+Key cdcProxyKeyFor(CDCStreamId streamId, UID proxyId);
+KeyRange cdcProxyRangeFor(CDCStreamId streamId);
+std::pair<CDCStreamId, UID> decodeCDCProxyKey(KeyRef const& key);
 
 //    "\xff\x02/datacenterReplicas/[[datacenterID]]" := "[[replicas]]"
 //	Provides the number of replicas for the given datacenterID.
 //	Used in the initialization of the Data Distributor.
 extern const KeyRangeRef datacenterReplicasKeys;
 extern const KeyRef datacenterReplicasPrefix;
-const Key datacenterReplicasKeyFor(Optional<Value> dcID);
-const Value datacenterReplicasValue(int const&);
+Key datacenterReplicasKeyFor(Optional<Value> dcID);
+Value datacenterReplicasValue(int const&);
 Optional<Value> decodeDatacenterReplicasKey(KeyRef const&);
 int decodeDatacenterReplicasValue(ValueRef const&);
 
@@ -286,7 +421,7 @@ int decodeDatacenterReplicasValue(ValueRef const&);
 //	(as opposed to having no value at all)
 extern const KeyRangeRef tLogDatacentersKeys;
 extern const KeyRef tLogDatacentersPrefix;
-const Key tLogDatacentersKeyFor(Optional<Value> dcID);
+Key tLogDatacentersKeyFor(Optional<Value> dcID);
 Optional<Value> decodeTLogDatacentersKey(KeyRef const&);
 
 extern const KeyRef primaryDatacenterKey;
@@ -297,8 +432,8 @@ extern const KeyRef primaryDatacenterKey;
 //    have a new ID.  When removed from here, a storage server may release all resources and destroy itself.
 extern const KeyRangeRef serverListKeys;
 extern const KeyRef serverListPrefix;
-const Key serverListKeyFor(UID serverID);
-const Value serverListValue(StorageServerInterface const&);
+Key serverListKeyFor(UID serverID);
+Value serverListValue(StorageServerInterface const&);
 UID decodeServerListKey(KeyRef const&);
 StorageServerInterface decodeServerListValue(ValueRef const&);
 
@@ -312,8 +447,8 @@ extern const KeyRef processClassPrefix;
 extern const KeyRef processClassChangeKey;
 extern const KeyRef processClassVersionKey;
 extern const ValueRef processClassVersionValue;
-const Key processClassKeyFor(StringRef processID);
-const Value processClassValue(ProcessClass const&);
+Key processClassKeyFor(StringRef processID);
+Value processClassValue(ProcessClass const&);
 Key decodeProcessClassKey(KeyRef const&);
 ProcessClass decodeProcessClassValue(ValueRef const&);
 UID decodeProcessClassKeyOld(KeyRef const& key);
@@ -325,6 +460,7 @@ extern const KeyRangeRef configKeys;
 extern const KeyRef configKeysPrefix;
 
 extern const KeyRef backupWorkerEnabledKey;
+extern const KeyRef rangePartitionedBackupWorkerEnabledKey;
 extern const KeyRef perpetualStorageWiggleKey;
 extern const KeyRef perpetualStorageWiggleLocalityKey;
 extern const KeyRef perpetualStorageWiggleIDPrefix;
@@ -411,8 +547,8 @@ extern const KeyRef globalConfigVersionKey;
 //	and are currently (recently) available
 extern const KeyRangeRef workerListKeys;
 extern const KeyRef workerListPrefix;
-const Key workerListKeyFor(StringRef processID);
-const Value workerListValue(ProcessData const&);
+Key workerListKeyFor(StringRef processID);
+Value workerListValue(ProcessData const&);
 Key decodeWorkerListKey(KeyRef const&);
 ProcessData decodeWorkerListValue(ValueRef const&);
 
@@ -421,8 +557,8 @@ ProcessData decodeWorkerListValue(ValueRef const&);
 //	See "FDBTypes.h" struct WorkerBackupStatus for more details on the return type value.
 extern const KeyRangeRef backupProgressKeys;
 extern const KeyRef backupProgressPrefix;
-const Key backupProgressKeyFor(UID workerID);
-const Value backupProgressValue(const WorkerBackupStatus& status);
+Key backupProgressKeyFor(UID workerID);
+Value backupProgressValue(const WorkerBackupStatus& status);
 UID decodeBackupProgressKey(const KeyRef& key);
 WorkerBackupStatus decodeBackupProgressValue(const ValueRef& value);
 
@@ -437,6 +573,32 @@ std::vector<std::pair<UID, Version>> decodeBackupStartedValue(const ValueRef& va
 // 0 = Send a signal to resume/already resumed.
 // 1 = Send a signal to pause/already paused.
 extern const KeyRef backupPausedKey;
+
+//	"\xff\x02/backupPartitionMap/[8-byte epoch][8-byte version]" := "[[PartitionMap]]"
+//	One row per (epoch, version) where a partition map became effective.
+//	Read by catch-up backup workers during recovery.
+extern const KeyRangeRef backupPartitionMapHistoryKeys;
+Key backupPartitionMapHistoryKeyFor(LogEpoch epoch, Version version);
+KeyRange backupPartitionMapHistoryRangeFor(LogEpoch epoch);
+std::pair<LogEpoch, Version> decodeBackupPartitionMapHistoryKey(const KeyRef& key);
+
+// The key BackupAgent writes to request DataDistributor to (re)compute partitions for
+// range-partitioned backup, or to clear the partition state on backup stop. DD watches
+// this key, performs the requested action, and clears it (sets value back to 0).
+//    "\xff\x02/backupPartitionRequired" := "[[0|1|2]]"
+// 0 = cleared / no pending request.
+// 1 = initial partition or manual/adaptive re-partition.
+// 2 = cleanup partitionMap (issued on backup abort/stop when the last backup leaves).
+extern const KeyRef backupPartitionRequiredKey;
+Value backupPartitionRequiredValue(int8_t requestType);
+int8_t decodeBackupPartitionRequiredValue(const ValueRef& value);
+
+// The key DataDistributor writes the computed partition list to. CommitProxy will read this
+// in a later change to construct the PartitionMap.
+//    "\xff\x02/backupPartitionList" := "[[vector<KeyRange>]]"
+extern const KeyRef backupPartitionListKey;
+Value encodeBackupPartitionListValue(const std::vector<KeyRange>& partitions);
+std::vector<KeyRange> decodeBackupPartitionListValue(const ValueRef& value);
 
 //	"\xff/previousCoordinators" = "[[ClusterConnectionString]]"
 //	Set to the encoded structure of the cluster's previous set of coordinators.
@@ -464,8 +626,8 @@ extern const KeyRef minRequiredCommitVersionKey;
 //	number of microseconds since the Unix epoch.
 extern const KeyRef versionEpochKey;
 
-const Value logsValue(const std::vector<std::pair<UID, NetworkAddress>>& logs,
-                      const std::vector<std::pair<UID, NetworkAddress>>& oldLogs);
+Value logsValue(const std::vector<std::pair<UID, NetworkAddress>>& logs,
+                const std::vector<std::pair<UID, NetworkAddress>>& oldLogs);
 std::pair<std::vector<std::pair<UID, NetworkAddress>>, std::vector<std::pair<UID, NetworkAddress>>> decodeLogsValue(
     const ValueRef& value);
 
@@ -492,37 +654,48 @@ extern const UID dataDistributionModeLock;
 extern const KeyRef bulkLoadModeKey;
 extern const KeyRangeRef bulkLoadTaskKeys;
 extern const KeyRef bulkLoadTaskPrefix;
-const Value bulkLoadTaskStateValue(const BulkLoadTaskState& bulkLoadTaskState);
+Value bulkLoadTaskStateValue(const BulkLoadTaskState& bulkLoadTaskState);
 BulkLoadTaskState decodeBulkLoadTaskState(const ValueRef& value);
 
-const Value ssBulkLoadMetadataValue(const SSBulkLoadMetadata& ssBulkLoadMetadata);
+Value ssBulkLoadMetadataValue(const SSBulkLoadMetadata& ssBulkLoadMetadata);
 SSBulkLoadMetadata decodeSSBulkLoadMetadata(const ValueRef& value);
 
 extern const KeyRangeRef bulkLoadJobKeys;
 extern const KeyRef bulkLoadJobPrefix;
-const Value bulkLoadJobValue(const BulkLoadJobState& bulkLoadJobState);
+Value bulkLoadJobValue(const BulkLoadJobState& bulkLoadJobState);
 BulkLoadJobState decodeBulkLoadJobState(const ValueRef& value);
 
 extern const KeyRangeRef bulkLoadJobHistoryKeys;
 extern const KeyRef bulkLoadJobHistoryPrefix;
-const Key bulkLoadJobHistoryKeyFor(const UID& jobId);
+Key bulkLoadJobHistoryKeyFor(const UID& jobId);
 
 extern const KeyRef bulkDumpModeKey;
 extern const KeyRangeRef bulkDumpKeys;
 extern const KeyRef bulkDumpPrefix;
-const Value bulkDumpStateValue(const BulkDumpState& bulkDumpState);
+Value bulkDumpStateValue(const BulkDumpState& bulkDumpState);
 BulkDumpState decodeBulkDumpState(const ValueRef& value);
+
+// BulkDump owner tracking - stored separately for backward compatibility
+// "\xff/bulkDumpOwner/[[jobId]]" := "[[BulkDumpOwnerInfo]]"
+extern const KeyRangeRef bulkDumpOwnerKeys;
+extern const KeyRef bulkDumpOwnerPrefix;
+
+// "\xff/bulkLoadOwner/[[jobId]]" := "[[BulkDumpOwnerInfo]]" (reuses same struct)
+extern const KeyRangeRef bulkLoadOwnerKeys;
+extern const KeyRef bulkLoadOwnerPrefix;
+Key bulkDumpOwnerKeyFor(const UID& jobId);
+Key bulkLoadOwnerKeyFor(const UID& jobId);
 
 extern const std::string rangeLockNameForBulkLoad;
 extern const KeyRangeRef rangeLockKeys;
 extern const KeyRef rangeLockPrefix;
-const Value rangeLockStateSetValue(const RangeLockStateSet& rangeLockStateSet);
+Value rangeLockStateSetValue(const RangeLockStateSet& rangeLockStateSet);
 RangeLockStateSet decodeRangeLockStateSet(const ValueRef& value);
 
 extern const KeyRangeRef rangeLockOwnerKeys;
 extern const KeyRef rangeLockOwnerPrefix;
-const Key rangeLockOwnerKeyFor(const RangeLockOwnerName& ownerUniqueID);
-const Value rangeLockOwnerValue(const RangeLockOwner& rangeLockOwner);
+Key rangeLockOwnerKeyFor(const RangeLockOwnerName& ownerUniqueID);
+Value rangeLockOwnerValue(const RangeLockOwner& rangeLockOwner);
 RangeLockOwner decodeRangeLockOwner(const ValueRef& value);
 
 // Keys to view and control tag throttling
@@ -533,8 +706,6 @@ extern const KeyRef tagThrottleSignalKey;
 extern const KeyRef tagThrottleAutoEnabledKey;
 extern const KeyRef tagThrottleLimitKey;
 extern const KeyRef tagThrottleCountKey;
-extern const KeyRangeRef tagQuotaKeys;
-extern const KeyRef tagQuotaPrefix;
 
 // Log Range constant variables
 // Used in the backup pipeline to track mutations
@@ -660,12 +831,18 @@ extern const KeyRangeRef monitorConfKeys;
 
 extern const KeyRef healthyZoneKey;
 extern const StringRef ignoreSSFailuresZoneString;
+// Stores the version at which the current healthyZoneKey window started. Written and read only by
+// the Data Distributor (fdbserver/datadistributor/DDTeamCollection.cpp), so a DD recruited
+// mid-maintenance can recover the true start version. Without persisting this information the
+// true start time of the maintenance mode would be lost when a DD is recruited during maintenance
+// mode. To preserve the current semantics of healthyZoneKey this additional key was added.
+extern const KeyRef healthyZoneStartVersionKey;
 extern const KeyRef rebalanceDDIgnoreKey;
 namespace DDIgnore {
 enum IgnoreType : uint8_t { NONE = 0, REBALANCE_DISK = 1, REBALANCE_READ = 2, ALL = 3 };
 }
 
-const Value healthyZoneValue(StringRef const& zoneId, Version version);
+Value healthyZoneValue(StringRef const& zoneId, Version version);
 std::pair<Key, Version> decodeHealthyZoneValue(ValueRef const&);
 
 // All mutations done to this range are blindly copied into txnStateStore.

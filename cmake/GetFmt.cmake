@@ -1,30 +1,13 @@
-# Try to find fmt using pkg-config first (for homebrew installations)
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-  pkg_check_modules(FMT QUIET fmt)
-  if(FMT_FOUND)
-    # Create an imported target for fmt
-    add_library(fmt::fmt INTERFACE IMPORTED)
-    target_link_libraries(fmt::fmt INTERFACE ${FMT_LIBRARIES})
-    target_link_directories(fmt::fmt INTERFACE ${FMT_LIBRARY_DIRS})
-    target_include_directories(fmt::fmt INTERFACE ${FMT_INCLUDE_DIRS})
-    target_compile_options(fmt::fmt INTERFACE ${FMT_CFLAGS_OTHER})
-    set(fmt_FOUND TRUE)
-  endif()
-endif()
+find_package(fmt 11.1.4 EXACT CONFIG QUIET)
 
-# Fall back to standard find_package
-if(NOT fmt_FOUND)
-  find_package(fmt 11.0.2 EXACT QUIET CONFIG)
-endif()
-
-# Fall back to FetchContent if still not found
-if(NOT fmt_FOUND)
+if(fmt_FOUND)
+  message(STATUS "Found fmt ${fmt_VERSION} at ${fmt_DIR}")
+else()
   include(FetchContent)
   FetchContent_Declare(
     fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt
-    GIT_TAG 11.0.2
+    URL      "https://github.com/fmtlib/fmt/archive/11.1.4.tar.gz"
+    URL_HASH SHA256=ac366b7b4c2e9f0dde63a59b3feb5ee59b67974b14ee5dc9ea8ad78aa2c1ee1e
   )
   FetchContent_MakeAvailable(fmt)
 endif()

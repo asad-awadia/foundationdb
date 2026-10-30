@@ -36,12 +36,8 @@ if(NOT "${fdbmonitor_options}" STREQUAL "fdbmonitor_options-NOTFOUND")
   set_property(TARGET fdbmonitor PROPERTY LINK_OPTIONS ${fdbmonitor_options})
 endif()
 
-if(GENERATE_DEBUG_PACKAGES)
-  fdb_install(TARGETS fdbmonitor DESTINATION sbin COMPONENT server)
-else()
-  add_custom_target(prepare_fdbmonitor_install ALL DEPENDS strip_only_fdbmonitor)
-  fdb_install(PROGRAMS ${CMAKE_BINARY_DIR}/packages/bin/fdbmonitor DESTINATION sbin COMPONENT server)
-endif()
+add_custom_target(stripped_fdbmonitor ALL DEPENDS strip_only_fdbmonitor)
+fdb_install(TARGETS fdbmonitor DESTINATION sbin COMPONENT server)
 
 # Create a local sandbox for quick manual testing without simulator
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/sandbox/data)
@@ -70,6 +66,9 @@ endif()
 add_custom_target(generate_profile
   COMMAND ${CMAKE_BINARY_DIR}/contrib/generate_profile.sh ${CMAKE_BINARY_DIR})
 
-add_dependencies(generate_profile fdbmonitor fdbserver mako fdbcli)
+add_dependencies(generate_profile fdbmonitor fdbserver fdbcli)
+if(TARGET mako)
+  add_dependencies(generate_profile mako)
+endif()
 
 add_test(NAME fdbmonitor_tests COMMAND fdbmonitor_tests)

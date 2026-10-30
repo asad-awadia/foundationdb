@@ -25,7 +25,7 @@
 #include "flow/flow.h"
 #include "flow/IAsyncFile.h"
 #include "fdbclient/FDBTypes.h"
-#include "fdbclient/NativeAPI.actor.h"
+#include "fdbclient/NativeAPI.h"
 #include "fdbclient/ReadYourWrites.h"
 #include <vector>
 
@@ -33,8 +33,8 @@ FDB_BOOLEAN_PARAM(IncludeKeyRangeMap);
 
 class ReadYourWritesTransaction;
 
-Future<Optional<int64_t>> timeKeeperEpochsFromVersion(Version const& v, Reference<ReadYourWritesTransaction> const& tr);
-Future<Version> timeKeeperVersionFromDatetime(std::string const& datetime, Database const& db);
+Future<Optional<int64_t>> timeKeeperEpochsFromVersion(Version v, Reference<ReadYourWritesTransaction> tr);
+Future<Version> timeKeeperVersionFromDatetime(std::string datetime, Database db);
 
 // Helper function to check if a URL is a blobstore:// URL
 bool isBlobstoreUrl(const std::string& url);
@@ -42,13 +42,18 @@ bool isBlobstoreUrl(const std::string& url);
 // Append-only file interface for writing backup data
 // Once finish() is called the file cannot be further written to.
 // Backup containers should not attempt to use files for which finish was not called or did not complete.
-// TODO: Move the log file and range file format encoding/decoding stuff to this file and behind interfaces.
+// Log and range file format encoding/decoding helpers live in BackupFileFormat.h and BackupFileFormat.cpp.
 class IBackupFile {
 public:
-	IBackupFile(const std::string& fileName) : m_fileName(fileName) {}
-	virtual ~IBackupFile() {}
+	explicit IBackupFile(const std::string& fileName) : m_fileName(fileName) {}
+	virtual ~IBackupFile() = default;
 	// Backup files are append-only and cannot have more than 1 append outstanding at once.
-	virtual Future<Void> append(const void* data, int len) = 0;
+	// Backend hook that writes a single chunk. len is bounded by the chunk size (see append()), so
+	// backends may safely narrow it to the int length taken by IAsyncFile::write().
+	virtual Future<Void> appendImpl(const void* data, size_t len) = 0;
+	// Writes len bytes, slicing them into chunks of at most CLIENT_KNOBS->BACKUP_MANIFEST_CHUNK_SIZE
+	// so appendImpl() never receives more than INT_MAX bytes.
+	Future<Void> append(const void* data, size_t len);
 	virtual Future<Void> finish() = 0;
 	inline std::string getFileName() const { return m_fileName; }
 	virtual int64_t size() const = 0;
@@ -68,6 +73,9 @@ static const uint32_t BACKUP_AGENT_MLOG_VERSION = 2001;
 
 // Mutation log version written by BackupWorker
 static const uint32_t PARTITIONED_MLOG_VERSION = 4110;
+
+// Mutation log version written by BackupWorker for range partitioned logs
+static const uint32_t RANGE_PARTITIONED_MLOG_VERSION = 5001;
 
 // Snapshot file version written by FileBackupAgent
 static const uint32_t BACKUP_AGENT_SNAPSHOT_FILE_VERSION = 1001;
@@ -132,7 +140,9 @@ struct KeyspaceSnapshotFile {
 	std::string fileName;
 	int64_t totalSize;
 	Optional<bool> restorable; // Whether or not the snapshot can be used in a restore, if known
+	std::string snapshotType; // "bulkdump" or "rangefile" (empty if not present in filename)
 	bool isSingleVersion() const { return beginVersion == endVersion; }
+	bool isBulkDump() const { return snapshotType == "bulkdump"; }
 	double expiredPct(Optional<Version> expiredEnd) const {
 		double pctExpired = 0;
 		if (expiredEnd.present() && expiredEnd.get() > beginVersion) {
@@ -157,17 +167,18 @@ struct SnapshotMetadata {
 	std::string snapshotType = "rangefile"; // "rangefile" or "bulkdump"
 	std::string bulkDumpJobId; // Only used for bulkdump snapshots
 	int64_t totalKeys = 0; // Key count (primarily for bulkdump)
-	Version snapshotVersion = invalidVersion; // For bulkdump: the snapshot version (beginVersion == endVersion)
-	                                          // For rangefile: ignored (derived from files)
+	Version beginVersion = invalidVersion;
+	Version endVersion = invalidVersion;
 
 	bool isBulkDump() const { return snapshotType == "bulkdump"; }
 
 	// Factory for creating BulkDump metadata
-	static SnapshotMetadata bulkDump(const std::string& jobId, Version version, int64_t totalBytes, int64_t keys) {
+	static SnapshotMetadata bulkDump(const std::string& jobId, Version begin, Version end, int64_t keys) {
 		SnapshotMetadata m;
 		m.snapshotType = "bulkdump";
 		m.bulkDumpJobId = jobId;
-		m.snapshotVersion = version;
+		m.beginVersion = begin;
+		m.endVersion = end;
 		m.totalKeys = keys;
 		return m;
 	}
@@ -181,9 +192,25 @@ struct BackupFileList {
 	void toStream(FILE* fout) const;
 };
 
+// Mutation log types for backup
+enum class MutationLogType { DEFAULT = 0, PARTITIONED_LOG, RANGE_PARTITIONED_LOG };
+
+inline std::string mutationLogTypeToString(MutationLogType type) {
+	switch (type) {
+	case MutationLogType::DEFAULT:
+		return "default";
+	case MutationLogType::PARTITIONED_LOG:
+		return "partitioned-log-experimental";
+	case MutationLogType::RANGE_PARTITIONED_LOG:
+		return "range-partitioned-log-experimental";
+	default:
+		return "unknown";
+	}
+}
+
 // The byte counts here only include usable log files and byte counts from kvrange manifests
 struct BackupDescription {
-	BackupDescription() : snapshotBytes(0) {}
+	BackupDescription() : snapshotBytes(0), mutationLogType(MutationLogType::DEFAULT) {}
 	std::string url;
 	Optional<std::string> proxy;
 	std::vector<KeyspaceSnapshotFile> snapshots;
@@ -203,8 +230,9 @@ struct BackupDescription {
 	// The minimum version which this backup can be used to restore to
 	Optional<Version> minRestorableVersion;
 	std::string extendedDetail; // Freeform container-specific info.
-	bool partitioned; // If this backup contains partitioned mutation logs.
+	MutationLogType mutationLogType;
 	bool fileLevelEncryption; // If this backup contains encrypted files.
+	int encryptionBlockSize; // Block size used for file encryption, 0 if not encrypted.
 
 	// Resolves the versions above to timestamps using a given database's TimeKeeper data.
 	// toString will use this information if present.
@@ -213,6 +241,11 @@ struct BackupDescription {
 
 	std::string toString() const;
 	std::string toJSON() const;
+};
+
+struct BulkDumpRangeVersion {
+	KeyRange range;
+	Version version;
 };
 
 struct RestorableFileSet {
@@ -227,7 +260,9 @@ struct RestorableFileSet {
 	// when the entire key space snapshot is at the target version.
 	Version continuousBeginVersion, continuousEndVersion;
 
-	KeyspaceSnapshotFile snapshot; // Info. for debug purposes
+	KeyspaceSnapshotFile snapshot;
+	std::string bulkDumpJobId;
+	std::vector<BulkDumpRangeVersion> bulkDumpRanges;
 };
 
 /* IBackupContainer is an interface to a set of backup data, which contains
@@ -248,8 +283,8 @@ public:
 	virtual void addref() = 0;
 	virtual void delref() = 0;
 
-	IBackupContainer() {}
-	virtual ~IBackupContainer() {}
+	IBackupContainer() = default;
+	virtual ~IBackupContainer() = default;
 
 	// Create the container
 	virtual Future<Void> create() = 0;
@@ -269,6 +304,12 @@ public:
 	                                                          uint16_t tagId,
 	                                                          int totalTags) = 0;
 
+	virtual Future<Reference<IBackupFile>> writeRangePartitionedLogFile(Version beginVersion,
+	                                                                    Version endVersion,
+	                                                                    Version baseVersion,
+	                                                                    int32_t partitionId,
+	                                                                    int blockSize) = 0;
+
 	// Write a KeyspaceSnapshotFile of range file names representing a full non overlapping
 	// snapshot of the key ranges this backup is targeting.
 	// For BulkDump snapshots, pass SnapshotMetadata with snapshotType="bulkdump" and the job ID.
@@ -279,6 +320,9 @@ public:
 	    int64_t totalBytes,
 	    IncludeKeyRangeMap includeKeyRangeMap,
 	    Optional<SnapshotMetadata> metadata = Optional<SnapshotMetadata>()) = 0;
+
+	// Write a partition list file which contains the partition info (e.g. key ranges and partition id).
+	virtual Future<Void> writePartitionListFile(Version v, std::string contents) = 0;
 
 	// Open a file for read by name
 	virtual Future<Reference<IAsyncFile>> readFile(const std::string& name) = 0;
@@ -291,6 +335,12 @@ public:
 		std::string step;
 		int total;
 		int done;
+		// The expire version actually requested, once resolved to an absolute version.
+		Version requestedEndVersion = invalidVersion;
+		// The version expiration was actually performed to, which can differ from requestedEndVersion
+		// because expiration cannot split a log file and will move the end version back to the
+		// beginning of a log file that would otherwise have been partially deleted.
+		Version actualEndVersion = invalidVersion;
 		std::string toString() const;
 	};
 	// Delete backup files which do not contain any data at or after (more recent than) expireEndVersion.
@@ -326,12 +376,14 @@ public:
 	virtual Future<Optional<RestorableFileSet>> getRestoreSet(Version targetVersion,
 	                                                          VectorRef<KeyRangeRef> keyRangesFilter = {},
 	                                                          bool logsOnly = false,
-	                                                          Version beginVersion = -1) = 0;
+	                                                          Version beginVersion = -1,
+	                                                          bool useBulkDump = false) = 0;
 
 	// Get an IBackupContainer based on a container spec string
 	static Reference<IBackupContainer> openContainer(const std::string& url,
 	                                                 const Optional<std::string>& proxy,
-	                                                 const Optional<std::string>& encryptionKeyFileName);
+	                                                 const Optional<std::string>& encryptionKeyFileName,
+	                                                 int encryptionBlockSize);
 	static std::vector<std::string> getURLFormats();
 	static Future<std::vector<std::string>> listContainers(const std::string& baseURL,
 	                                                       const Optional<std::string>& proxy);
@@ -340,11 +392,14 @@ public:
 	Optional<std::string> const& getProxy() const { return proxy; }
 	Optional<std::string> const& getEncryptionKeyFileName() const { return encryptionKeyFileName; }
 
-	virtual Future<Void> writeEncryptionMetadata() = 0;
+	virtual Future<Void> writeEncryptionMetadata(int encryptionBlockSize) = 0;
 
 	static std::string lastOpenError;
 
 	virtual Future<Void> encryptionSetupComplete() const = 0;
+
+	virtual int getEncryptionBlockSize() const { return 0; }
+	virtual void setEncryptionBlockSize(int blockSize) {}
 
 	// TODO: change the following back to `private` once blob obj access is refactored
 protected:
@@ -390,7 +445,8 @@ private:
 // Accumulates mutation log value chunks, as both a vector of chunks and as a combined chunk,
 // in chunk order, and can check the chunk set for completion or intersection with a set
 // of ranges.
-struct AccumulatedMutations {
+class AccumulatedMutations {
+public:
 	AccumulatedMutations() : lastChunkNumber(-1) {}
 
 	// Add a KV pair for this mutation chunk set
@@ -404,11 +460,19 @@ struct AccumulatedMutations {
 	//     that matches the bytes after the header in the combined value in serializedMutations
 	bool isComplete() const;
 
+	// Returns the complete serialized payload, or no value if the chunk set is incomplete.
+	// The returned bytes remain valid until this accumulator is modified or destroyed.
+	Optional<StringRef> getCompleteMutations() const;
+
+	// The key and value bytes remain owned by the inputs passed to addChunk().
+	const std::vector<KeyValueRef>& getChunks() const { return kvs; }
+
 	// Returns true if a complete chunk contains any MutationRefs which intersect with any
 	// range in ranges.
 	// It is undefined behavior to run this if isComplete() does not return true.
 	bool matchesAnyRange(const RangeMapFilters& rangeMap) const;
 
+private:
 	std::vector<KeyValueRef> kvs;
 	std::string serializedMutations;
 	int lastChunkNumber;

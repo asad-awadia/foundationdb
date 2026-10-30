@@ -22,7 +22,7 @@
 
 namespace FDB {
 Subspace::Subspace(Tuple const& tuple, StringRef const& rawPrefix) {
-	StringRef packed = tuple.pack();
+	Standalone<StringRef> packed = tuple.pack();
 
 	this->rawPrefix.reserve(this->rawPrefix.arena(), rawPrefix.size() + packed.size());
 	this->rawPrefix.append(this->rawPrefix.arena(), rawPrefix.begin(), rawPrefix.size());
@@ -39,7 +39,7 @@ Subspace::Subspace(StringRef const& rawPrefix) {
 	this->rawPrefix.append(this->rawPrefix.arena(), rawPrefix.begin(), rawPrefix.size());
 }
 
-Subspace::~Subspace() {}
+Subspace::~Subspace() = default;
 
 Key Subspace::key() const {
 	return StringRef(rawPrefix.begin(), rawPrefix.size());

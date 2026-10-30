@@ -27,7 +27,7 @@ namespace FdbApiTester {
 
 class ApiCorrectnessWorkload : public ApiWorkload {
 public:
-	ApiCorrectnessWorkload(const WorkloadConfig& config) : ApiWorkload(config) {}
+	explicit ApiCorrectnessWorkload(const WorkloadConfig& config) : ApiWorkload(config) {}
 
 private:
 	enum OpType {
@@ -149,7 +149,7 @@ private:
 			selector.keyLength = key.size();
 			selector.orEqual = Random::get().randomBool(0.5);
 			selector.offset = Random::get().randomInt(0, 4);
-			keysWithSelectors->emplace_back(std::move(key), std::move(selector));
+			keysWithSelectors->emplace_back(std::move(key), selector);
 			// We would ideally do the following above:
 			//   selector.key = key.data();
 			// but key.data() may become invalid after the key is moved to the vector.
@@ -248,7 +248,7 @@ private:
 				                      results->size()));
 			    } else {
 				    auto expected_kv = expected.begin();
-				    for (auto actual_kv : *results) {
+				    for (const auto& actual_kv : *results) {
 					    if (actual_kv.key != expected_kv->key || actual_kv.value != expected_kv->value) {
 						    error(fmt::format(
 						        "randomGetRangeOp mismatch. expected key: {} actual key: {} expected value: "
@@ -266,7 +266,7 @@ private:
 		    getTenant(tenantId));
 	}
 
-	void randomOperation(TTaskFct cont) {
+	void randomOperation(TTaskFct cont) override {
 		std::optional<int> tenantId = randomTenant();
 		OpType txType = (stores[tenantId].size() == 0) ? OP_INSERT : (OpType)Random::get().randomInt(0, OP_LAST);
 

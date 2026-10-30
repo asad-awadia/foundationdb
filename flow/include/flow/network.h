@@ -34,7 +34,6 @@
 #include <atomic>
 #include <unordered_map>
 #include "flow/IRandom.h"
-#include "flow/ProtocolVersion.h"
 #include "flow/WriteOnlySet.h"
 
 class Void;
@@ -65,7 +64,7 @@ struct NetworkMetrics {
 		double windowedTimer = 0;
 		double maxDuration = 0;
 
-		PriorityStats(TaskPriority priority) : priority(priority) {}
+		explicit PriorityStats(TaskPriority priority) : priority(priority) {}
 	};
 
 	std::unordered_map<TaskPriority, struct PriorityStats> activeTrackers;
@@ -88,6 +87,8 @@ struct NetworkMetrics {
 	}
 
 	// Since networkBusyness is atomic we need to redefine copy assignment operator
+	// All fields support self-assignment; the array is copied element by element.
+	// NOLINTNEXTLINE(bugprone-unhandled-self-assignment)
 	NetworkMetrics& operator=(const NetworkMetrics& rhs) {
 		for (int i = 0; i < SLOW_EVENT_BINS; i++) {
 			countSlowEvents[i] = rhs.countSlowEvents[i];
@@ -120,14 +121,14 @@ struct NetworkInfo {
 
 class IEventFD : public ReferenceCounted<IEventFD> {
 public:
-	virtual ~IEventFD() {}
+	virtual ~IEventFD() = default;
 	virtual int getFD() = 0;
 	virtual Future<int64_t> read() = 0;
 };
 
-typedef void* flowGlobalType;
-typedef NetworkAddress (*NetworkAddressFuncPtr)();
-typedef NetworkAddressList (*NetworkAddressesFuncPtr)();
+using flowGlobalType = void*;
+using NetworkAddressFuncPtr = NetworkAddress (*)();
+using NetworkAddressesFuncPtr = NetworkAddressList (*)();
 
 class TLSConfig;
 
@@ -173,6 +174,7 @@ public:
 		enGrpcState = 21,
 		enProxy = 22,
 		enS3FaultInjector = 23,
+		enGlobalCipherKey = 24,
 		COUNT // Add new fields before this enumerator
 	};
 
@@ -272,14 +274,13 @@ public:
 
 	// Shorthand for transport().getLocalAddress()
 	static NetworkAddress getLocalAddress() {
-		flowGlobalType netAddressFuncPtr =
-		    reinterpret_cast<flowGlobalType>(g_network->global(INetwork::enNetworkAddressFunc));
+		auto netAddressFuncPtr = reinterpret_cast<flowGlobalType>(g_network->global(INetwork::enNetworkAddressFunc));
 		return (netAddressFuncPtr) ? reinterpret_cast<NetworkAddressFuncPtr>(netAddressFuncPtr)() : NetworkAddress();
 	}
 
 	// Shorthand for transport().getLocalAddresses()
 	static NetworkAddressList getLocalAddresses() {
-		flowGlobalType netAddressesFuncPtr =
+		auto netAddressesFuncPtr =
 		    reinterpret_cast<flowGlobalType>(g_network->global(INetwork::enNetworkAddressesFunc));
 		return (netAddressesFuncPtr) ? reinterpret_cast<NetworkAddressesFuncPtr>(netAddressesFuncPtr)()
 		                             : NetworkAddressList();
@@ -288,9 +289,9 @@ public:
 	NetworkInfo networkInfo;
 
 protected:
-	INetwork() {}
+	INetwork() = default;
 
-	~INetwork() {} // Please don't try to delete through this interface!
+	~INetwork() = default; // Please don't try to delete through this interface!
 };
 
 /// A wrapper for `g_network` value  that lets you access global properties from Swift.

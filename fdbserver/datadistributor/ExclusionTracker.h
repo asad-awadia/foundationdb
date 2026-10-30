@@ -1,0 +1,175 @@
+/*
+ * ExclusionTracker.h
+ *
+ * This source file is part of the FoundationDB open source project
+ *
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <set>
+
+#include "flow/CoroUtils.h"
+#include "flow/flow.h"
+#include "flow/Trace.h"
+#include "fdbclient/DatabaseContext.h"
+#include "fdbclient/ManagementAPI.h"
+
+struct ExclusionTracker {
+	std::set<AddressExclusion> excluded;
+	std::set<AddressExclusion> failed;
+
+	AsyncTrigger changed;
+
+	Database db;
+	Future<Void> trackerFuture;
+
+	ExclusionTracker() = default;
+	explicit ExclusionTracker(Database db) : db(db) { trackerFuture = tracker(); }
+
+	bool isFailedOrExcluded(NetworkAddress addr) {
+		AddressExclusion addrExclusion(addr.ip, addr.port);
+		return excluded.contains(addrExclusion) || failed.contains(addrExclusion);
+	}
+
+	// Note the tracker is intended to be used by the Data Distributor. The tracker will check for excluded localities
+	// based on the server list, the server list only includes storage processes.
+	Future<Void> tracker() {
+		// Fetch the list of excluded servers
+		ReadYourWritesTransaction tr(db);
+		while (true) {
+			Error err;
+			bool hasErr = false;
+			try {
+				tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+				tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+				tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+				Future<RangeResult> fresultsExclude = tr.getRange(excludedServersKeys, CLIENT_KNOBS->TOO_MANY);
+				Future<RangeResult> fresultsFailed = tr.getRange(failedServersKeys, CLIENT_KNOBS->TOO_MANY);
+				Future<RangeResult> flocalitiesExclude = tr.getRange(excludedLocalityKeys, CLIENT_KNOBS->TOO_MANY);
+				Future<RangeResult> flocalitiesFailed = tr.getRange(failedLocalityKeys, CLIENT_KNOBS->TOO_MANY);
+				Future<RangeResult> fServerList = tr.getRange(serverListKeys, CLIENT_KNOBS->TOO_MANY);
+
+				co_await (success(fresultsExclude) && success(fresultsFailed) && success(flocalitiesExclude) &&
+				          success(flocalitiesFailed));
+
+				RangeResult excludedResults = fresultsExclude.get();
+				ASSERT(!excludedResults.more && excludedResults.size() < CLIENT_KNOBS->TOO_MANY);
+
+				RangeResult failedResults = fresultsFailed.get();
+				ASSERT(!failedResults.more && failedResults.size() < CLIENT_KNOBS->TOO_MANY);
+
+				RangeResult excludedLocalityResults = flocalitiesExclude.get();
+				ASSERT(!excludedLocalityResults.more && excludedLocalityResults.size() < CLIENT_KNOBS->TOO_MANY);
+
+				RangeResult failedLocalityResults = flocalitiesFailed.get();
+				ASSERT(!failedLocalityResults.more && failedLocalityResults.size() < CLIENT_KNOBS->TOO_MANY);
+
+				std::set<AddressExclusion> newExcluded;
+				std::set<AddressExclusion> newFailed;
+				for (const auto& r : excludedResults) {
+					AddressExclusion addr = decodeExcludedServersKey(r.key);
+					if (addr.isValid()) {
+						newExcluded.insert(addr);
+					}
+				}
+				for (const auto& r : failedResults) {
+					AddressExclusion addr = decodeFailedServersKey(r.key);
+					if (addr.isValid()) {
+						newFailed.insert(addr);
+					}
+				}
+
+				co_await fServerList;
+				// In some cases it can happen that the process is not running, e.g. because the process is down
+				// for maintenance. In this case the process will not be part of the worker list, but the process
+				// might be a storage server and could be part of the server list.
+				// See: https://github.com/apple/foundationdb/issues/12168
+				std::vector<std::pair<std::string, std::string>> decodedExcludedLocalities;
+				for (auto& excludedLocality : excludedLocalityResults) {
+					decodedExcludedLocalities.push_back(
+					    decodeLocality(decodeExcludedLocalityKey(excludedLocality.key)));
+				}
+
+				std::vector<std::pair<std::string, std::string>> decodedFailedLocalities;
+				for (auto& failedLocality : failedLocalityResults) {
+					decodedFailedLocalities.push_back(decodeLocality(decodeFailedLocalityKey(failedLocality.key)));
+				}
+
+				RangeResult serverList = fServerList.get();
+				for (auto& s : serverList) {
+					auto decodedServer = decodeServerListValue(s.value);
+					appendAddressesMatchingLocalities(decodedServer, decodedExcludedLocalities, newExcluded);
+					appendAddressesMatchingLocalities(decodedServer, decodedFailedLocalities, newFailed);
+				}
+
+				bool foundChange = false;
+				if (excluded != newExcluded) {
+					excluded = newExcluded;
+					foundChange = true;
+				}
+				if (failed != newFailed) {
+					failed = newFailed;
+					foundChange = true;
+				}
+
+				if (foundChange) {
+					changed.trigger();
+				}
+
+				Future<Void> watchFuture = tr.watch(excludedServersVersionKey) || tr.watch(failedServersVersionKey) ||
+				                           tr.watch(excludedLocalityVersionKey) || tr.watch(failedLocalityVersionKey);
+				co_await tr.commit();
+				if (!excludedLocalityResults.empty() || !failedLocalityResults.empty()) {
+					// when there are excluded localities we need to monitor for when the worker list changes, so we
+					// must poll
+					watchFuture = watchFuture || delay(10.0);
+				}
+				co_await watchFuture;
+				tr.reset();
+			} catch (Error& e) {
+				err = e;
+				hasErr = true;
+			}
+			if (hasErr) {
+				TraceEvent("ExclusionTrackerError").error(err);
+				co_await tr.onError(err);
+			}
+		}
+	}
+
+private:
+	static void appendAddressesMatchingLocalities(StorageServerInterface const& server,
+	                                              std::vector<std::pair<std::string, std::string>> const& localities,
+	                                              std::set<AddressExclusion>& exclusions) {
+		for (auto const& locality : localities) {
+			if (!server.locality.isPresent(locality.first)) {
+				continue;
+			}
+
+			if (server.locality.get(locality.first) != locality.second) {
+				continue;
+			}
+
+			auto addresses = server.getKeyValues.getEndpoint().addresses;
+			exclusions.insert(AddressExclusion(addresses.address.ip, addresses.address.port));
+			if (addresses.secondaryAddress.present()) {
+				auto secondaryAddress = addresses.secondaryAddress.get();
+				exclusions.insert(AddressExclusion(secondaryAddress.ip, secondaryAddress.port));
+			}
+		}
+	}
+};

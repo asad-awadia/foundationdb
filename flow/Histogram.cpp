@@ -27,7 +27,6 @@
 // scoped to the right "machine".
 // either we pull g_simulator into flow, or flow (and the I/O path) will be unable to log performance
 // metrics.
-#include <limits>
 
 #pragma region HistogramRegistry
 
@@ -57,7 +56,7 @@ void HistogramRegistry::unregisterHistogram(Histogram* h) {
 		TraceEvent(SevError, "HistogramNotRegistered").detail("group", h->group).detail("op", h->op);
 	}
 	int count = histograms.erase(name);
-	ASSERT(count == 1);
+	ASSERT_EQ(count, 1);
 }
 
 Histogram* HistogramRegistry::lookupHistogram(std::string const& name) {

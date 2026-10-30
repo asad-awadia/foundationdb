@@ -1,5 +1,5 @@
 /**
- * gRPC.actor.cpp
+ * FlowGrpc.cpp
  *
  * This source file is part of the FoundationDB open source project
  *
@@ -21,7 +21,6 @@
 #include "fdbrpc/FlowGrpc.h"
 #include "flow/Error.h"
 #include "flow/Trace.h"
-#include "flow/actorcompiler.h" // This must be the last #include.
 
 #ifdef FLOW_GRPC_ENABLED
 
@@ -69,7 +68,7 @@ Future<Void> GrpcServer::run() {
 		co_await run_actor_;
 	} catch (Error& err) {
 		if (err.code() != error_code_operation_cancelled) {
-			TraceEvent(SevError, "GrpcServerRunError").detail("Endpoint", address_).detail("Error", err.name());
+			TraceEvent(SevError, "GrpcServerRunError").error(err).detail("Endpoint", address_);
 			throw;
 		}
 	}
@@ -85,15 +84,15 @@ Future<Void> GrpcServer::runInternal() {
 	// ASSERT(g_network->isOnMainThread()); // Unit-tests are not on main-thread?
 
 	Future<Void> next = Void();
-	loop {
+	while (true) {
 		ASSERT(state_ != State::Shutdown);
 
-		loop {
+		while (true) {
 			co_await next;
 			co_await delay(CONFIG_STARTUP_DELAY_BETWEEN_RESTART);
 
 			// gRPC can't run a server without registered service.
-			if (registered_services_.size() > 0) {
+			if (!registered_services_.empty()) {
 				break;
 			} else {
 				next = on_services_changed_.onTrigger();
@@ -178,7 +177,7 @@ void GrpcServer::stopServerSync() {
 }
 
 void GrpcServer::stopServerSyncInternal() {
-	if (server_ != nullptr) {
+	if (server_ == nullptr) {
 		return;
 	}
 
@@ -200,7 +199,7 @@ void GrpcServer::registerRoleServices(const UID& owner_id, const ServiceList& se
 	on_services_changed_.trigger();
 }
 
-Future<Void> GrpcServer::deregisterRoleServices(const UID& owner_id) {
+Future<Void> GrpcServer::deregisterRoleServices(UID owner_id) {
 	ASSERT(g_network->isOnMainThread());
 	co_await stopServer();
 	registered_services_.erase(owner_id);

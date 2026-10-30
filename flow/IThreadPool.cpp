@@ -20,22 +20,15 @@
 
 #include "flow/IThreadPool.h"
 
-#include <algorithm>
-// The ifndef's allow us to compile with pre-built boost.  Otherwise, we get
-// errors about double-defines.  As of this writing, the automatically downloaded
-// build of boost doesn't define these, but the pre-built version does.  (The old
-// prebuilt version was being silently ignored by cmake, so it's unclear when the
-// compatibility divergence started)
-#ifndef BOOST_SYSTEM_NO_LIB
-#define BOOST_SYSTEM_NO_LIB
-#endif
+// The ifndef's allow us to compile with pre-built boost - depending on what
+// libraries were enabled when it was built, we can get errors about double-defines.
 #ifndef BOOST_DATE_TIME_NO_LIB
 #define BOOST_DATE_TIME_NO_LIB
 #endif
 #ifndef BOOST_REGEX_NO_LIB
 #define BOOST_REGEX_NO_LIB
 #endif
-#include "boost/asio.hpp"
+#include <boost/asio.hpp>
 
 class ThreadPool final : public IThreadPool, public ReferenceCounted<ThreadPool> {
 	struct Thread {
@@ -67,8 +60,8 @@ class ThreadPool final : public IThreadPool, public ReferenceCounted<ThreadPool>
 	}
 
 	std::vector<Thread*> threads;
-	boost::asio::io_service ios;
-	boost::asio::io_service::work dontstop;
+	boost::asio::io_context ios;
+	boost::asio::executor_work_guard<boost::asio::io_context::executor_type> dontstop;
 	enum Mode { Run = 0, Shutdown = 2 };
 	volatile int mode;
 	int stackSize;
@@ -76,7 +69,7 @@ class ThreadPool final : public IThreadPool, public ReferenceCounted<ThreadPool>
 
 	struct ActionWrapper {
 		PThreadAction action;
-		ActionWrapper(PThreadAction action) : action(action) {}
+		explicit ActionWrapper(PThreadAction action) : action(action) {}
 		// HACK: Boost won't use move constructors, so we just assume the last copy made is the one that will be called
 		// or cancelled
 		ActionWrapper(ActionWrapper const& r) : action(r.action) { const_cast<ActionWrapper&>(r).action = nullptr; }
@@ -93,8 +86,8 @@ class ThreadPool final : public IThreadPool, public ReferenceCounted<ThreadPool>
 	};
 
 public:
-	ThreadPool(int stackSize, int pri) : dontstop(ios), mode(Run), stackSize(stackSize), pri(pri) {}
-	~ThreadPool() override {}
+	ThreadPool(int stackSize, int pri) : dontstop(ios.get_executor()), mode(Run), stackSize(stackSize), pri(pri) {}
+	~ThreadPool() override = default;
 	Future<Void> stop(Error const& e = success()) override {
 		if (mode == Shutdown)
 			return Void();
@@ -132,12 +125,12 @@ public:
 		threads.push_back(new Thread(this, userData));
 		threads.back()->handle = g_network->startThread(start, threads.back(), stackSize, name);
 	}
-	void post(PThreadAction action) override { ios.post(ActionWrapper(action)); }
+	void post(PThreadAction action) override { boost::asio::post(ios, ActionWrapper(action)); }
 	int priority() const { return pri; }
 };
 
 Reference<IThreadPool> createGenericThreadPool(int stackSize, int pri) {
-	return Reference<IThreadPool>(new ThreadPool(stackSize, pri));
+	return makeReference<ThreadPool>(stackSize, pri);
 }
 
 thread_local IThreadPoolReceiver* ThreadPool::Thread::threadUserObject;

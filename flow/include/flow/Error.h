@@ -26,7 +26,6 @@
 #include <map>
 #include <boost/preprocessor/facilities/is_empty.hpp>
 #include <boost/preprocessor/control/if.hpp>
-#include "flow/ActorContext.h"
 #include "flow/Platform.h"
 #include "flow/Knobs.h"
 #include "flow/FileIdentifier.h"
@@ -96,7 +95,7 @@ class AttributeNotFoundError : public Error {
 	std::string missingAttribute;
 
 public:
-	AttributeNotFoundError(const std::string&);
+	explicit AttributeNotFoundError(const std::string&);
 
 	const std::string& getMissingAttribute() const;
 };
@@ -150,7 +149,7 @@ extern bool isAssertDisabled(int line);
 		throw internal_error_impl("unreachable", __FILE__, __LINE__);                                                  \
 	}
 
-// TODO: magic so this works even if const-ness doesn't not match.
+// TODO: magic so this works even if const-ness doesn't match.
 template <typename T, typename U>
 void assert_impl(char const* a_nm,
                  T const& a,
@@ -160,7 +159,7 @@ void assert_impl(char const* a_nm,
                  bool (*compare)(T const&, U const&),
                  char const* file,
                  int line) {
-	if (!compare(a, b)) {
+	if (!(compare(a, b) || isAssertDisabled(line))) [[unlikely]] {
 		throw internal_error_impl(a_nm, Traceable<T>::toString(a), opName, b_nm, Traceable<U>::toString(b), file, line);
 	}
 }

@@ -17,10 +17,10 @@ fi
 #
 BUILDDIR="$1"
 SRCDIR="$2"
-
+HOST_ARCH="$(uname -m)"
 VERSION="$(cat "$BUILDDIR/version.txt")"
 
-PKGFILE="$BUILDDIR/packages/FoundationDB-$VERSION.pkg"
+PKGFILE="$BUILDDIR/packages/FoundationDB-$HOST_ARCH-$VERSION.pkg"
 
 CLIENTSDIR=$( mktemp -d -t fdb-clients-pkg )
 SERVERDIR=$( mktemp -d -t fdb-server-pkg )
@@ -33,14 +33,12 @@ dos2unix()
 mkdir -p -m 0755 $CLIENTSDIR/usr/local/bin
 mkdir -p -m 0755 $CLIENTSDIR/usr/local/lib
 mkdir -p -m 0755 $CLIENTSDIR/usr/local/include/foundationdb
-mkdir -p -m 0755 $CLIENTSDIR/Library/Python/2.7/site-packages/fdb
 mkdir -p -m 0775 $CLIENTSDIR/usr/local/etc/foundationdb
 mkdir -p -m 0755 $CLIENTSDIR/usr/local/foundationdb/backup_agent
 
 install -m 0755 "$BUILDDIR"/bin/fdbcli $CLIENTSDIR/usr/local/bin
 install -m 0644 "$SRCDIR"/bindings/c/foundationdb/fdb_c.h "$BUILDDIR"/bindings/c/foundationdb/fdb_c_options.g.h "$BUILDDIR"/bindings/c/foundationdb/fdb_c_apiversion.g.h "$SRCDIR"/bindings/c/foundationdb/fdb_c_types.h "$SRCDIR"/bindings/c/foundationdb/fdb_c_internal.h "$SRCDIR"/fdbclient/vexillographer/fdb.options $CLIENTSDIR/usr/local/include/foundationdb
 install -m 0755 "$BUILDDIR"/lib/libfdb_c.dylib $CLIENTSDIR/usr/local/lib
-install -m 0644 "$BUILDDIR"/bindings/python/fdb/*.py $CLIENTSDIR/Library/Python/2.7/site-packages/fdb
 install -m 0755 "$BUILDDIR"/bin/fdbbackup $CLIENTSDIR/usr/local/foundationdb/backup_agent/backup_agent
 install -m 0755 "$SRCDIR"/packaging/osx/uninstall-FoundationDB.sh $CLIENTSDIR/usr/local/foundationdb
 dos2unix "$SRCDIR"/README.md $CLIENTSDIR/usr/local/foundationdb/README
@@ -67,6 +65,8 @@ install -m 0644 "$SRCDIR"/packaging/osx/com.foundationdb.fdbmonitor.plist $SERVE
 pkgbuild --root $SERVERDIR --identifier FoundationDB-server --version "$VERSION" --scripts "$SRCDIR"/packaging/osx/scripts-server FoundationDB-server.pkg
 
 rm -rf $SERVERDIR
+
+sed -i '' "s|<options |<options hostArchitectures=\"$HOST_ARCH\" |" "$SRCDIR"/packaging/osx/Distribution.xml
 
 productbuild --distribution "$SRCDIR"/packaging/osx/Distribution.xml --resources "$SRCDIR"/packaging/osx/resources --package-path . "$PKGFILE"
 

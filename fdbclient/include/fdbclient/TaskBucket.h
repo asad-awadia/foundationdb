@@ -24,13 +24,13 @@
 
 #include "flow/flow.h"
 #include "flow/IDispatched.h"
-#include "flow/genericactors.actor.h"
+#include "flow/genericactors.h"
 
 #include "fdbclient/FDBTypes.h"
-#include "fdbclient/NativeAPI.actor.h"
-#include "fdbclient/RunRYWTransaction.actor.h"
+#include "fdbclient/NativeAPI.h"
+#include "fdbclient/RunRYWTransaction.h"
 #include "fdbclient/Subspace.h"
-#include "fdbclient/KeyBackedTypes.actor.h"
+#include "fdbclient/KeyBackedTypes.h"
 
 class FutureBucket;
 class TaskFuture;
@@ -56,8 +56,8 @@ FDB_BOOLEAN_PARAM(UpdateParams);
 //       same Task
 class Task : public ReferenceCounted<Task> {
 public:
-	Task(Value type = StringRef(), uint32_t version = 0, Value done = StringRef(), unsigned int priority = 0);
-	~Task() {};
+	explicit Task(Value type = StringRef(), uint32_t version = 0, Value done = StringRef(), unsigned int priority = 0);
+	~Task() = default;
 
 	// Methods that safely read values from task's params
 	uint32_t getVersion() const;
@@ -102,7 +102,7 @@ public:
 template <typename T>
 class TaskParam {
 public:
-	TaskParam(StringRef key) : key(key) {}
+	explicit(false) TaskParam(StringRef key) : key(key) {}
 	T get(Reference<Task> task) const { return TupleCodec<T>::unpack(task->params[key]); }
 	void set(Reference<Task> task, T const& val) const { task->params[key] = TupleCodec<T>::pack(val); }
 	bool exists(Reference<Task> task) const { return task->params.find(key) != task->params.end(); }
@@ -139,10 +139,10 @@ class FutureBucket;
 // instance may declare the Task a failure and move it back to the available subspace.
 class TaskBucket : public ReferenceCounted<TaskBucket> {
 public:
-	TaskBucket(const Subspace& subspace,
-	           AccessSystemKeys = AccessSystemKeys::False,
-	           PriorityBatch = PriorityBatch::False,
-	           LockAware = LockAware::False);
+	explicit TaskBucket(const Subspace& subspace,
+	                    AccessSystemKeys = AccessSystemKeys::False,
+	                    PriorityBatch = PriorityBatch::False,
+	                    LockAware = LockAware::False);
 	virtual ~TaskBucket();
 
 	void setOptions(Reference<ReadYourWritesTransaction> tr) {
@@ -311,7 +311,9 @@ class TaskFuture;
 
 class FutureBucket : public ReferenceCounted<FutureBucket> {
 public:
-	FutureBucket(const Subspace& subspace, AccessSystemKeys = AccessSystemKeys::False, LockAware = LockAware::False);
+	explicit FutureBucket(const Subspace& subspace,
+	                      AccessSystemKeys = AccessSystemKeys::False,
+	                      LockAware = LockAware::False);
 	virtual ~FutureBucket();
 
 	void setOptions(Reference<ReadYourWritesTransaction> tr) {
@@ -350,7 +352,7 @@ private:
 class TaskFuture : public ReferenceCounted<TaskFuture> {
 public:
 	TaskFuture();
-	TaskFuture(const Reference<FutureBucket> bucket, Standalone<StringRef> key = Standalone<StringRef>());
+	explicit TaskFuture(const Reference<FutureBucket> bucket, Standalone<StringRef> key = Standalone<StringRef>());
 	virtual ~TaskFuture();
 
 	Future<bool> isSet(Reference<ReadYourWritesTransaction> tr);
@@ -439,14 +441,12 @@ public:
 
 struct TaskFuncBase : IDispatched<TaskFuncBase, Standalone<StringRef>, std::function<TaskFuncBase*()>>,
                       ReferenceCounted<TaskFuncBase> {
-	virtual ~TaskFuncBase() {};
+	virtual ~TaskFuncBase() = default;
 	static Reference<TaskFuncBase> create(Standalone<StringRef> const& taskFuncType) {
 		return Reference<TaskFuncBase>(dispatch(taskFuncType)());
 	}
 
-	static bool isValidTaskType(StringRef type) {
-		return (type.size()) && (dispatches().find(type) != dispatches().end());
-	}
+	static bool isValidTaskType(StringRef type) { return !type.empty() && dispatches().contains(type); }
 
 	static bool isValidTask(Reference<Task> task) {
 		auto itor = task->params.find(Task::reservedTaskParamKeyType);
@@ -496,11 +496,11 @@ struct TaskCompletionKey {
 	static TaskCompletionKey signal(Reference<TaskFuture> f) { return TaskCompletionKey(f->key); }
 
 	static TaskCompletionKey noSignal() { return TaskCompletionKey(StringRef()); }
-	TaskCompletionKey() {}
+	TaskCompletionKey() = default;
 
 private:
-	TaskCompletionKey(Reference<TaskFuture> f) : joinFuture(f) {}
-	TaskCompletionKey(Key k) : key(k) {}
+	explicit TaskCompletionKey(Reference<TaskFuture> f) : joinFuture(f) {}
+	explicit TaskCompletionKey(Key k) : key(k) {}
 };
 
 #endif

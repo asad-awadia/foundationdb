@@ -43,7 +43,7 @@ struct VersionVector {
 	                    // version in the "versions" map.)
 
 	VersionVector() : maxVersion(invalidVersion), cachedEncodedSize(InvalidEncodedSize) {}
-	VersionVector(Version version) : maxVersion(version), cachedEncodedSize(InvalidEncodedSize) {}
+	explicit VersionVector(Version version) : maxVersion(version), cachedEncodedSize(InvalidEncodedSize) {}
 
 private:
 	// Only invoked by getDelta() and applyDelta(), where tag has been validated
@@ -60,7 +60,7 @@ private:
 	// that happen to the version vector.
 	// @note A value of 0 (= InvalidEncodedSize) indicates that the encoded version
 	// vector size is not cached.
-	size_t cachedEncodedSize;
+	mutable size_t cachedEncodedSize;
 
 public:
 	Version getMaxVersion() const { return maxVersion; }
@@ -95,7 +95,7 @@ public:
 
 	bool hasVersion(const Tag& tag) const {
 		ASSERT(tag != invalidTag);
-		return versions.find(tag) != versions.end();
+		return versions.contains(tag);
 	}
 
 	// @pre assumes that the given tag has an entry in the version vector.
@@ -198,7 +198,7 @@ public:
 	//
 	// Methods to set/get/check cached encoded version vector size.
 	//
-	void setCachedEncodedSize(size_t size) { cachedEncodedSize = size; }
+	void setCachedEncodedSize(size_t size) const { cachedEncodedSize = size; }
 
 	bool isEncodedSizeCached() const { return cachedEncodedSize != InvalidEncodedSize; }
 
@@ -509,7 +509,7 @@ struct dynamic_size_traits<VersionVector> : std::true_type {
 			ASSERT(encodedSize == vv.getEncodedSize());
 		} else {
 			encodedSize = vv.getEncodedSize();
-			const_cast<VersionVector&>(vv).setCachedEncodedSize(encodedSize);
+			vv.setCachedEncodedSize(encodedSize);
 		}
 		return encodedSize;
 	}

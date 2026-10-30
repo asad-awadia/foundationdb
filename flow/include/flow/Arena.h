@@ -47,7 +47,6 @@
 #include <unordered_set>
 #include <type_traits>
 #include <sstream>
-#include <string_view>
 #include <fmt/format.h>
 
 // TrackIt is a zero-size class for tracking constructions, destructions, and assignments of instances
@@ -61,7 +60,7 @@
 // of a class without producing an "inaccessible due to ambiguity" error.
 template <class T>
 struct TrackIt {
-	typedef TrackIt<T> TrackItType;
+	using TrackItType = TrackIt<T>;
 // Put TRACKIT_ASSIGN into any operator= functions for which you want assignments tracked
 #define TRACKIT_ASSIGN(o) *(TrackItType*)this = *(TrackItType*)&(o)
 
@@ -305,8 +304,8 @@ public:
 	T& contents() { return *(T*)this; }
 	T const& contents() const { return *(T const*)this; }
 
-	Standalone() {}
-	Standalone(const T& t) : Arena(t.expectedSize()), T(arena(), t) {}
+	Standalone() = default;
+	explicit(false) Standalone(const T& t) : Arena(t.expectedSize()), T(arena(), t) {}
 	Standalone<T>& operator=(const T& t) {
 		Arena old = std::move(arena()); // We want to defer the destruction of the arena until after we have copied t,
 		                                // in case it cross-references our previous value
@@ -338,7 +337,7 @@ public:
 
 private:
 	template <class U>
-	Standalone(Standalone<U> const&); // unimplemented
+	explicit(false) Standalone(Standalone<U> const&); // unimplemented
 	template <class U>
 	Standalone<T> const& operator=(Standalone<U> const&); // unimplemented
 };
@@ -352,6 +351,12 @@ private:
 		static SimpleCounter<int64_t>* bytesCopied =
 		    SimpleCounter<int64_t>::makeCounter("/flow/arena/stringRefBytesCopied");
 		return bytesCopied;
+	}
+
+	// Delegated-to by StringRef(const char*) so strlen runs once and overflow is checked before truncation.
+	StringRef(const char* str, size_t len)
+	  : data(reinterpret_cast<const uint8_t*>(str)), length(static_cast<int>(len)) {
+		UNSTOPPABLE_ASSERT(len <= std::numeric_limits<int>::max());
 	}
 
 public:
@@ -378,7 +383,21 @@ public:
 		}
 	}
 	StringRef(const uint8_t* data, int length) : data(data), length(length) {}
-	StringRef(const std::string& s) : data((const uint8_t*)s.c_str()), length((int)s.size()) {
+	// For string literals prefer "foo"_sr, which captures the length at compile time and
+	// avoids the runtime strlen walk this ctor performs. This ctor is for const char*
+	// values whose length isn't known at compile time (e.g: from  C APIs or interop).
+	// Borrows the pointer and computes length via strlen, like std::string_view.
+	// Marked explicit so that existing `f("literal")` calls that resolve against
+	// overload pairs like f(std::string) / f(StringRef) keep picking std::string,
+	// avoiding ambiguity. Direct-init `StringRef s("literal")` still selects this
+	// constructor — which is the actual use-after-free case this guards against.
+	// Precondition: str is not null.
+	explicit StringRef(const char* str) : StringRef(str, strlen(str)) {}
+	explicit StringRef(std::nullptr_t) = delete;
+	// Reject integer literals (e.g. StringRef(0)), which would otherwise pick the const char*
+	// overload via null-pointer conversion and crash in strlen.
+	explicit StringRef(int) = delete;
+	explicit(false) StringRef(const std::string& s) : data((const uint8_t*)s.c_str()), length((int)s.size()) {
 		if (s.size() > std::numeric_limits<int>::max())
 			abort();
 	}
@@ -579,7 +598,7 @@ public:
 
 private:
 	// Unimplemented; blocks conversion through std::string
-	StringRef(char*);
+	explicit StringRef(char*);
 
 	const uint8_t* data;
 	int length;
@@ -613,16 +632,14 @@ struct hash<Optional<T>> {
 };
 } // namespace std
 
-template <class T, class V = std::void_t<>>
-struct boost_hashable : std::false_type {};
-
 template <class T>
-struct boost_hashable<T, std::void_t<decltype(boost::hash_value(std::declval<T>()))>> : std::true_type {};
+concept boost_hashable = requires(T const& value) { boost::hash_value(value); };
 
 // Using boost hash functions on types that depend on member hashes (e.g. std::pair) expect the members
 // to be boost hashable. This provides a default boost hash function based on std::hash.
 template <class T>
-std::enable_if_t<!boost_hashable<T>::value, std::size_t> hash_value(const T& v) {
+    requires(!boost_hashable<T>)
+std::size_t hash_value(const T& v) {
 	return std::hash<T>{}(v);
 }
 
@@ -666,7 +683,7 @@ inline static uintptr_t getAlignedUpperBound(uintptr_t value, uintptr_t alignmen
 
 // makeString is used to allocate a Standalone<StringRef> of a known length for later
 // mutation (via mutateString).  If you need to append to a string of unknown length,
-// consider factoring StringBuffer from DiskQueue.actor.cpp.
+// consider factoring StringBuffer from DiskQueue.cpp.
 inline static Standalone<StringRef> makeString(int length) {
 	Standalone<StringRef> returnString;
 	uint8_t* outData = new (returnString.arena()) uint8_t[length];
@@ -764,7 +781,7 @@ struct dynamic_size_traits<StringRef> : std::true_type {
 };
 
 inline bool operator==(const StringRef& lhs, const StringRef& rhs) {
-	if (lhs.size() == 0 && rhs.size() == 0) {
+	if (lhs.empty() && rhs.empty()) {
 		return true;
 	}
 	ASSERT(lhs.size() >= 0);
@@ -800,7 +817,7 @@ inline bool operator>=(const StringRef& lhs, const StringRef& rhs) {
 	return !(lhs < rhs);
 }
 
-typedef uint64_t Word;
+using Word = uint64_t;
 // Get the number of prefix bytes that are the same between a and b, up to their common length of cl
 static inline int commonPrefixLength(uint8_t const* ap, uint8_t const* bp, int cl) {
 	int i = 0;
@@ -865,12 +882,12 @@ enum class VecSerStrategy { FlatBuffers, String };
 
 template <class T, VecSerStrategy>
 struct VectorRefPreserializer {
-	VectorRefPreserializer() {}
-	VectorRefPreserializer(const VectorRefPreserializer<T, VecSerStrategy::FlatBuffers>&) noexcept {}
+	VectorRefPreserializer() = default;
+	explicit(false) VectorRefPreserializer(const VectorRefPreserializer<T, VecSerStrategy::FlatBuffers>&) noexcept {}
 	VectorRefPreserializer& operator=(const VectorRefPreserializer<T, VecSerStrategy::FlatBuffers>&) noexcept {
 		return *this;
 	}
-	VectorRefPreserializer(const VectorRefPreserializer<T, VecSerStrategy::String>&) noexcept {}
+	explicit(false) VectorRefPreserializer(const VectorRefPreserializer<T, VecSerStrategy::String>&) noexcept {}
 	VectorRefPreserializer& operator=(const VectorRefPreserializer<T, VecSerStrategy::String>&) noexcept {
 		return *this;
 	}
@@ -893,7 +910,8 @@ struct VectorRefPreserializer<T, VecSerStrategy::String> {
 		_cached_size = other._cached_size;
 		return *this;
 	}
-	VectorRefPreserializer(const VectorRefPreserializer<T, VecSerStrategy::FlatBuffers>&) noexcept : _cached_size(-1) {}
+	explicit(false) VectorRefPreserializer(const VectorRefPreserializer<T, VecSerStrategy::FlatBuffers>&) noexcept
+	  : _cached_size(-1) {}
 	VectorRefPreserializer& operator=(const VectorRefPreserializer<T, VecSerStrategy::FlatBuffers>&) noexcept {
 		_cached_size = -1;
 		return *this;
@@ -932,7 +950,7 @@ public:
 	VectorRef() : data(0), m_size(0), m_capacity(0) {}
 
 	template <VecSerStrategy S>
-	VectorRef(const VectorRef<T, S>& other)
+	explicit(false) VectorRef(const VectorRef<T, S>& other)
 	  : VPS(other), data(other.data), m_size(other.m_size), m_capacity(other.m_capacity) {}
 	template <VecSerStrategy S>
 	VectorRef& operator=(const VectorRef<T, S>& other) {
@@ -945,7 +963,8 @@ public:
 
 	// Arena constructor for non-Ref types, identified by !flow_ref
 	template <class T2 = T, VecSerStrategy S>
-	VectorRef(Arena& p, const VectorRef<T, S>& toCopy, typename std::enable_if<!flow_ref<T2>::value, int>::type = 0)
+	    requires(!flow_ref<T2>::value)
+	VectorRef(Arena& p, const VectorRef<T, S>& toCopy)
 	  : VPS(toCopy), data((T*)new(p) uint8_t[sizeof(T) * toCopy.size()]), m_size(toCopy.size()),
 	    m_capacity(toCopy.size()) {
 		if (m_size > 0) {
@@ -955,7 +974,8 @@ public:
 
 	// Arena constructor for Ref types, which must have an Arena constructor
 	template <class T2 = T, VecSerStrategy S>
-	VectorRef(Arena& p, const VectorRef<T, S>& toCopy, typename std::enable_if<flow_ref<T2>::value, int>::type = 0)
+	    requires(flow_ref<T2>::value)
+	VectorRef(Arena& p, const VectorRef<T, S>& toCopy)
 	  : VPS(), data((T*)new(p) uint8_t[sizeof(T) * toCopy.size()]), m_size(toCopy.size()), m_capacity(toCopy.size()) {
 		for (int i = 0; i < m_size; i++) {
 			auto ptr = new (&data[i]) T(p, toCopy[i]);
@@ -978,7 +998,8 @@ public:
 	// toCopy.m_capacity ) {} VectorRef<T>& operator=( const VectorRef<T>& );
 
 	template <VecSerStrategy S = SerStrategy>
-	typename std::enable_if<S == VecSerStrategy::String, uint32_t>::type serializedSize() const {
+	    requires(S == VecSerStrategy::String)
+	uint32_t serializedSize() const {
 		uint32_t result = sizeof(uint32_t);
 		string_serialized_traits<T> t;
 		if (VPS::_cached_size >= 0) {
@@ -1009,7 +1030,8 @@ public:
 	std::reverse_iterator<const T*> rend() const { return std::reverse_iterator<const T*>(begin()); }
 
 	template <VecSerStrategy S = SerStrategy>
-	typename std::enable_if<S == VecSerStrategy::FlatBuffers, VectorRef>::type slice(int begin, int end) const {
+	    requires(S == VecSerStrategy::FlatBuffers)
+	VectorRef slice(int begin, int end) const {
 		return VectorRef(data + begin, end - begin);
 	}
 
@@ -1143,13 +1165,15 @@ public:
 
 	// expectedSize() for non-Ref types, identified by !flow_ref
 	template <class T2 = T>
-	typename std::enable_if<!flow_ref<T2>::value, size_t>::type expectedSize() const {
+	    requires(!flow_ref<T2>::value)
+	size_t expectedSize() const {
 		return sizeof(T) * m_size;
 	}
 
 	// expectedSize() for Ref types, which must in turn have expectedSize() implemented.
 	template <class T2 = T>
-	typename std::enable_if<flow_ref<T2>::value, size_t>::type expectedSize() const {
+	    requires(flow_ref<T2>::value)
+	size_t expectedSize() const {
 		size_t t = sizeof(T) * m_size;
 		for (int i = 0; i < m_size; i++)
 			t += data[i].expectedSize();
@@ -1286,29 +1310,20 @@ public:
 
 public: // Construction
 	static_assert(std::is_trivially_destructible_v<T>);
-	SmallVectorRef() {}
+	SmallVectorRef() = default;
 	SmallVectorRef(const SmallVectorRef<T, InlineMembers>& other)
 	  : m_size(other.m_size), arr(other.arr), data(other.data) {}
-	SmallVectorRef& operator=(const SmallVectorRef<T, InlineMembers>& other) {
-		m_size = other.m_size;
-		arr = other.arr;
-		data = other.data;
-		return *this;
-	}
+	SmallVectorRef& operator=(const SmallVectorRef<T, InlineMembers>&) = default;
 
 	template <class T2 = T, int IM = InlineMembers>
-	SmallVectorRef(Arena& arena,
-	               const SmallVectorRef<T, IM>& toCopy,
-	               typename std::enable_if<!flow_ref<T2>::value, int>::type = 0)
-	  : m_size(0) {
+	    requires(!flow_ref<T2>::value)
+	SmallVectorRef(Arena& arena, const SmallVectorRef<T, IM>& toCopy, int = 0) : m_size(0) {
 		append(arena, toCopy.begin(), toCopy.size());
 	}
 
 	template <class T2 = T, int IM = InlineMembers>
-	SmallVectorRef(Arena& arena,
-	               const SmallVectorRef<T2, IM>& toCopy,
-	               typename std::enable_if<flow_ref<T2>::value, int>::type = 0)
-	  : m_size(0) {
+	    requires(flow_ref<T2>::value)
+	SmallVectorRef(Arena& arena, const SmallVectorRef<T2, IM>& toCopy, int = 0) : m_size(0) {
 		append_deep(arena, toCopy.begin(), toCopy.size());
 	}
 

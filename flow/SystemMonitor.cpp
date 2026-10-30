@@ -18,13 +18,12 @@
  * limitations under the License.
  */
 
-#include <fstream>
-
 #include "flow/flow.h"
-#include "flow/Histogram.h"
 #include "flow/Platform.h"
-#include "flow/TDMetric.actor.h"
+#include "flow/TDMetric.h"
 #include "flow/SystemMonitor.h"
+#include "flow/Knobs.h"
+#include "flow/MemoryTracker.h"
 
 #if defined(ALLOC_INSTRUMENTATION) && defined(__linux__)
 #include <cxxabi.h>
@@ -111,10 +110,6 @@ SystemStatistics getSystemStatistics() {
 	    .detail("SampleCount", 1)                                                                                      \
 	    .detail("Hash", "FastAllocatedUnused" #size)                                                                   \
 	    .detail("Bt", "na")
-#define DETAILALLOCATORMEMUSAGE(size)                                                                                  \
-	detail("TotalMemory" #size, FastAllocator<size>::getTotalMemory())                                                 \
-	    .detail("ApproximateUnusedMemory" #size, FastAllocator<size>::getApproximateMemoryUnused())                    \
-	    .detail("ActiveThreads" #size, FastAllocator<size>::getActiveThreads())
 
 namespace {
 
@@ -231,51 +226,24 @@ SystemStatistics customSystemMonitor(std::string const& eventName, StatisticsSta
 
 			    .trackLatest(eventName);
 
-			TraceEvent("MemoryMetrics")
-			    .DETAILALLOCATORMEMUSAGE(16)
-			    .DETAILALLOCATORMEMUSAGE(32)
-			    .DETAILALLOCATORMEMUSAGE(64)
-			    .DETAILALLOCATORMEMUSAGE(96)
-			    .DETAILALLOCATORMEMUSAGE(128)
-			    .DETAILALLOCATORMEMUSAGE(256)
-			    .DETAILALLOCATORMEMUSAGE(512)
-			    .DETAILALLOCATORMEMUSAGE(1024)
-			    .DETAILALLOCATORMEMUSAGE(2048)
-			    .DETAILALLOCATORMEMUSAGE(4096)
-			    .DETAILALLOCATORMEMUSAGE(8192)
-			    .DETAILALLOCATORMEMUSAGE(16384)
-			    .detail("HugeArenaMemory", g_hugeArenaMemory.load())
-			    .detail("DCID", machineState.dcId)
-			    .detail("ZoneID", machineState.zoneId)
-			    .detail("MachineID", machineState.machineId);
+			{
+				TraceEvent memoryMetrics("MemoryMetrics");
+				forEachFastAllocatorSize([&]<int Size>() {
+					memoryMetrics.detail(format("TotalMemory%d", Size), FastAllocator<Size>::getTotalMemory())
+					    .detail(format("ApproximateUnusedMemory%d", Size),
+					            FastAllocator<Size>::getApproximateMemoryUnused())
+					    .detail(format("ActiveThreads%d", Size), FastAllocator<Size>::getActiveThreads());
+				});
+				memoryMetrics.detail("HugeArenaMemory", g_hugeArenaMemory.load())
+				    .detail("DCID", machineState.dcId)
+				    .detail("ZoneID", machineState.zoneId)
+				    .detail("MachineID", machineState.machineId);
+			}
 
 			uint64_t total_memory = 0;
-			total_memory += FastAllocator<16>::getTotalMemory();
-			total_memory += FastAllocator<32>::getTotalMemory();
-			total_memory += FastAllocator<64>::getTotalMemory();
-			total_memory += FastAllocator<96>::getTotalMemory();
-			total_memory += FastAllocator<128>::getTotalMemory();
-			total_memory += FastAllocator<256>::getTotalMemory();
-			total_memory += FastAllocator<512>::getTotalMemory();
-			total_memory += FastAllocator<1024>::getTotalMemory();
-			total_memory += FastAllocator<2048>::getTotalMemory();
-			total_memory += FastAllocator<4096>::getTotalMemory();
-			total_memory += FastAllocator<8192>::getTotalMemory();
-			total_memory += FastAllocator<16384>::getTotalMemory();
+			forEachFastAllocatorSize([&]<int Size>() { total_memory += FastAllocator<Size>::getTotalMemory(); });
 
-			uint64_t unused_memory = 0;
-			unused_memory += FastAllocator<16>::getApproximateMemoryUnused();
-			unused_memory += FastAllocator<32>::getApproximateMemoryUnused();
-			unused_memory += FastAllocator<64>::getApproximateMemoryUnused();
-			unused_memory += FastAllocator<96>::getApproximateMemoryUnused();
-			unused_memory += FastAllocator<128>::getApproximateMemoryUnused();
-			unused_memory += FastAllocator<256>::getApproximateMemoryUnused();
-			unused_memory += FastAllocator<512>::getApproximateMemoryUnused();
-			unused_memory += FastAllocator<1024>::getApproximateMemoryUnused();
-			unused_memory += FastAllocator<2048>::getApproximateMemoryUnused();
-			unused_memory += FastAllocator<4096>::getApproximateMemoryUnused();
-			unused_memory += FastAllocator<8192>::getApproximateMemoryUnused();
-			unused_memory += FastAllocator<16384>::getApproximateMemoryUnused();
+			const uint64_t unused_memory = getTotalUnusedAllocatedMemory();
 
 			if (total_memory > 0) {
 				TraceEvent("FastAllocMemoryUsage")
@@ -492,6 +460,20 @@ SystemStatistics customSystemMonitor(std::string const& eventName, StatisticsSta
 #endif
 	statState->networkMetricsState = g_network->networkInfo.metrics;
 	statState->networkState = netData;
+
+	// Periodic dump of the per-call-site memory tracker; cadence from the
+	// MEMORY_TRACKING_REPORT_INTERVAL knob (<=0 disables). In simulation the
+	// tracker's tables and this static are shared across all simulated
+	// processes, so one dump fires per interval cluster-wide and its site
+	// numbers blend every process — correct only in a real single-process server.
+	if (FLOW_KNOBS && FLOW_KNOBS->MEMORY_TRACKING_REPORT_INTERVAL > 0) {
+		static double lastMemTrackerDump = 0;
+		if (now() - lastMemTrackerDump >= FLOW_KNOBS->MEMORY_TRACKING_REPORT_INTERVAL) {
+			memTrackerDump(FLOW_KNOBS->MEMORY_TRACKING_REPORT_BYTES_THRESHOLD);
+			lastMemTrackerDump = now();
+		}
+	}
+
 	return currentStats;
 }
 

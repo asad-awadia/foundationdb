@@ -19,6 +19,10 @@ SCRATCH_DIR=
 readonly TAG="test_backup"
 USE_PARTITIONED_LOG=$(((RANDOM % 2)) && echo true || echo false )
 USE_ENCRYPTION=$(((RANDOM % 2)) && echo true || echo false )
+USE_ENCRYPTION_BLOCK_SIZE=false
+if [[ "${USE_ENCRYPTION}" == "true" ]]; then
+  USE_ENCRYPTION_BLOCK_SIZE=$(((RANDOM % 2)) && echo true || echo false)
+fi
 ENCRYPTION_KEY_FILE=
 
 # Install signal traps. Calls the cleanup function.
@@ -30,21 +34,27 @@ trap cleanup  EXIT
 function cleanup {
   echo "$(date -Iseconds) cleanup: starting (with 30s hard timeout)"
   start_cleanup_watchdog 30
-  
+
+  if cleanup_with_preserve_check; then
+    echo "$(date -Iseconds) cleanup: preserving test data, skipping cleanup"
+    cancel_cleanup_watchdog
+    return 0
+  fi
+
   echo "$(date -Iseconds) cleanup: shutting down FDB cluster"
   shutdown_fdb_cluster
-  
+
   if [[ -d "${SCRATCH_DIR}" ]]; then
     echo "$(date -Iseconds) cleanup: removing scratch dir: ${SCRATCH_DIR}"
     rm -rf "${SCRATCH_DIR}"
   fi
-  
+
   # Clean up encryption key file
   if [[ -n "${ENCRYPTION_KEY_FILE:-}" ]] && [[ -f "${ENCRYPTION_KEY_FILE}" ]]; then
     echo "$(date -Iseconds) cleanup: removing encryption key file: ${ENCRYPTION_KEY_FILE}"
     rm -f "${ENCRYPTION_KEY_FILE}"
   fi
-  
+
   echo "$(date -Iseconds) cleanup: complete"
   cancel_cleanup_watchdog
 }
@@ -82,12 +92,78 @@ function backup {
     cmd_args+=("--encryption-key-file" "${local_encryption_key_file}")
   fi
 
+  if [[ "${USE_ENCRYPTION_BLOCK_SIZE}" == "true" ]]; then
+    cmd_args+=("--encryption-block-size" "4096")
+  fi
+
   if [[ "${USE_PARTITIONED_LOG}" == "true" ]]; then
-    cmd_args+=("--partitioned-log-experimental")
+    cmd_args+=("--mutation-log-type" "partitioned-log-experimental")
   fi
 
   if ! "${local_build_dir}"/bin/fdbbackup start "${cmd_args[@]}"; then
     err "Start fdbbackup failed"
+    return 1
+  fi
+}
+
+# Check that 'fdbbackup status' reports the mutation log type the backup was started with.
+# $1 The build directory
+# $2 The scratch directory
+function check_status_mutation_log_type {
+  local local_build_dir="${1}"
+  local scratch_dir="${2}"
+  local expected="default"
+  if [[ "${USE_PARTITIONED_LOG}" == "true" ]]; then
+    expected="partitioned-log-experimental"
+  fi
+
+  local status_output
+  if ! status_output=$("${local_build_dir}"/bin/fdbbackup status -t "${TAG}" \
+      -C "${scratch_dir}/loopback_cluster/fdb.cluster" --log --logdir="${scratch_dir}" 2>&1); then
+    err "fdbbackup status failed: ${status_output}"
+    return 1
+  fi
+  if ! grep -qx "Mutation Log Type: ${expected}" <<< "${status_output}"; then
+    err "Expected 'Mutation Log Type: ${expected}' in status output: ${status_output}"
+    return 1
+  fi
+
+  local json_output
+  if ! json_output=$("${local_build_dir}"/bin/fdbbackup status --json -t "${TAG}" \
+      -C "${scratch_dir}/loopback_cluster/fdb.cluster" --log --logdir="${scratch_dir}"); then
+    err "fdbbackup status --json failed: ${json_output}"
+    return 1
+  fi
+  local json_type
+  if ! json_type=$(jq -r '.MutationLogType' <<< "${json_output}"); then
+    err "Failed to parse status --json output: ${json_output}"
+    return 1
+  fi
+  if [[ "${json_type}" != "${expected}" ]]; then
+    err "Expected MutationLogType '${expected}' in status --json, got '${json_type}'"
+    return 1
+  fi
+}
+
+# Check that 'fdbrestore status' reports the mutation log type the backup was started with.
+# $1 The build directory
+# $2 The scratch directory
+function check_restore_status_mutation_log_type {
+  local local_build_dir="${1}"
+  local scratch_dir="${2}"
+  local expected="default"
+  if [[ "${USE_PARTITIONED_LOG}" == "true" ]]; then
+    expected="partitioned-log-experimental"
+  fi
+
+  local status_output
+  if ! status_output=$("${local_build_dir}"/bin/fdbrestore status -t "${TAG}" \
+      --dest-cluster-file "${scratch_dir}/loopback_cluster/fdb.cluster" --log --logdir="${scratch_dir}" 2>&1); then
+    err "fdbrestore status failed: ${status_output}"
+    return 1
+  fi
+  if ! grep -qE "  Mutation Log Type: ${expected}( |$)" <<< "${status_output}"; then
+    err "Expected 'Mutation Log Type: ${expected}' in restore status output: ${status_output}"
     return 1
   fi
 }
@@ -129,6 +205,40 @@ function restore {
   fi
 }
 
+# fdbbackup query reports failure as a JSON object on stdout, so only the exit status distinguishes it from success.
+# $1 build directory
+# $2 a url that does not hold a backup
+# $3 the url of an existing backup; empty to skip the success check, as query has no way to be given an
+#    encryption key
+function test_query_exit_codes {
+  local local_build_dir="${1}"
+  local bad_url="${2}"
+  local good_url="${3:-}"
+
+  local out
+  local rc
+  if [[ -n "${good_url}" ]]; then
+    set +e
+    out=$("${local_build_dir}"/bin/fdbbackup query -d "${good_url}" 2>/dev/null)
+    rc=$?
+    set -e
+    if (( rc != 0 )); then
+      err "fdbbackup query on an existing backup exited ${rc}; output: ${out}"
+      return 1
+    fi
+  fi
+
+  set +e
+  out=$("${local_build_dir}"/bin/fdbbackup query -d "${bad_url}" 2>/dev/null)
+  rc=$?
+  set -e
+  if (( rc == 0 )); then
+    err "fdbbackup query on a missing backup exited 0; output: ${out}"
+    return 1
+  fi
+  log "fdbbackup query exit codes OK (missing backup exit: ${rc})"
+}
+
 # Run a backup to the fs and then a restore.
 # $1 build directory
 # $2 the scratch directory
@@ -149,6 +259,11 @@ function test_dir_backup_and_restore {
     err "Failed backup"
     return 1
   fi
+  log "Check status mutation log type"
+  if ! check_status_mutation_log_type "${local_build_dir}" "${scratch_dir}"; then
+    err "Failed status mutation log type check"
+    return 1
+  fi
 
   test_fdbcli_status_json_for_bkup "${local_build_dir}" "${scratch_dir}"
 
@@ -157,9 +272,35 @@ function test_dir_backup_and_restore {
     err "Failed clear data in fdb"
     return 1
   fi
+
+  log "Testing encryption mismatches"
+  local backup
+  local backup_name
+  if ! backup=$(ls -dt "${scratch_dir}"/backups/backup-* | head -1); then
+    err "Failed to list backups under ${scratch_dir}/backups/"
+    return 1
+  fi
+  backup_name=$(basename "${backup}")
+  test_encryption_mismatches "${local_build_dir}" "${scratch_dir}" "file://${scratch_dir}/backups/${backup_name}" "${TAG}" "${local_encryption_key_file}"
+
+  log "Testing fdbbackup query exit codes"
+  local query_url=
+  if [[ -z "${local_encryption_key_file}" ]]; then
+    query_url="file://${scratch_dir}/backups/${backup_name}"
+  fi
+  if ! test_query_exit_codes "${local_build_dir}" "file://${scratch_dir}/no_such_backup" "${query_url}"; then
+    err "Failed fdbbackup query exit code test"
+    return 1
+  fi
+
   log "Restore"
   if ! restore "${local_build_dir}" "${scratch_dir}" "${local_encryption_key_file}"; then
     err "Failed restore"
+    return 1
+  fi
+  log "Check restore status mutation log type"
+  if ! check_restore_status_mutation_log_type "${local_build_dir}" "${scratch_dir}"; then
+    err "Failed restore status mutation log type check"
     return 1
   fi
   log "Verify restore"
@@ -195,6 +336,11 @@ export FDB_DATA_KEYCOUNT=10
 # shellcheck source=/dev/null
 if ! source "${cwd}/../../fdbclient/tests/tests_common.sh"; then
   err "Failed to source tests_common.sh"
+  exit 1
+fi
+# shellcheck source=/dev/null
+if ! source "${cwd}/backup_tests_common.sh"; then
+  err "Failed to source backup_tests_common.sh"
   exit 1
 fi
 
@@ -238,6 +384,7 @@ fi
 
 readonly USE_PARTITIONED_LOG
 readonly USE_ENCRYPTION
+readonly USE_ENCRYPTION_BLOCK_SIZE
 readonly ENCRYPTION_KEY_FILE
 
 # Startup fdb cluster and backup agent.

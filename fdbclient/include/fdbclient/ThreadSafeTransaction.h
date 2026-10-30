@@ -25,7 +25,7 @@
 #pragma once
 
 #include "fdbclient/ReadYourWrites.h"
-#include "flow/ThreadHelper.actor.h"
+#include "flow/ThreadHelper.h"
 #include "fdbclient/ClusterInterface.h"
 #include "fdbclient/IClientApi.h"
 
@@ -58,6 +58,15 @@ public:
 	ThreadFuture<Void> forceRecoveryWithDataLoss(const StringRef& dcid) override;
 	ThreadFuture<Void> createSnapshot(const StringRef& uid, const StringRef& snapshot_command) override;
 
+	ThreadFuture<CDCStreamId> registerNativeCdcStream(const KeyRef& name, const std::vector<KeyRange>& ranges) override;
+	ThreadFuture<CDCStreamId> registerNativeCdcOrderedStream(const KeyRef& name,
+	                                                         const std::vector<KeyRange>& ranges,
+	                                                         const std::vector<Key>& splitPoints) override;
+	ThreadFuture<Void> removeNativeCdcStream(const KeyRef& name) override;
+	ThreadFuture<std::vector<NativeCdcStreamInfo>> listNativeCdcStreams() override;
+	ThreadFuture<Reference<INativeCdcConsumer>> createNativeCdcConsumer(const KeyRef& name) override;
+	ThreadFuture<Reference<INativeCdcConsumer>> resumeNativeCdcConsumer(const NativeCdcCursor& cursor) override;
+
 	ThreadFuture<DatabaseSharedState*> createSharedState() override;
 	void setSharedState(DatabaseSharedState* p) override;
 
@@ -71,7 +80,7 @@ private:
 public: // Internal use only
 	enum class ConnectionRecordType { FILE, CONNECTION_STRING };
 	ThreadSafeDatabase(ConnectionRecordType connectionRecordType, std::string connectionRecord, int apiVersion);
-	ThreadSafeDatabase(DatabaseContext* db) : db(db) {}
+	explicit ThreadSafeDatabase(DatabaseContext* db) : db(db) {}
 	DatabaseContext* unsafeGetPtr() const { return db; }
 };
 
@@ -123,7 +132,8 @@ public:
 	ThreadFuture<Standalone<StringRef>> getVersionstamp() override;
 	ThreadFuture<int64_t> getEstimatedRangeSizeBytes(const KeyRangeRef& keys) override;
 	ThreadFuture<Standalone<VectorRef<KeyRef>>> getRangeSplitPoints(const KeyRangeRef& range,
-	                                                                int64_t chunkSize) override;
+	                                                                int64_t chunkSize,
+	                                                                int limit = -1) override;
 
 	void addReadConflictRange(const KeyRangeRef& keys) override;
 	void makeSelfConflicting();

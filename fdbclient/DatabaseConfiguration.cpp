@@ -23,9 +23,10 @@
 #include "fdbclient/FDBTypes.h"
 #include "fdbclient/SystemData.h"
 #include "flow/ITrace.h"
+#include "flow/ObjectSerializer.h"
 #include "flow/Platform.h"
 #include "flow/Trace.h"
-#include "flow/genericactors.actor.h"
+#include "flow/genericactors.h"
 #include "flow/UnitTest.h"
 
 DatabaseConfiguration::DatabaseConfiguration() {
@@ -36,7 +37,7 @@ void DatabaseConfiguration::resetInternal() {
 	// does NOT reset rawConfiguration
 	initialized = false;
 	commitProxyCount = grvProxyCount = resolverCount = desiredTLogCount = tLogWriteAntiQuorum = tLogReplicationFactor =
-	    storageTeamSize = desiredLogRouterCount = -1;
+	    storageTeamSize = desiredLogRouterCount = desiredRangePartitionedBackupWorkerCount = -1;
 	tLogVersion = TLogVersion::DEFAULT;
 	tLogDataStoreType = storageServerStoreType = testingStorageServerStoreType = KeyValueStoreType::END;
 	perpetualStoreType = KeyValueStoreType::NONE;
@@ -52,9 +53,12 @@ void DatabaseConfiguration::resetInternal() {
 	remoteDesiredTLogCount = -1;
 	remoteTLogReplicationFactor = repopulateRegionAntiQuorum = 0;
 	backupWorkerEnabled = false;
+	rangePartitionedBackupWorkerEnabled = false;
 	perpetualStorageWiggleSpeed = 0;
 	perpetualStorageWiggleLocality = "0";
 	storageMigrationType = StorageMigrationType::DEFAULT;
+	shardMetadataFormat = ShardMetadataFormat::UNSET;
+	shardMetadataMigration = ShardMetadataMigration::UNSET;
 }
 
 int toInt(ValueRef const& v) {
@@ -83,7 +87,7 @@ void parseReplicationPolicy(Reference<IReplicationPolicy>* policy, ValueRef cons
 
 void parse(std::vector<RegionInfo>* regions, ValueRef const& v) {
 	try {
-		StatusObject statusObj = BinaryReader::fromStringRef<StatusObject>(v, IncludeVersion());
+		auto statusObj = BinaryReader::fromStringRef<StatusObject>(v, IncludeVersion());
 		regions->clear();
 		if (statusObj["regions"].type() != json_spirit::array_type) {
 			return;
@@ -122,47 +126,39 @@ void parse(std::vector<RegionInfo>* regions, ValueRef const& v) {
 					info.satelliteTLogReplicationFactor = 1;
 					info.satelliteTLogUsableDcs = 1;
 					info.satelliteTLogWriteAntiQuorum = 0;
-					info.satelliteTLogPolicy = Reference<IReplicationPolicy>(new PolicyOne());
+					info.satelliteTLogPolicy = makeReference<PolicyOne>();
 				} else if (satelliteReplication == "one_satellite_double") {
 					info.satelliteTLogReplicationFactor = 2;
 					info.satelliteTLogUsableDcs = 1;
 					info.satelliteTLogWriteAntiQuorum = 0;
-					info.satelliteTLogPolicy = Reference<IReplicationPolicy>(
-					    new PolicyAcross(2, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
+					info.satelliteTLogPolicy = makeReference<PolicyAcross>(2, "zoneid", makeReference<PolicyOne>());
 				} else if (satelliteReplication == "one_satellite_triple") {
 					info.satelliteTLogReplicationFactor = 3;
 					info.satelliteTLogUsableDcs = 1;
 					info.satelliteTLogWriteAntiQuorum = 0;
-					info.satelliteTLogPolicy = Reference<IReplicationPolicy>(
-					    new PolicyAcross(3, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
+					info.satelliteTLogPolicy = makeReference<PolicyAcross>(3, "zoneid", makeReference<PolicyOne>());
 				} else if (satelliteReplication == "two_satellite_safe") {
 					info.satelliteTLogReplicationFactor = 4;
 					info.satelliteTLogUsableDcs = 2;
 					info.satelliteTLogWriteAntiQuorum = 0;
-					info.satelliteTLogPolicy = Reference<IReplicationPolicy>(
-					    new PolicyAcross(2,
-					                     "dcid",
-					                     Reference<IReplicationPolicy>(new PolicyAcross(
-					                         2, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())))));
+					info.satelliteTLogPolicy = makeReference<PolicyAcross>(
+					    2, "dcid", makeReference<PolicyAcross>(2, "zoneid", makeReference<PolicyOne>()));
 					info.satelliteTLogReplicationFactorFallback = 2;
 					info.satelliteTLogUsableDcsFallback = 1;
 					info.satelliteTLogWriteAntiQuorumFallback = 0;
-					info.satelliteTLogPolicyFallback = Reference<IReplicationPolicy>(
-					    new PolicyAcross(2, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
+					info.satelliteTLogPolicyFallback =
+					    makeReference<PolicyAcross>(2, "zoneid", makeReference<PolicyOne>());
 				} else if (satelliteReplication == "two_satellite_fast") {
 					info.satelliteTLogReplicationFactor = 4;
 					info.satelliteTLogUsableDcs = 2;
 					info.satelliteTLogWriteAntiQuorum = 2;
-					info.satelliteTLogPolicy = Reference<IReplicationPolicy>(
-					    new PolicyAcross(2,
-					                     "dcid",
-					                     Reference<IReplicationPolicy>(new PolicyAcross(
-					                         2, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())))));
+					info.satelliteTLogPolicy = makeReference<PolicyAcross>(
+					    2, "dcid", makeReference<PolicyAcross>(2, "zoneid", makeReference<PolicyOne>()));
 					info.satelliteTLogReplicationFactorFallback = 2;
 					info.satelliteTLogUsableDcsFallback = 1;
 					info.satelliteTLogWriteAntiQuorumFallback = 0;
-					info.satelliteTLogPolicyFallback = Reference<IReplicationPolicy>(
-					    new PolicyAcross(2, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
+					info.satelliteTLogPolicyFallback =
+					    makeReference<PolicyAcross>(2, "zoneid", makeReference<PolicyOne>());
 				} else {
 					throw invalid_option();
 				}
@@ -184,31 +180,29 @@ void parse(std::vector<RegionInfo>* regions, ValueRef const& v) {
 
 void DatabaseConfiguration::setDefaultReplicationPolicy() {
 	if (!storagePolicy) {
-		storagePolicy = Reference<IReplicationPolicy>(
-		    new PolicyAcross(storageTeamSize, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
+		storagePolicy = makeReference<PolicyAcross>(storageTeamSize, "zoneid", makeReference<PolicyOne>());
 	}
 	if (!tLogPolicy) {
-		tLogPolicy = Reference<IReplicationPolicy>(
-		    new PolicyAcross(tLogReplicationFactor, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
+		tLogPolicy = makeReference<PolicyAcross>(tLogReplicationFactor, "zoneid", makeReference<PolicyOne>());
 	}
 	if (remoteTLogReplicationFactor > 0 && !remoteTLogPolicy) {
-		remoteTLogPolicy = Reference<IReplicationPolicy>(
-		    new PolicyAcross(remoteTLogReplicationFactor, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
+		remoteTLogPolicy =
+		    makeReference<PolicyAcross>(remoteTLogReplicationFactor, "zoneid", makeReference<PolicyOne>());
 	}
 	for (auto& r : regions) {
 		if (r.satelliteTLogReplicationFactor > 0 && !r.satelliteTLogPolicy) {
-			r.satelliteTLogPolicy = Reference<IReplicationPolicy>(new PolicyAcross(
-			    r.satelliteTLogReplicationFactor, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
+			r.satelliteTLogPolicy =
+			    makeReference<PolicyAcross>(r.satelliteTLogReplicationFactor, "zoneid", makeReference<PolicyOne>());
 		}
 		if (r.satelliteTLogReplicationFactorFallback > 0 && !r.satelliteTLogPolicyFallback) {
-			r.satelliteTLogPolicyFallback = Reference<IReplicationPolicy>(new PolicyAcross(
-			    r.satelliteTLogReplicationFactorFallback, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
+			r.satelliteTLogPolicyFallback = makeReference<PolicyAcross>(
+			    r.satelliteTLogReplicationFactorFallback, "zoneid", makeReference<PolicyOne>());
 		}
 	}
 }
 
 int32_t DatabaseConfiguration::maxZoneFailuresTolerated(int fullyReplicatedRegions, bool forAvailability) const {
-	int worstSatelliteTLogReplicationFactor = regions.size() ? std::numeric_limits<int>::max() : 0;
+	int worstSatelliteTLogReplicationFactor = !regions.empty() ? std::numeric_limits<int>::max() : 0;
 	int regionsWithNonNegativePriority = 0;
 	for (auto& r : regions) {
 		if (r.priority >= 0) {
@@ -269,21 +263,29 @@ bool DatabaseConfiguration::isValid() const {
 	      LOG_TEST(remoteTLogReplicationFactor >= 0) && LOG_TEST(repopulateRegionAntiQuorum >= 0) &&
 	      LOG_TEST(repopulateRegionAntiQuorum <= 1) && LOG_TEST(usableRegions >= 1) && LOG_TEST(usableRegions <= 2) &&
 	      LOG_TEST(regions.size() <= 2) && LOG_TEST((usableRegions == 1 || regions.size() == 2)) &&
-	      LOG_TEST((regions.size() == 0 || regions[0].priority >= 0)) &&
-	      LOG_TEST((regions.size() == 0 || tLogPolicy->info() != "dcid^2 x zoneid^2 x 1")) &&
+	      LOG_TEST((regions.empty() || regions[0].priority >= 0)) &&
+	      LOG_TEST((regions.empty() || tLogPolicy->info() != "dcid^2 x zoneid^2 x 1")) &&
 	      // We cannot specify regions with three_datacenter replication
 	      LOG_TEST((perpetualStorageWiggleSpeed == 0 || perpetualStorageWiggleSpeed == 1)) &&
 	      LOG_TEST(isValidPerpetualStorageWiggleLocality(perpetualStorageWiggleLocality)) &&
-	      LOG_TEST(storageMigrationType != StorageMigrationType::UNSET))) {
+	      LOG_TEST(storageMigrationType != StorageMigrationType::UNSET) &&
+	      // sharded-rocksdb maps shards to physical column families using the
+	      // shardId carried only by new-format (shard-encoded) location
+	      // metadata. Old-format metadata cannot describe those mappings, so
+	      // reject configuring original while the storage engine is
+	      // sharded-rocksdb (this also blocks rolling metadata back to
+	      // original without first migrating off sharded-rocksdb).
+	      LOG_TEST(!(shardMetadataFormat == ShardMetadataFormat::ORIGINAL &&
+	                 storageServerStoreType == KeyValueStoreType::SSD_SHARDED_ROCKSDB)))) {
 		return false;
 	}
 #undef LOG_TEST
 	std::set<Key> dcIds;
 	dcIds.insert(Key());
 	for (auto& r : regions) {
-		if (!(!dcIds.count(r.dcId) && r.satelliteTLogReplicationFactor >= 0 && r.satelliteTLogWriteAntiQuorum >= 0 &&
+		if (!(!dcIds.contains(r.dcId) && r.satelliteTLogReplicationFactor >= 0 && r.satelliteTLogWriteAntiQuorum >= 0 &&
 		      r.satelliteTLogUsableDcs >= 1 &&
-		      (r.satelliteTLogReplicationFactor == 0 || (r.satelliteTLogPolicy && r.satellites.size())) &&
+		      (r.satelliteTLogReplicationFactor == 0 || (r.satelliteTLogPolicy && !r.satellites.empty())) &&
 		      (r.satelliteTLogUsableDcsFallback == 0 ||
 		       (r.satelliteTLogReplicationFactor > 0 && r.satelliteTLogReplicationFactorFallback > 0)))) {
 			return false;
@@ -293,7 +295,7 @@ bool DatabaseConfiguration::isValid() const {
 		satelliteDcIds.insert(Key());
 		satelliteDcIds.insert(r.dcId);
 		for (auto& s : r.satellites) {
-			if (satelliteDcIds.count(s.dcId)) {
+			if (satelliteDcIds.contains(s.dcId)) {
 				return false;
 			}
 			satelliteDcIds.insert(s.dcId);
@@ -376,7 +378,7 @@ StatusObject DatabaseConfiguration::toJSON(bool noPolicies) const {
 	}
 	result["usable_regions"] = usableRegions;
 
-	if (regions.size()) {
+	if (!regions.empty()) {
 		result["regions"] = getRegionJSON();
 	}
 
@@ -430,10 +432,24 @@ StatusObject DatabaseConfiguration::toJSON(bool noPolicies) const {
 	}
 
 	result["backup_worker_enabled"] = (int32_t)backupWorkerEnabled;
+	result["range_partitioned_backup_worker_enabled"] = (int32_t)rangePartitionedBackupWorkerEnabled;
+	if (desiredRangePartitionedBackupWorkerCount != -1 || isOverridden("range_partitioned_backup_workers")) {
+		result["range_partitioned_backup_workers"] = desiredRangePartitionedBackupWorkerCount;
+	}
 	result["perpetual_storage_wiggle"] = perpetualStorageWiggleSpeed;
 	result["perpetual_storage_wiggle_locality"] = perpetualStorageWiggleLocality;
 	if (perpetualStoreType.storeType() != KeyValueStoreType::END) {
 		result["perpetual_storage_wiggle_engine"] = perpetualStoreType.toString();
+	}
+	if (shardMetadataFormat != ShardMetadataFormat::UNSET) {
+		result[SHARD_METADATA_FORMAT_KEY] = (shardMetadataFormat == ShardMetadataFormat::ENCODED)
+		                                        ? SHARD_METADATA_FORMAT_ENCODED
+		                                        : SHARD_METADATA_FORMAT_ORIGINAL;
+	}
+	if (shardMetadataMigration != ShardMetadataMigration::UNSET) {
+		result[SHARD_METADATA_MIGRATION_KEY] = (shardMetadataMigration == ShardMetadataMigration::ENABLED)
+		                                           ? SHARD_METADATA_MIGRATION_ENABLED
+		                                           : SHARD_METADATA_MIGRATION_DISABLED;
 	}
 	result["storage_migration_type"] = storageMigrationType.toString();
 	return result;
@@ -459,7 +475,8 @@ std::string DatabaseConfiguration::configureStringFromJSON(const StatusObject& j
 			// For string values, some properties can set with a "<name>=<value>" syntax in "configure"
 			// Such properties are listed here:
 			static std::set<std::string> directSet = {
-				"storage_migration_type", "storage_engine", "log_engine", "perpetual_storage_wiggle_engine"
+				"storage_migration_type",          "storage_engine",          "log_engine",
+				"perpetual_storage_wiggle_engine", SHARD_METADATA_FORMAT_KEY, SHARD_METADATA_MIGRATION_KEY
 			};
 
 			if (directSet.contains(kv.first)) {
@@ -542,7 +559,7 @@ StatusArray DatabaseConfiguration::getRegionJSON() const {
 			regionObj["satellite_logs"] = r.satelliteDesiredTLogCount;
 		}
 
-		if (r.satellites.size()) {
+		if (!r.satellites.empty()) {
 			for (auto& s : r.satellites) {
 				StatusObject satObj;
 				satObj["id"] = s.dcId.toString();
@@ -700,6 +717,11 @@ bool DatabaseConfiguration::setInternal(KeyRef key, ValueRef value) {
 	} else if (ck == "backup_worker_enabled"_sr) {
 		parse((&type), value);
 		backupWorkerEnabled = (type != 0);
+	} else if (ck == "range_partitioned_backup_worker_enabled"_sr) {
+		parse((&type), value);
+		rangePartitionedBackupWorkerEnabled = (type != 0);
+	} else if (ck == "range_partitioned_backup_workers"_sr) {
+		parse(&desiredRangePartitionedBackupWorkerCount, value);
 	} else if (ck == "usable_regions"_sr) {
 		parse(&usableRegions, value);
 	} else if (ck == "repopulate_anti_quorum"_sr) {
@@ -716,6 +738,22 @@ bool DatabaseConfiguration::setInternal(KeyRef key, ValueRef value) {
 	} else if (ck == "perpetual_storage_wiggle_engine"_sr) {
 		parse((&type), value);
 		perpetualStoreType = (KeyValueStoreType::StoreType)type;
+	} else if (ck == StringRef(SHARD_METADATA_FORMAT_KEY)) {
+		if (value == StringRef(SHARD_METADATA_FORMAT_ORIGINAL)) {
+			shardMetadataFormat = ShardMetadataFormat::ORIGINAL;
+		} else if (value == StringRef(SHARD_METADATA_FORMAT_ENCODED)) {
+			shardMetadataFormat = ShardMetadataFormat::ENCODED;
+		} else {
+			return false;
+		}
+	} else if (ck == StringRef(SHARD_METADATA_MIGRATION_KEY)) {
+		if (value == StringRef(SHARD_METADATA_MIGRATION_DISABLED)) {
+			shardMetadataMigration = ShardMetadataMigration::DISABLED;
+		} else if (value == StringRef(SHARD_METADATA_MIGRATION_ENABLED)) {
+			shardMetadataMigration = ShardMetadataMigration::ENABLED;
+		} else {
+			return false;
+		}
 	} else if (ck == "storage_migration_type"_sr) {
 		parse((&type), value);
 		storageMigrationType = (StorageMigrationType::MigrationType)type;
@@ -797,17 +835,16 @@ bool DatabaseConfiguration::isExcludedServer(NetworkAddressList a, const Localit
 	       isExcludedLocality(locality);
 }
 std::set<AddressExclusion> DatabaseConfiguration::getExcludedServers() const {
-	const_cast<DatabaseConfiguration*>(this)->makeConfigurationImmutable();
+	const auto snapshot = configurationSnapshot();
 	std::set<AddressExclusion> addrs;
-	for (auto i = lower_bound(rawConfiguration, excludedServersKeys.begin);
-	     i != rawConfiguration.end() && i->key < excludedServersKeys.end;
+	for (auto i = lower_bound(snapshot, excludedServersKeys.begin);
+	     i != snapshot.end() && i->key < excludedServersKeys.end;
 	     ++i) {
 		AddressExclusion a = decodeExcludedServersKey(i->key);
 		if (a.isValid())
 			addrs.insert(a);
 	}
-	for (auto i = lower_bound(rawConfiguration, failedServersKeys.begin);
-	     i != rawConfiguration.end() && i->key < failedServersKeys.end;
+	for (auto i = lower_bound(snapshot, failedServersKeys.begin); i != snapshot.end() && i->key < failedServersKeys.end;
 	     ++i) {
 		AddressExclusion a = decodeFailedServersKey(i->key);
 		if (a.isValid())
@@ -835,17 +872,16 @@ bool DatabaseConfiguration::isExcludedLocality(const LocalityData& locality) con
 
 // Gets the list of already excluded localities (with failed option)
 std::set<std::string> DatabaseConfiguration::getExcludedLocalities() const {
-	// TODO: revisit all const_cast usages
-	const_cast<DatabaseConfiguration*>(this)->makeConfigurationImmutable();
+	const auto snapshot = configurationSnapshot();
 	std::set<std::string> localities;
-	for (auto i = lower_bound(rawConfiguration, excludedLocalityKeys.begin);
-	     i != rawConfiguration.end() && i->key < excludedLocalityKeys.end;
+	for (auto i = lower_bound(snapshot, excludedLocalityKeys.begin);
+	     i != snapshot.end() && i->key < excludedLocalityKeys.end;
 	     ++i) {
 		std::string l = decodeExcludedLocalityKey(i->key);
 		localities.insert(l);
 	}
-	for (auto i = lower_bound(rawConfiguration, failedLocalityKeys.begin);
-	     i != rawConfiguration.end() && i->key < failedLocalityKeys.end;
+	for (auto i = lower_bound(snapshot, failedLocalityKeys.begin);
+	     i != snapshot.end() && i->key < failedLocalityKeys.end;
 	     ++i) {
 		std::string l = decodeFailedLocalityKey(i->key);
 		localities.insert(l);
@@ -863,21 +899,22 @@ void DatabaseConfiguration::makeConfigurationMutable() {
 	rawConfiguration = Standalone<VectorRef<KeyValueRef>>();
 }
 
-void DatabaseConfiguration::makeConfigurationImmutable() {
+Standalone<VectorRef<KeyValueRef>> DatabaseConfiguration::configurationSnapshot() const {
 	if (!mutableConfiguration.present())
-		return;
-	auto& mc = mutableConfiguration.get();
-	rawConfiguration = Standalone<VectorRef<KeyValueRef>>();
-	rawConfiguration.resize(rawConfiguration.arena(), mc.size());
+		return rawConfiguration;
+	const auto& mc = mutableConfiguration.get();
+	Standalone<VectorRef<KeyValueRef>> snapshot;
+	snapshot.resize(snapshot.arena(), mc.size());
 	int i = 0;
-	for (auto r = mc.begin(); r != mc.end(); ++r)
-		rawConfiguration[i++] = KeyValueRef(rawConfiguration.arena(), KeyValueRef(r->first, r->second));
-	mutableConfiguration = Optional<std::map<std::string, std::string>>();
+	for (const auto& [key, value] : mc)
+		snapshot[i++] = KeyValueRef(snapshot.arena(), KeyValueRef(key, value));
+	return snapshot;
 }
 
 void DatabaseConfiguration::fromKeyValues(Standalone<VectorRef<KeyValueRef>> rawConfig) {
 	resetInternal();
-	this->rawConfiguration = rawConfig;
+	mutableConfiguration = Optional<std::map<std::string, std::string>>();
+	this->rawConfiguration = std::move(rawConfig);
 	for (auto c = rawConfiguration.begin(); c != rawConfiguration.end(); ++c) {
 		setInternal(c->key, c->value);
 	}
@@ -918,5 +955,62 @@ TEST_CASE("/fdbclient/databaseConfiguration/overwriteCommitProxy") {
 	ASSERT(conf1 == conf2);
 	ASSERT(conf1.getDesiredCommitProxies() == conf2.getDesiredCommitProxies());
 
+	return Void();
+}
+
+TEST_CASE("/fdbclient/databaseConfiguration/constReads") {
+	const KeyRef key = "\xff/conf/test_value"_sr;
+	const ValueRef value = "a configuration value that outlives read operations"_sr;
+	DatabaseConfiguration mutableConfig;
+	mutableConfig.set(key, value);
+	mutableConfig.set("\xff/conf/excluded/127.0.0.1:4000"_sr, ""_sr);
+	mutableConfig.set("\xff/conf/failed/127.0.0.2"_sr, ""_sr);
+	mutableConfig.set("\xff/conf/excluded_locality/zoneid:one"_sr, ""_sr);
+	mutableConfig.set("\xff/conf/failed_locality/zoneid:two"_sr, ""_sr);
+	const DatabaseConfiguration config = std::move(mutableConfig);
+	const DatabaseConfiguration copy = config;
+	const ValueRef borrowed = config.get(key).get();
+
+	ASSERT(config == copy);
+	ASSERT_EQ(config.getExcludedServers().size(), 2);
+	ASSERT(config.getExcludedLocalities() == (std::set<std::string>{ "zoneid:one", "zoneid:two" }));
+	ASSERT(borrowed == value);
+	return Void();
+}
+
+TEST_CASE("/fdbclient/databaseConfiguration/snapshotSerialization") {
+	Standalone<VectorRef<KeyValueRef>> raw;
+	raw.push_back(raw.arena(), KeyValueRef("\xff/conf/commit_proxies"_sr, "3"_sr));
+	raw.push_back(raw.arena(), KeyValueRef("\xff/conf/resolvers"_sr, "4"_sr));
+	raw.push_back(raw.arena(), KeyValueRef("\xff/conf/unknown"_sr, "value"_sr));
+
+	DatabaseConfiguration config;
+	config.set("\xff/conf/unknown"_sr, "value"_sr);
+	config.set("\xff/conf/resolvers"_sr, "4"_sr);
+	config.set("\xff/conf/commit_proxies"_sr, "3"_sr);
+	DatabaseConfiguration loaded;
+	loaded.set("\xff/conf/obsolete"_sr, "old"_sr);
+	loaded.fromKeyValues(raw);
+	ASSERT(!loaded.get("\xff/conf/obsolete"_sr).present());
+	ASSERT(config == loaded);
+
+	const auto binary = BinaryWriter::toValue(config, IncludeVersion());
+	ASSERT(binary == BinaryWriter::toValue(raw, IncludeVersion()));
+	const auto binaryDecoded = BinaryReader::fromStringRef<DatabaseConfiguration>(binary, IncludeVersion());
+	ASSERT(binaryDecoded == config);
+	ASSERT_EQ(binaryDecoded.commitProxyCount, 3);
+	ASSERT_EQ(binaryDecoded.resolverCount, 4);
+
+	constexpr FileIdentifier id = 2738451;
+	ObjectWriter writer(IncludeVersion());
+	writer.serialize(id, config);
+	const auto object = writer.toString();
+	ObjectReader reader(object.begin(), IncludeVersion());
+	loaded.set("\xff/conf/obsolete"_sr, "old"_sr);
+	reader.deserialize(id, loaded);
+	ASSERT(!loaded.get("\xff/conf/obsolete"_sr).present());
+	ASSERT(loaded == config);
+	ASSERT_EQ(loaded.commitProxyCount, 3);
+	ASSERT_EQ(loaded.resolverCount, 4);
 	return Void();
 }

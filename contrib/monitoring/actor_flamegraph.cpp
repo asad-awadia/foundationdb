@@ -113,11 +113,11 @@ public:
 					actor->stack.push_back(currentStack.top()->name);
 				}
 			} else if (op == OP_DESTROY) {
-				if (actors.count(id)) {
+				if (actors.contains(id)) {
 					actors.erase(id);
 				}
 			} else if (op == OP_ENTER) {
-				if (actors.count(id) == 0) {
+				if (!actors.contains(id)) {
 					actors[id] = std::make_shared<Actor>(results, id, name);
 				}
 				currentStack.push(actors[id]);
@@ -148,15 +148,13 @@ int main(int argc, char* argv[]) {
 	bool endOfArgs = false;
 	for (int i = 1; i < argc; ++i) {
 		std::string arg(argv[i]);
-		if (endOfArgs) {
+		if (endOfArgs || arg[0] != '-') {
 			files.emplace_back(arg);
 		} else if (arg == "--") {
 			endOfArgs = true;
 		} else if (arg == "-h" || arg == "--") {
 			usage(argv[0], std::cout);
 			return 0;
-		} else if (arg[0] != '-') {
-			files.emplace_back(arg);
 		} else {
 			std::cerr << "Unknown argument \"" << arg << "\"" << std::endl;
 			usage(argv[0], std::cerr);

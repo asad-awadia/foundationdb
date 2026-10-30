@@ -18,7 +18,8 @@
  * limitations under the License.
  */
 
-#include "fdbclient/RYWIterator.h"
+#include "RYWIterator.h"
+#include "fdbclient/RandomTestUtils.h"
 #include "fdbclient/KeyRangeMap.h"
 #include "flow/UnitTest.h"
 
@@ -183,14 +184,15 @@ void testESR() {
 	printf("1\n");
 	std::vector<ExtStringRef> srs;
 	std::vector<Standalone<StringRef>> ssrs;
-	for (int e = 0; e < 3; e++)
+	for (int e = 0; e < 3; e++) {
 		for (auto b = bases.begin(); b != bases.end(); ++b) {
 			srs.push_back(ExtStringRef(*b, e));
 			ssrs.push_back(StringRef(*b + std::string(e, 0)));
 		}
+	}
 	ASSERT(srs.size() == ssrs.size());
 	printf("2\n");
-	for (int i = 0; i < srs.size(); i++)
+	for (int i = 0; i < srs.size(); i++) {
 		for (int j = 0; j < srs.size(); j++) {
 			bool c = ssrs[i] != ssrs[j];
 			bool c2 = srs[i] != srs[j];
@@ -222,6 +224,7 @@ void testESR() {
 			}
 			*/
 		}
+	}
 	printf("OK\n");
 }
 
@@ -419,6 +422,48 @@ static int getWriteMapCount(WriteMap* p) {
 		count += 1;
 	}
 	return count;
+}
+
+TEST_CASE("/fdbclient/ExtStringRef/materialization") {
+	struct MaterializationCase {
+		StringRef base;
+		int padding;
+		StringRef expected;
+	};
+	const MaterializationCase cases[] = {
+		{ ""_sr, 0, ""_sr },
+		{ ""_sr, 3, "\x00\x00\x00"_sr },
+		{ "a\x00z"_sr, 0, "a\x00z"_sr },
+		{ "a\x00z"_sr, 1, "a\x00z\x00"_sr },
+		{ "a\x00z"_sr, 3, "a\x00z\x00\x00\x00"_sr },
+	};
+	for (const auto& test : cases) {
+		Standalone<StringRef> base(test.base);
+		ExtStringRef extended(base, test.padding);
+		Arena ownedArena;
+		Arena borrowArena;
+		StringRef owned = extended.toArena(ownedArena);
+		StringRef borrowedOrOwned = extended.toArenaOrRef(borrowArena);
+		Standalone<StringRef> standalone = extended.toStandaloneStringRef();
+		ASSERT(owned == test.expected);
+		ASSERT(borrowedOrOwned == test.expected);
+		ASSERT(standalone == test.expected);
+		if (test.padding == 0) {
+			ASSERT(borrowedOrOwned.begin() == base.begin());
+			ASSERT(borrowArena.getSize() == 0);
+		}
+		if (!base.empty()) {
+			mutateString(base)[0] = 'b';
+			ASSERT(owned == test.expected);
+			ASSERT(standalone == test.expected);
+			if (test.padding == 0) {
+				ASSERT(borrowedOrOwned == base);
+			} else {
+				ASSERT(borrowedOrOwned == test.expected);
+			}
+		}
+	}
+	return Void();
 }
 
 TEST_CASE("/fdbclient/WriteMap/emptiness") {
@@ -706,10 +751,11 @@ TEST_CASE("/fdbclient/WriteMap/random") {
 			if (clearMap[key]) {
 				stack = OperationStack(RYWMutation(StringRef(), MutationRef::SetValue));
 				WriteMap::coalesceOver(stack, RYWMutation(value, MutationRef::And), arena);
-			} else if (!unreadableMap[key] && stack.size() > 0)
+			} else if (!unreadableMap[key] && stack.size() > 0) {
 				WriteMap::coalesceOver(stack, RYWMutation(value, MutationRef::And), arena);
-			else
+			} else {
 				stack.push(RYWMutation(value, MutationRef::And));
+			}
 
 			if (addConflict)
 				conflictMap.insert(key, true);

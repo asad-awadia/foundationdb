@@ -25,6 +25,7 @@
 #include <vector>
 #include <functional>
 #include <memory>
+#include <type_traits>
 
 #ifndef DLLEXPORT
 #if defined(_MSC_VER)
@@ -36,10 +37,14 @@
 #endif
 #endif
 
-typedef struct FDB_future FDBFuture;
-typedef struct FDB_result FDBResult;
-typedef struct FDB_database FDBDatabase;
-typedef struct FDB_transaction FDBTransaction;
+struct FDB_future;
+struct FDB_result;
+struct FDB_database;
+struct FDB_transaction;
+using FDBFuture = FDB_future;
+using FDBResult = FDB_result;
+using FDBDatabase = FDB_database;
+using FDBTransaction = FDB_transaction;
 
 enum class FDBSeverity { Debug, Info, Warn, WarnAlways, Error };
 
@@ -77,7 +82,8 @@ class GenericPromise {
 	std::shared_ptr<FDBPromise> impl;
 
 public:
-	template <class Ptr>
+	template <class Ptr,
+	          typename std::enable_if<std::is_constructible<std::shared_ptr<FDBPromise>, Ptr&&>::value, int>::type = 0>
 	explicit GenericPromise(Ptr&& impl) : impl(std::forward<Ptr>(impl)) {}
 	void send(T val) { impl->send(&val); }
 };

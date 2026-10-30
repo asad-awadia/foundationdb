@@ -1,0 +1,653 @@
+/*
+ * AsyncFileCached.h
+ *
+ * This source file is part of the FoundationDB open source project
+ *
+ * Copyright 2013-2026 Apple Inc. and the FoundationDB project authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <boost/intrusive/list.hpp>
+#include <type_traits>
+
+#include "flow/flow.h"
+#include "flow/IAsyncFile.h"
+#include "flow/Knobs.h"
+#include "flow/TDMetric.h"
+#include "flow/network.h"
+
+namespace bi = boost::intrusive;
+struct EvictablePage {
+	void* data;
+	int index;
+	class Reference<struct EvictablePageCache> pageCache;
+	bi::list_member_hook<> member_hook;
+
+	virtual bool evict() = 0; // true if page was evicted, false if it isn't immediately evictable (but will be evicted
+	                          // regardless if possible)
+
+	explicit EvictablePage(Reference<EvictablePageCache> pageCache) : data(0), index(-1), pageCache(pageCache) {}
+	virtual ~EvictablePage();
+};
+
+struct EvictablePageCache : ReferenceCounted<EvictablePageCache> {
+	using List =
+	    bi::list<EvictablePage, bi::member_hook<EvictablePage, bi::list_member_hook<>, &EvictablePage::member_hook>>;
+	enum CacheEvictionType { RANDOM = 0, LRU = 1 };
+
+	static CacheEvictionType evictionPolicyStringToEnum(const std::string& policy) {
+		std::string cep = policy;
+		std::transform(cep.begin(), cep.end(), cep.begin(), ::tolower);
+		if (cep != "random" && cep != "lru")
+			throw invalid_cache_eviction_policy();
+
+		if (cep == "random")
+			return RANDOM;
+		return LRU;
+	}
+
+	EvictablePageCache() : pageSize(0), maxPages(0), cacheEvictionType(RANDOM) {}
+
+	explicit EvictablePageCache(int pageSize, int64_t maxSize)
+	  : pageSize(pageSize), maxPages(maxSize / pageSize),
+	    cacheEvictionType(evictionPolicyStringToEnum(FLOW_KNOBS->CACHE_EVICTION_POLICY)) {
+		cacheEvictions.init("EvictablePageCache.CacheEvictions"_sr);
+	}
+
+	void allocate(EvictablePage* page) {
+		try_evict();
+		try_evict();
+
+		page->data = allocateFast4kAligned(pageSize);
+
+		if (RANDOM == cacheEvictionType) {
+			page->index = pages.size();
+			pages.push_back(page);
+		} else {
+			lruPages.push_back(*page); // new page is considered the most recently used (placed at LRU tail)
+		}
+	}
+
+	void updateHit(EvictablePage* page) {
+		if (RANDOM != cacheEvictionType) {
+			// on a hit, update page's location in the LRU so that it's most recent (tail)
+			lruPages.erase(List::s_iterator_to(*page));
+			lruPages.push_back(*page);
+		}
+	}
+
+	void try_evict() {
+		if (RANDOM == cacheEvictionType) {
+			if (pages.size() >= (uint64_t)maxPages && !pages.empty()) {
+				for (int i = 0; i < FLOW_KNOBS->MAX_EVICT_ATTEMPTS;
+				     i++) { // If we don't manage to evict anything, just go ahead and exceed the cache limit
+					int toEvict = deterministicRandom()->randomInt(0, pages.size());
+					if (pages[toEvict]->evict()) {
+						++cacheEvictions;
+						break;
+					}
+				}
+			}
+		} else {
+			// For now, LRU is the only other CACHE_EVICTION option
+			if (lruPages.size() >= (uint64_t)maxPages) {
+				int i = 0;
+				// try the least recently used pages first (starting at head of the LRU list)
+				for (List::iterator it = lruPages.begin(); it != lruPages.end() && i < FLOW_KNOBS->MAX_EVICT_ATTEMPTS;
+				     ++it, ++i) { // If we don't manage to evict anything, just go ahead and exceed the cache limit
+					if (it->evict()) {
+						++cacheEvictions;
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	std::vector<EvictablePage*> pages;
+	List lruPages;
+	int pageSize;
+	int64_t maxPages;
+	Int64MetricHandle cacheEvictions;
+	const CacheEvictionType cacheEvictionType;
+};
+
+struct AFCPage;
+
+class AsyncFileCached final : public IAsyncFile, public ReferenceCounted<AsyncFileCached> {
+	friend struct AFCPage;
+	template <class P, class... Args>
+	friend Reference<P> makeReference(Args&&... args);
+
+public:
+	StringRef getClassName() override { return "AsyncFileCached"_sr; }
+
+	// Opens a file that uses the FDB in-memory page cache
+	static Future<Reference<IAsyncFile>> open(std::string filename, int flags, int mode) {
+		//TraceEvent("AsyncFileCachedOpen").detail("Filename", filename);
+		auto itr = openFiles.find(filename);
+		if (itr == openFiles.end()) {
+			auto f = open_impl(filename, flags, mode);
+			if (f.isReady() && f.isError())
+				return f;
+
+			auto result = openFiles.try_emplace(filename, f);
+
+			// This should be inserting a new entry
+			ASSERT(result.second);
+			itr = result.first;
+
+			// We return here instead of falling through to the outer scope so that we don't delete all references to
+			// the underlying file before returning
+			return itr->second.get();
+		}
+		return itr->second.get();
+	}
+
+	Future<int> read(void* data, int length, int64_t offset) override {
+		++countFileCacheReads;
+		++countCacheReads;
+		if (offset + length > this->length) {
+			length = int(this->length - offset);
+			ASSERT_GE(length, 0);
+		}
+		auto f = read_write_impl<false>(static_cast<uint8_t*>(data), length, offset);
+		if (f.isReady() && !f.isError())
+			return length;
+		++countFileCacheReadsBlocked;
+		++countCacheReadsBlocked;
+		return tag(f, length);
+	}
+
+	Future<Void> write(void const* data, int length, int64_t offset) override {
+		// If there is a truncate in progress before the the write position then we must
+		// wait for it to complete.
+		if (length + offset > currentTruncateSize) {
+			Future<Void> currentTruncate = this->currentTruncate;
+			co_await currentTruncate;
+		}
+		++countFileCacheWrites;
+		++countCacheWrites;
+		Future<Void> f = read_write_impl<true>(static_cast<const uint8_t*>(data), length, offset);
+		if (!f.isReady()) {
+			++countFileCacheWritesBlocked;
+			++countCacheWritesBlocked;
+		}
+		co_await f;
+	}
+
+	Future<Void> readZeroCopy(void** data, int* length, int64_t offset) override;
+	void releaseZeroCopy(void* data, int length, int64_t offset) override;
+
+	// This wrapper for the actual truncation operation enforces ordering of truncates.
+	// It maintains currentTruncate and currentTruncateSize so writers can wait behind truncates that would affect them.
+	Future<Void> truncate(int64_t size) override {
+		Future<Void> previousTruncate = currentTruncate;
+		co_await previousTruncate;
+		currentTruncateSize = size;
+		currentTruncate = changeFileSize(size);
+		Future<Void> currentTruncate = this->currentTruncate;
+		co_await currentTruncate;
+	}
+
+	// This is the 'real' truncate that does the actual removal of cache blocks and then shortens the file
+	Future<Void> changeFileSize(int64_t size);
+
+	Future<Void> sync() override { return waitAndSync(flush()); }
+
+	Future<int64_t> size() const override { return length; }
+
+	int64_t debugFD() const override { return uncached->debugFD(); }
+
+	std::string getFilename() const override { return filename; }
+
+	void setRateControl(Reference<IRateControl> const& rc) override { rateControl = rc; }
+
+	Reference<IRateControl> const& getRateControl() override { return rateControl; }
+
+	void addref() override {
+		ReferenceCounted<AsyncFileCached>::addref();
+		//TraceEvent("AsyncFileCachedAddRef").detail("Filename", filename).detail("Refcount", debugGetReferenceCount()).backtrace();
+	}
+	void delref() override {
+		if (delref_no_destroy()) {
+			// If this is ever ThreadSafeReferenceCounted...
+			// setrefCountUnsafe(0);
+
+			if (rateControl) {
+				TraceEvent(SevDebug, "AsyncFileCachedKillWaiters").detail("Filename", filename);
+				rateControl->killWaiters(io_error());
+			}
+
+			auto f = quiesce();
+			TraceEvent("AsyncFileCachedDel")
+			    .detail("Filename", filename)
+			    .detail("Refcount", debugGetReferenceCount())
+			    .detail("CanDie", f.isReady());
+			// .backtrace();
+			if (f.isReady())
+				delete this;
+			else
+				uncancellable(holdWhile(Reference<AsyncFileCached>::addRef(this), f));
+		}
+	}
+
+	~AsyncFileCached() override;
+
+private:
+	// A map of filename to the file handle for all opened cached files
+	static std::map<std::string, UnsafeWeakFutureReference<IAsyncFile>> openFiles;
+
+	std::string filename;
+	Reference<IAsyncFile> uncached;
+	int64_t length;
+	int64_t prevLength;
+	std::unordered_map<int64_t, AFCPage*> pages;
+	std::vector<AFCPage*> flushable;
+	Reference<EvictablePageCache> pageCache;
+	Future<Void> currentTruncate;
+	int64_t currentTruncateSize;
+	Reference<IRateControl> rateControl;
+
+	// Map of pointers which hold page buffers for pages which have been overwritten
+	// but at the time of write there were still readZeroCopy holders.
+	std::unordered_map<void*, int> orphanedPages;
+
+	Int64MetricHandle countFileCacheFinds;
+	Int64MetricHandle countFileCacheReads;
+	Int64MetricHandle countFileCacheWrites;
+	Int64MetricHandle countFileCacheReadsBlocked;
+	Int64MetricHandle countFileCacheWritesBlocked;
+	Int64MetricHandle countFileCachePageReadsHit;
+	Int64MetricHandle countFileCachePageReadsMissed;
+	Int64MetricHandle countFileCachePageReadsMerged;
+	Int64MetricHandle countFileCacheReadBytes;
+
+	Int64MetricHandle countCacheFinds;
+	Int64MetricHandle countCacheReads;
+	Int64MetricHandle countCacheWrites;
+	Int64MetricHandle countCacheReadsBlocked;
+	Int64MetricHandle countCacheWritesBlocked;
+	Int64MetricHandle countCachePageReadsHit;
+	Int64MetricHandle countCachePageReadsMissed;
+	Int64MetricHandle countCachePageReadsMerged;
+	Int64MetricHandle countCacheReadBytes;
+
+	AsyncFileCached(Reference<IAsyncFile> uncached,
+	                const std::string& filename,
+	                int64_t length,
+	                Reference<EvictablePageCache> pageCache)
+	  : filename(filename), uncached(uncached), length(length), prevLength(length), pageCache(pageCache),
+	    currentTruncate(Void()), currentTruncateSize(0), rateControl(nullptr) {
+		if (!g_network->isSimulated()) {
+			countFileCacheWrites.init("AsyncFile.CountFileCacheWrites"_sr, filename);
+			countFileCacheReads.init("AsyncFile.CountFileCacheReads"_sr, filename);
+			countFileCacheWritesBlocked.init("AsyncFile.CountFileCacheWritesBlocked"_sr, filename);
+			countFileCacheReadsBlocked.init("AsyncFile.CountFileCacheReadsBlocked"_sr, filename);
+			countFileCachePageReadsHit.init("AsyncFile.CountFileCachePageReadsHit"_sr, filename);
+			countFileCachePageReadsMissed.init("AsyncFile.CountFileCachePageReadsMissed"_sr, filename);
+			countFileCachePageReadsMerged.init("AsyncFile.CountFileCachePageReadsMerged"_sr, filename);
+			countFileCacheFinds.init("AsyncFile.CountFileCacheFinds"_sr, filename);
+			countFileCacheReadBytes.init("AsyncFile.CountFileCacheReadBytes"_sr, filename);
+
+			countCacheWrites.init("AsyncFile.CountCacheWrites"_sr);
+			countCacheReads.init("AsyncFile.CountCacheReads"_sr);
+			countCacheWritesBlocked.init("AsyncFile.CountCacheWritesBlocked"_sr);
+			countCacheReadsBlocked.init("AsyncFile.CountCacheReadsBlocked"_sr);
+			countCachePageReadsHit.init("AsyncFile.CountCachePageReadsHit"_sr);
+			countCachePageReadsMissed.init("AsyncFile.CountCachePageReadsMissed"_sr);
+			countCachePageReadsMerged.init("AsyncFile.CountCachePageReadsMerged"_sr);
+			countCacheFinds.init("AsyncFile.CountCacheFinds"_sr);
+			countCacheReadBytes.init("AsyncFile.CountCacheReadBytes"_sr);
+		}
+	}
+
+	static Future<Reference<IAsyncFile>> open_impl(std::string filename, int flags, int mode);
+
+	// Opens a file that uses the FDB in-memory page cache
+	static Future<Reference<IAsyncFile>> open_impl(std::string filename,
+	                                               int flags,
+	                                               int mode,
+	                                               Reference<EvictablePageCache> pageCache) {
+		try {
+			TraceEvent("AFCUnderlyingOpenBegin").detail("Filename", filename);
+			if (flags & IAsyncFile::OPEN_CACHED_READ_ONLY)
+				flags = (flags & ~IAsyncFile::OPEN_READWRITE) | IAsyncFile::OPEN_READONLY;
+			else
+				flags = (flags & ~IAsyncFile::OPEN_READONLY) | IAsyncFile::OPEN_READWRITE;
+			Reference<IAsyncFile> f = co_await IAsyncFileSystem::filesystem()->open(
+			    filename, flags | IAsyncFile::OPEN_UNCACHED | IAsyncFile::OPEN_UNBUFFERED, mode);
+			TraceEvent("AFCUnderlyingOpenEnd").detail("Filename", filename);
+			int64_t l = co_await f->size();
+			TraceEvent("AFCUnderlyingSize").detail("Filename", filename).detail("Size", l);
+			auto cachedFile = makeReference<AsyncFileCached>(f, filename, l, pageCache);
+			co_return Reference<IAsyncFile>(cachedFile);
+		} catch (Error& e) {
+			if (e.code() != error_code_actor_cancelled)
+				openFiles.erase(filename);
+			throw e;
+		}
+	}
+
+	Future<Void> flush() override;
+
+	Future<Void> quiesce();
+
+	Future<Void> waitAndSync(Future<Void> flush) {
+		co_await flush;
+		co_await uncached->sync();
+	}
+
+	template <bool writing>
+	Future<Void> read_write_impl(typename std::conditional_t<writing, const uint8_t*, uint8_t*> data,
+	                             int length,
+	                             int64_t offset);
+
+	void remove_page(AFCPage* page);
+};
+
+struct AFCPage : public EvictablePage, public FastAllocated<AFCPage> {
+	bool evict() override {
+		if (notReading.isReady() && notFlushing.isReady() && !dirty && !zeroCopyRefCount && !truncated) {
+			owner->remove_page(this);
+			delete this;
+			return true;
+		}
+
+		if (dirty)
+			flush();
+
+		return false;
+	}
+
+	// Move this page's data into the orphanedPages set of the owner
+	void orphan() {
+		owner->orphanedPages[data] = zeroCopyRefCount;
+		zeroCopyRefCount = 0;
+		notReading = Void();
+		data = allocateFast4kAligned(pageCache->pageSize);
+	}
+
+	Future<Void> write(void const* data, int length, int offset) {
+		// If zero-copy reads are in progress, allow whole page writes to a new page buffer so the effects
+		// are not seen by the prior readers who still hold zeroCopyRead pointers
+		bool fullPage = offset == 0 && length == pageCache->pageSize;
+		ASSERT(zeroCopyRefCount == 0 || fullPage);
+
+		if (zeroCopyRefCount != 0) {
+			ASSERT(fullPage);
+			orphan();
+		}
+
+		setDirty();
+
+		// If there are no active readers then if data is valid or we're replacing all of it we can write directly
+		if (valid || fullPage) {
+			if (!fullPage) {
+				++owner->countFileCachePageReadsHit;
+				++owner->countCachePageReadsHit;
+			}
+			valid = true;
+			memcpy(static_cast<uint8_t*>(this->data) + offset, data, length);
+			return yield();
+		}
+
+		++owner->countFileCachePageReadsMissed;
+		++owner->countCachePageReadsMissed;
+
+		// If data is not valid but no read is in progress, start reading
+		if (notReading.isReady()) {
+			notReading = readThrough();
+		}
+
+		notReading = waitAndWrite(data, length, offset);
+
+		return notReading;
+	}
+
+	Future<Void> waitAndWrite(void const* data, int length, int offset) {
+		Future<Void> notReading = this->notReading;
+		co_await notReading;
+		memcpy(static_cast<uint8_t*>(this->data) + offset, data, length);
+	}
+
+	Future<Void> readZeroCopy() {
+		++zeroCopyRefCount;
+		if (valid) {
+			++owner->countFileCachePageReadsHit;
+			++owner->countCachePageReadsHit;
+			return yield();
+		}
+
+		++owner->countFileCachePageReadsMissed;
+		++owner->countCachePageReadsMissed;
+
+		if (notReading.isReady()) {
+			notReading = readThrough();
+		} else {
+			++owner->countFileCachePageReadsMerged;
+			++owner->countCachePageReadsMerged;
+		}
+
+		return notReading;
+	}
+	void releaseZeroCopy() {
+		--zeroCopyRefCount;
+		ASSERT_GE(zeroCopyRefCount, 0);
+	}
+
+	Future<Void> read(void* data, int length, int offset) {
+		if (valid) {
+			++owner->countFileCachePageReadsHit;
+			++owner->countCachePageReadsHit;
+			owner->countFileCacheReadBytes += length;
+			owner->countCacheReadBytes += length;
+			memcpy(data, static_cast<uint8_t const*>(this->data) + offset, length);
+			return yield();
+		}
+
+		++owner->countFileCachePageReadsMissed;
+		++owner->countCachePageReadsMissed;
+
+		if (notReading.isReady()) {
+			notReading = readThrough();
+		} else {
+			++owner->countFileCachePageReadsMerged;
+			++owner->countCachePageReadsMerged;
+		}
+
+		notReading = waitAndRead(data, length, offset);
+
+		return notReading;
+	}
+
+	Future<Void> waitAndRead(void* data, int length, int offset) {
+		Future<Void> notReading = this->notReading;
+		co_await notReading;
+		memcpy(data, static_cast<uint8_t const*>(this->data) + offset, length);
+	}
+
+	Future<Void> readThrough() {
+		ASSERT(!valid);
+		void* dst = data;
+		if (pageOffset < owner->prevLength) {
+			try {
+				int _ = co_await owner->uncached->read(dst, pageCache->pageSize, pageOffset);
+				if (_ != pageCache->pageSize) {
+					TraceEvent("ReadThroughShortRead")
+					    .detail("ReadAmount", _)
+					    .detail("PageSize", pageCache->pageSize)
+					    .detail("PageOffset", pageOffset);
+				}
+			} catch (Error& e) {
+				zeroCopyRefCount = 0;
+				TraceEvent("ReadThroughFailed").error(e);
+				throw;
+			}
+		}
+		// If the memory we read into wasn't orphaned while we were waiting on the read then set valid to true
+		if (dst == data)
+			valid = true;
+	}
+
+	Future<Void> writeThrough(Promise<Void> writing) {
+		// writeThrough can be called on a page that is not dirty, just to wait for a previous writeThrough to finish.
+		// In that case we don't want to do any disk I/O
+		try {
+			bool dirty = this->dirty;
+			++writeThroughCount;
+			updateFlushableIndex();
+
+			Future<Void> readyToWrite = notReading && notFlushing;
+			co_await readyToWrite;
+
+			if (dirty) {
+				// Wait for rate control if it is set
+				if (owner->getRateControl()) {
+					int allowance = 1;
+					// If I/O size is defined, wait for the calculated I/O quota
+					if (FLOW_KNOBS->FLOW_CACHEDFILE_WRITE_IO_SIZE > 0) {
+						allowance = (pageCache->pageSize + FLOW_KNOBS->FLOW_CACHEDFILE_WRITE_IO_SIZE - 1) /
+						            FLOW_KNOBS->FLOW_CACHEDFILE_WRITE_IO_SIZE; // round up
+						ASSERT_GT(allowance, 0);
+					}
+					co_await owner->getRateControl()->getAllowance(allowance);
+				}
+
+				if (pageOffset + pageCache->pageSize > owner->length) {
+					ASSERT_LT(pageOffset, owner->length);
+					memset(static_cast<uint8_t*>(data) + owner->length - pageOffset,
+					       0,
+					       pageCache->pageSize - (owner->length - pageOffset));
+				}
+
+				auto f = owner->uncached->write(data, pageCache->pageSize, pageOffset);
+
+				co_await f;
+			}
+		} catch (Error& e) {
+			--writeThroughCount;
+			setDirty();
+			writing.sendError(e);
+			throw;
+		}
+		--writeThroughCount;
+		updateFlushableIndex();
+
+		writing.send(Void()); // FIXME: This could happen before the wait if AsyncFileKAIO dealt properly with
+		                      // overlapping write and sync operations
+
+		pageCache->try_evict();
+	}
+
+	Future<Void> flush() {
+		if (!dirty && notFlushing.isReady())
+			return Void();
+
+		ASSERT(valid || !notReading.isReady() || notReading.isError());
+
+		Promise<Void> writing;
+
+		notFlushing = writeThrough(writing);
+
+		clearDirty(); // Do this last so that if writeThrough immediately calls try_evict, we can't be evicted before
+		              // assigning notFlushing
+		return writing.getFuture();
+	}
+
+	Future<Void> quiesce() {
+		if (dirty)
+			flush();
+
+		// If we are flushing, we will be quiescent when all flushes are finished
+		// Returning flush() isn't right, because flush can return before notFlushing.isReady()
+		if (!notFlushing.isReady()) {
+			return notFlushing;
+		}
+
+		// else if we are reading, we will be quiescent when the read is finished
+		if (!notReading.isReady())
+			return notReading;
+
+		return Void();
+	}
+
+	Future<Void> truncate() {
+		// Allow truncatation during zero copy reads but orphan the previous buffer
+		if (zeroCopyRefCount != 0)
+			orphan();
+		truncated = true;
+		return truncate_impl();
+	}
+
+	Future<Void> truncate_impl() {
+		Future<Void> readyToTruncate = notReading && notFlushing && yield();
+		co_await readyToTruncate;
+		delete this;
+	}
+
+	AFCPage(AsyncFileCached* owner, int64_t offset)
+	  : EvictablePage(owner->pageCache), owner(owner), pageOffset(offset), notReading(Void()), notFlushing(Void()),
+	    dirty(false), valid(false), truncated(false), writeThroughCount(0), flushableIndex(-1), zeroCopyRefCount(0) {
+		pageCache->allocate(this);
+	}
+
+	~AFCPage() override {
+		clearDirty();
+		ASSERT_ABORT(flushableIndex == -1);
+	}
+
+	void setDirty() {
+		dirty = true;
+		updateFlushableIndex();
+	}
+
+	void clearDirty() {
+		dirty = false;
+		updateFlushableIndex();
+	}
+
+	void updateFlushableIndex() {
+		bool flushable = dirty || writeThroughCount;
+		if (flushable == (flushableIndex != -1))
+			return;
+
+		if (flushable) {
+			flushableIndex = owner->flushable.size();
+			owner->flushable.push_back(this);
+		} else {
+			ASSERT(owner->flushable[flushableIndex] == this);
+			owner->flushable[flushableIndex] = owner->flushable.back();
+			owner->flushable[flushableIndex]->flushableIndex = flushableIndex;
+			owner->flushable.pop_back();
+			flushableIndex = -1;
+		}
+	}
+
+	AsyncFileCached* owner;
+	int64_t pageOffset;
+
+	Future<Void> notReading; // .isReady when a readThrough (or waitAndWrite) is not in progress
+	Future<Void> notFlushing; // .isReady when a writeThrough is not in progress
+
+	bool dirty; // write has been called more recently than flush
+	bool valid; // data contains the file contents
+	bool truncated; // true if this page has been truncated
+	int writeThroughCount; // number of writeThrough actors that are in progress (potentially writing or waiting to
+	                       // write)
+	int flushableIndex; // index in owner->flushable[]
+	int zeroCopyRefCount; // references held by "zero-copy" reads
+};

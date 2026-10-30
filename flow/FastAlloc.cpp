@@ -20,6 +20,7 @@
 
 #include "flow/FastAlloc.h"
 
+#include "flow/MemoryTracker.h"
 #include "flow/ThreadPrimitives.h"
 #include "flow/Trace.h"
 #include "flow/Error.h"
@@ -30,6 +31,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <thread>
 #include <unordered_map>
 
 #ifdef WIN32
@@ -63,8 +65,8 @@
 #elif defined(__FreeBSD__)
 #define INIT_SEG __attribute__((init_priority(1000)))
 #elif defined(__APPLE__)
-#pragma message "init_priority is not supported on this platform; will this be a problem?"
-#define INIT_SEG
+#define INIT_SEG __attribute__((init_priority(1000)))
+// WARNING: init_priority for macOS linker is just "within single module" not "entire application"
 #else
 #error Where am I?
 #endif
@@ -108,9 +110,6 @@ bool valgrindPrecise() {
 	return result;
 }
 #endif
-
-template <int Size>
-void* FastAllocator<Size>::freelist = nullptr;
 
 std::atomic<int64_t> g_hugeArenaMemory(0);
 
@@ -311,10 +310,10 @@ namespace keepalive_allocator {
 
 namespace detail {
 
-std::set<void*> g_allocatedSet;
-std::set<void*> g_freedSet;
-std::vector<std::pair<const uint8_t*, int>> g_wipedSet;
-bool g_active = false;
+thread_local std::set<void*> g_allocatedSet;
+thread_local std::set<void*> g_freedSet;
+thread_local std::vector<std::pair<const uint8_t*, int>> g_wipedSet;
+thread_local bool g_active = false;
 
 } // namespace detail
 
@@ -371,6 +370,33 @@ std::vector<std::pair<const uint8_t*, int>> const& getWipedAreaSet() {
 
 } // namespace keepalive_allocator
 
+TEST_CASE("/flow/FastAlloc/KeepaliveScopeThreadIsolation") {
+	std::atomic<bool> start{ false };
+	std::atomic<bool> allocated{ false };
+	std::atomic<bool> release{ false };
+	std::thread otherThread([&] {
+		while (!start.load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+		}
+		auto* memory = allocateAndMaybeKeepalive(64);
+		allocated.store(true, std::memory_order_release);
+		while (!release.load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+		}
+		freeOrMaybeKeepalive(memory);
+	});
+	{
+		keepalive_allocator::ActiveScope scope;
+		start.store(true, std::memory_order_release);
+		while (!allocated.load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+		}
+	}
+	release.store(true, std::memory_order_release);
+	otherThread.join();
+	return Void();
+}
+
 template <int Size>
 void* FastAllocator<Size>::allocate() {
 	if (keepalive_allocator::isActive()) [[unlikely]]
@@ -386,18 +412,28 @@ void* FastAllocator<Size>::allocate() {
 	bytes->increment(size);
 
 #if defined(USE_GPERFTOOLS) || defined(ADDRESS_SANITIZER)
-	// Some usages of FastAllocator require 4096 byte alignment.
-	return aligned_alloc(Size >= 4096 ? 4096 : alignof(void*), Size);
+	{
+		// Some usages of FastAllocator require 4096 byte alignment.
+		// This path bypasses the freelist and the memTrackerOnAlloc at the bottom
+		// of the function, so track here too — otherwise every FastAllocator size
+		// class (and the small Arena blocks backed by it) would be invisible to the
+		// tracker under gperftools / ASan. Symmetric with release() below. (Braces
+		// scope this `p` so it can't collide with the freelist `p` compiled below.)
+		void* p = aligned_alloc(Size >= 4096 ? 4096 : alignof(void*), Size);
+		memTrackerOnAlloc(p, Size);
+		return p;
+	}
 #endif
 
 #if VALGRIND
 	if (valgrindPrecise()) {
 		// Some usages of FastAllocator require 4096 byte alignment
-		return aligned_alloc(Size >= 4096 ? 4096 : alignof(void*), Size);
+		void* p = aligned_alloc(Size >= 4096 ? 4096 : alignof(void*), Size);
+		memTrackerOnAlloc(p, Size); // track here too (see the gperftools/ASan path above)
+		return p;
 	}
 #endif
 
-#if FASTALLOC_THREAD_SAFE
 	ThreadData& thr = threadData();
 	if (!thr.freelist) {
 		ASSERT(thr.count == 0);
@@ -417,21 +453,13 @@ void* FastAllocator<Size>::allocate() {
 	thr.freelist = *(void**)p;
 	ASSERT(!thr.freelist == (thr.count == 0)); // freelist is empty if and only if count is 0
 	// check( p, true );
-#else
-	void* p = freelist;
-	if (!p)
-		getMagazine();
-#if VALGRIND
-	VALGRIND_MAKE_MEM_DEFINED(p, sizeof(void*));
-#endif
-	freelist = *(void**)p;
-#endif
 #if VALGRIND
 	VALGRIND_MALLOCLIKE_BLOCK(p, Size, 0, 0);
 #endif
 #if defined(ALLOC_INSTRUMENTATION) || defined(ALLOC_INSTRUMENTATION_STDOUT)
 	recordAllocation(p, Size);
 #endif
+	memTrackerOnAlloc(p, Size);
 	return p;
 }
 
@@ -470,16 +498,19 @@ void FastAllocator<Size>::release(void* ptr) {
 	bytes->increment(size);
 
 #if defined(USE_GPERFTOOLS) || defined(ADDRESS_SANITIZER)
+	// Mirror allocate()'s early-return tracking so frees on this path debit the
+	// live table (without this the block would leak in the tracker's accounting).
+	memTrackerOnFree(ptr);
 	return aligned_free(ptr);
 #endif
 
 #if VALGRIND
 	if (valgrindPrecise()) {
+		memTrackerOnFree(ptr); // mirror allocate() (see the gperftools/ASan path above)
 		return aligned_free(ptr);
 	}
 #endif
 
-#if FASTALLOC_THREAD_SAFE
 	ThreadData& thr = threadData();
 	if (thr.count == magazine_size) {
 		if (thr.alternate) // Two full magazines, return one
@@ -498,10 +529,6 @@ void FastAllocator<Size>::release(void* ptr) {
 	*(void**)ptr = thr.freelist;
 	// check(ptr, false);
 	thr.freelist = ptr;
-#else
-	*(void**)ptr = freelist;
-	freelist = ptr;
-#endif
 
 #if VALGRIND
 	VALGRIND_FREELIKE_BLOCK(ptr, 0);
@@ -509,6 +536,7 @@ void FastAllocator<Size>::release(void* ptr) {
 #if defined(ALLOC_INSTRUMENTATION) || defined(ALLOC_INSTRUMENTATION_STDOUT)
 	recordDeallocation(ptr);
 #endif
+	memTrackerOnFree(ptr);
 }
 
 template <int Size>
@@ -635,17 +663,20 @@ void FastAllocator<Size>::getMagazine() {
 #endif
 	// NOTE: rely on lower level metrics in allocate() (and whatever it calls)
 	// for accounting the allocations it does.
-	block = (void**)::allocate(magazine_size * Size, /*allowLargePages*/ false, includeGuardPages);
+	block = (void**)::allocate(static_cast<size_t>(magazine_size) * Size, /*allowLargePages*/ false, includeGuardPages);
 #endif
 
 	// void** block = new void*[ magazine_size * PSize ];
 	for (int i = 0; i < magazine_size - 1; i++) {
-		block[i * PSize + 1] = block[i * PSize] = &block[(i + 1) * PSize];
-		check(&block[i * PSize], false);
+		const size_t offset = static_cast<size_t>(i) * PSize;
+		const size_t nextOffset = static_cast<size_t>(i + 1) * PSize;
+		block[offset + 1] = block[offset] = &block[nextOffset];
+		check(&block[offset], false);
 	}
 
-	block[(magazine_size - 1) * PSize + 1] = block[(magazine_size - 1) * PSize] = nullptr;
-	check(&block[(magazine_size - 1) * PSize], false);
+	const size_t lastOffset = static_cast<size_t>(magazine_size - 1) * PSize;
+	block[lastOffset + 1] = block[lastOffset] = nullptr;
+	check(&block[lastOffset], false);
 	thr.freelist = block;
 	thr.count = magazine_size;
 }
@@ -677,34 +708,25 @@ FastAllocator<Size>::ThreadData::~ThreadData() {
 int64_t getTotalUnusedAllocatedMemory() {
 	int64_t unusedMemory = 0;
 
-	unusedMemory += FastAllocator<16>::getApproximateMemoryUnused();
-	unusedMemory += FastAllocator<32>::getApproximateMemoryUnused();
-	unusedMemory += FastAllocator<64>::getApproximateMemoryUnused();
-	unusedMemory += FastAllocator<96>::getApproximateMemoryUnused();
-	unusedMemory += FastAllocator<128>::getApproximateMemoryUnused();
-	unusedMemory += FastAllocator<256>::getApproximateMemoryUnused();
-	unusedMemory += FastAllocator<512>::getApproximateMemoryUnused();
-	unusedMemory += FastAllocator<1024>::getApproximateMemoryUnused();
-	unusedMemory += FastAllocator<2048>::getApproximateMemoryUnused();
-	unusedMemory += FastAllocator<4096>::getApproximateMemoryUnused();
-	unusedMemory += FastAllocator<8192>::getApproximateMemoryUnused();
-	unusedMemory += FastAllocator<16384>::getApproximateMemoryUnused();
+	forEachFastAllocatorSize([&]<int Size>() { unusedMemory += FastAllocator<Size>::getApproximateMemoryUnused(); });
 
 	return unusedMemory;
 }
 
-template class FastAllocator<16>;
-template class FastAllocator<32>;
-template class FastAllocator<64>;
-template class FastAllocator<96>;
-template class FastAllocator<128>;
-template class FastAllocator<256>;
-template class FastAllocator<512>;
-template class FastAllocator<1024>;
-template class FastAllocator<2048>;
-template class FastAllocator<4096>;
-template class FastAllocator<8192>;
-template class FastAllocator<16384>;
+// Explicit class instantiation also emits the early thread-local initializer.
+static_assert(FAST_ALLOCATOR_SIZES.size() == 12, "Update the explicit instantiations when changing size classes.");
+template class FastAllocator<FAST_ALLOCATOR_SIZES[0]>;
+template class FastAllocator<FAST_ALLOCATOR_SIZES[1]>;
+template class FastAllocator<FAST_ALLOCATOR_SIZES[2]>;
+template class FastAllocator<FAST_ALLOCATOR_SIZES[3]>;
+template class FastAllocator<FAST_ALLOCATOR_SIZES[4]>;
+template class FastAllocator<FAST_ALLOCATOR_SIZES[5]>;
+template class FastAllocator<FAST_ALLOCATOR_SIZES[6]>;
+template class FastAllocator<FAST_ALLOCATOR_SIZES[7]>;
+template class FastAllocator<FAST_ALLOCATOR_SIZES[8]>;
+template class FastAllocator<FAST_ALLOCATOR_SIZES[9]>;
+template class FastAllocator<FAST_ALLOCATOR_SIZES[10]>;
+template class FastAllocator<FAST_ALLOCATOR_SIZES[11]>;
 
 #ifdef USE_JEMALLOC
 #include <jemalloc/jemalloc.h>
@@ -714,7 +736,7 @@ TEST_CASE("/jemalloc/4k_aligned_usable_size") {
 		// Check that we can allocate 4k aligned up to 16k with no internal
 		// fragmentation
 		for (int i = 1; i < 4; ++i) {
-			ptr = aligned_alloc(4096, i * 4096);
+			ptr = aligned_alloc(4096, static_cast<size_t>(i) * 4096);
 			ASSERT_EQ(malloc_usable_size(ptr), i * 4096);
 			aligned_free(ptr);
 			ptr = nullptr;

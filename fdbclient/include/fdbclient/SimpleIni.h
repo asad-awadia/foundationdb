@@ -297,7 +297,8 @@ public:
 		const SI_CHAR* pComment;
 		int nOrder;
 
-		Entry(const SI_CHAR* a_pszItem = NULL, int a_nOrder = 0) : pItem(a_pszItem), pComment(NULL), nOrder(a_nOrder) {}
+		explicit(false) Entry(const SI_CHAR* a_pszItem = NULL, int a_nOrder = 0)
+		  : pItem(a_pszItem), pComment(NULL), nOrder(a_nOrder) {}
 		Entry(const SI_CHAR* a_pszItem, const SI_CHAR* a_pszComment, int a_nOrder)
 		  : pItem(a_pszItem), pComment(a_pszComment), nOrder(a_nOrder) {}
 		Entry(const Entry& rhs) { operator=(rhs); }
@@ -363,7 +364,7 @@ public:
 		FILE* m_file;
 
 	public:
-		FileWriter(FILE* a_file) : m_file(a_file) {}
+		explicit FileWriter(FILE* a_file) : m_file(a_file) {}
 		void Write(const char* a_pBuf) { fputs(a_pBuf, m_file); }
 
 	private:
@@ -376,7 +377,7 @@ public:
 		std::string& m_string;
 
 	public:
-		StringWriter(std::string& a_string) : m_string(a_string) {}
+		explicit StringWriter(std::string& a_string) : m_string(a_string) {}
 		void Write(const char* a_pBuf) { m_string.append(a_pBuf); }
 
 	private:
@@ -390,7 +391,7 @@ public:
 		std::ostream& m_ostream;
 
 	public:
-		StreamWriter(std::ostream& a_ostream) : m_ostream(a_ostream) {}
+		explicit StreamWriter(std::ostream& a_ostream) : m_ostream(a_ostream) {}
 		void Write(const char* a_pBuf) { m_ostream << a_pBuf; }
 
 	private:
@@ -405,7 +406,7 @@ public:
 	class Converter : private SI_CONVERTER {
 	public:
 		using SI_CONVERTER::SizeToStore;
-		Converter(bool a_bStoreIsUtf8) : SI_CONVERTER(a_bStoreIsUtf8) { m_scratch.resize(1024); }
+		explicit Converter(bool a_bStoreIsUtf8) : SI_CONVERTER(a_bStoreIsUtf8) { m_scratch.resize(1024); }
 		Converter(const Converter& rhs) { operator=(rhs); }
 		Converter& operator=(const Converter& rhs) {
 			m_scratch = rhs.m_scratch;
@@ -436,7 +437,7 @@ public:
 	    @param a_bMultiKey   See the method SetMultiKey() for details.
 	    @param a_bMultiLine  See the method SetMultiLine() for details.
 	 */
-	CSimpleIniTempl(bool a_bIsUtf8 = false, bool a_bMultiKey = false, bool a_bMultiLine = false);
+	explicit CSimpleIniTempl(bool a_bIsUtf8 = false, bool a_bMultiKey = false, bool a_bMultiLine = false);
 
 	/** Destructor */
 	~CSimpleIniTempl();
@@ -1862,9 +1863,9 @@ SI_Error CSimpleIniTempl<SI_CHAR, SI_STRLESS, SI_CONVERTER>::SetLongValue(const 
 	// convert to an ASCII string
 	char szInput[64];
 #if __STDC_WANT_SECURE_LIB__ && !_WIN32_WCE
-	sprintf_s(szInput, a_bUseHex ? "0x%lx" : "%ld", a_nValue);
+	snprintf_s(szInput, sizeof(szInput), a_bUseHex ? "0x%lx" : "%ld", a_nValue);
 #else // !__STDC_WANT_SECURE_LIB__
-	sprintf(szInput, a_bUseHex ? "0x%lx" : "%ld", a_nValue);
+	snprintf(szInput, sizeof(szInput), a_bUseHex ? "0x%lx" : "%ld", a_nValue);
 #endif // __STDC_WANT_SECURE_LIB__
 
 	// convert to output text
@@ -1914,13 +1915,8 @@ SI_Error CSimpleIniTempl<SI_CHAR, SI_STRLESS, SI_CONVERTER>::SetDoubleValue(cons
 	if (!a_pSection || !a_pKey)
 		return SI_FAIL;
 
-	// convert to an ASCII string
 	char szInput[64];
-#if __STDC_WANT_SECURE_LIB__ && !_WIN32_WCE
-	sprintf_s(szInput, "%f", a_nValue);
-#else // !__STDC_WANT_SECURE_LIB__
-	sprintf(szInput, "%f", a_nValue);
-#endif // __STDC_WANT_SECURE_LIB__
+	snprintf(szInput, sizeof(szInput), "%f", a_nValue);
 
 	// convert to output text
 	SI_CHAR szOutput[64];
@@ -2436,7 +2432,7 @@ protected:
 	SI_ConvertA() {}
 
 public:
-	SI_ConvertA(bool a_bStoreIsUtf8) : m_bStoreIsUtf8(a_bStoreIsUtf8) {}
+	explicit SI_ConvertA(bool a_bStoreIsUtf8) : m_bStoreIsUtf8(a_bStoreIsUtf8) {}
 
 	/* copy and assignment */
 	SI_ConvertA(const SI_ConvertA& rhs) { operator=(rhs); }
@@ -2555,7 +2551,7 @@ protected:
 	SI_ConvertW() {}
 
 public:
-	SI_ConvertW(bool a_bStoreIsUtf8) : m_bStoreIsUtf8(a_bStoreIsUtf8) {}
+	explicit SI_ConvertW(bool a_bStoreIsUtf8) : m_bStoreIsUtf8(a_bStoreIsUtf8) {}
 
 	/* copy and assignment */
 	SI_ConvertW(const SI_ConvertW& rhs) { operator=(rhs); }
@@ -2736,7 +2732,7 @@ protected:
 	SI_ConvertW() : m_pEncoding(NULL), m_pConverter(NULL) {}
 
 public:
-	SI_ConvertW(bool a_bStoreIsUtf8) : m_pConverter(NULL) { m_pEncoding = a_bStoreIsUtf8 ? "UTF-8" : NULL; }
+	explicit SI_ConvertW(bool a_bStoreIsUtf8) : m_pConverter(NULL) { m_pEncoding = a_bStoreIsUtf8 ? "UTF-8" : NULL; }
 
 	/* copy and assignment */
 	SI_ConvertW(const SI_ConvertW& rhs) { operator=(rhs); }
@@ -2943,7 +2939,7 @@ protected:
 	SI_ConvertW() {}
 
 public:
-	SI_ConvertW(bool a_bStoreIsUtf8) { m_uCodePage = a_bStoreIsUtf8 ? CP_UTF8 : CP_ACP; }
+	explicit SI_ConvertW(bool a_bStoreIsUtf8) { m_uCodePage = a_bStoreIsUtf8 ? CP_UTF8 : CP_ACP; }
 
 	/* copy and assignment */
 	SI_ConvertW(const SI_ConvertW& rhs) { operator=(rhs); }

@@ -1,0 +1,156 @@
+# AGENTS.md
+
+This file provides guidance to AI coding agents working in this repository.
+
+## Build
+
+```bash
+mkdir build && cd build
+cmake -G Ninja <SOURCE_DIR>
+ninja
+# or: ninja fdbserver fdbcli fdbclient  (specific targets)
+```
+
+Key cmake options:
+- `-DCMAKE_BUILD_TYPE=Debug` (default Release)
+- `-DUSE_WERROR=ON` for development
+- `-DOPEN_FOR_IDE=ON` to generate IDE project without building
+
+macOS: add `-DBUILD_SWIFT_BINDING=OFF` if Swift issues arise.
+
+Linux with Clang: `CC=clang CXX=clang++ cmake -DUSE_LD=LLD -DUSE_LIBCXX=1 -G Ninja ..`
+
+## Testing
+
+**Unit tests** use `TEST_CASE("/path/to/test")` macros (defined in `flow/include/flow/UnitTest.h`). Prefer the narrowest dedicated unit-test target instead of `fdbserver -r unittests`; these targets compile and run faster. Use `fdbclient_test` for client tests or the relevant `fdbserver_<library>_test` target defined via `add_fdbserver_unit_test` (for example, `fdbserver_core_test`, `fdbserver_kvstore_test`, or `fdbserver_storageserver_test`). Find the applicable target in the affected component's `CMakeLists.txt`:
+```bash
+ninja fdbclient_test
+bin/fdbclient_test                                  # all tests in the target
+bin/fdbclient_test -f "<test-prefix>"                # tests matching a prefix
+
+ninja fdbserver_core_test
+bin/fdbserver_core_test
+```
+
+Use `fdbserver` for simulation or broader end-to-end validation, not as the default unit-test runner.
+
+**Simulation tests** use TOML workload definitions in `tests/fast/`, `tests/slow/`, etc.:
+```bash
+bin/fdbserver -r simulation -f tests/fast/CycleTest.toml
+```
+
+**Via ctest:**
+```bash
+ctest -L fast                    # all fast tests
+ctest -R "StatusDuringOutage"    # by name pattern
+```
+
+Enable simulation tests in cmake: `-DENABLE_SIMULATION_TESTS=ON`
+
+**Adding new tests:**
+- For a new otherwise-unreferenced translation unit containing `TEST_CASE`, add a `forceLinkXxxTests()` stub and call it from `fdbserver/workloads/UnitTests.cpp`, or the linker can drop the tests.
+- Register new `.toml` or `.txt` tests under `tests/` in `tests/CMakeLists.txt` via `add_fdb_test`. `configure_testing(... ERROR_ON_ADDITIONAL_FILES)` and `verify_testing()` should catch unregistered files during CMake configuration.
+
+**Joshua**: bulk correctness/simulation testing runs on the internal Joshua cluster against optimized Release builds. Local `fdbserver -r simulation` runs are for iteration; large-scale shake-out happens on Joshua.
+
+**Trace logs**: simulation and test runs emit `trace.*.xml` (or `.json`) files in the run directory. `TraceEvent(...)` is the canonical logging mechanism — search trace files by event name when debugging a simulation failure.
+
+- A `SevError` (Severity 40) `TraceEvent` **fails** a simulation/Joshua run. Use `SevWarnAlways` for "shouldn't happen but non-fatal." Errors carrying an injected fault are auto-downgraded; genuine `SevError`s are not. Expected errors must be suppressed/allowlisted, never emitted at `SevError`.
+- Keep a `TraceEvent` small: any single `detail()` value over 495 bytes is truncated (`...`), and an event whose fields total over 4000 bytes is **dropped entirely** and re-logged as `TraceEventOverflow` — at `SevError` in simulation, so an oversized event *fails the test*. Chunk long payloads (joined lists, command lines, serialized blobs) across multiple events.
+- The `Time` field is `now()`, which does not advance between `co_await`s, so spans within one run-loop slice read as zero. `g_traceBatch` events also carry `MonotonicTime` for this.
+
+## Architecture
+
+FoundationDB is a distributed ordered key-value store with strict serializability. The codebase is organized into ~12 subsystems. For background on subsystems before diving into code, the `design/` directory holds human-authored design docs and `design/AI-generated/` holds subsystem maps and per-subsystem diagrams (start with `design/AI-generated/foundationdb_subsystem_map.md`).
+
+### Concurrency Model: C++ Coroutines
+
+FDB uses cooperative single-threaded concurrency. Asynchronous functions use
+standard C++ coroutines with `co_await` and `co_return` in ordinary `.cpp` and
+`.h` files. See `design/coroutines.md` for coroutine and cancellation semantics.
+
+Key types: `Future<T>`, `Promise<T>`, `PromiseStream<T>`, `Reference<T>` (ref-counted pointer), `Optional<T>`, `ErrorOr<T>`, `Arena` (region-based allocation).
+
+#### Common pitfalls
+
+- C++ coroutines: `co_await` is not allowed inside a `catch` handler. Capture the error, exit the catch, then `co_await` outside.
+- Errors are integer codes (`flow/include/flow/error_definitions.h`), not exceptions with messages. When you `catch (Error& e)`, re-throw `actor_cancelled` (and never silently swallow `broken_promise`) — eating cancellation causes hangs and leaks. Transaction retry goes through `tr.onError(e)`, not a bare loop.
+- `StringRef`/`KeyRef`/`ValueRef` are non-owning views into an `Arena`. Returning or storing one past its arena's lifetime is a dangling-reference bug; use `Standalone<>` (or `Key`/`Value`) when you need to own the bytes.
+- `a && b` on `Future<Void>` is `quorum(x, 2, 2)`, not a join: the first error completes it and drops the other input, cancelling it if nothing else holds it, and an already-failed `lhs` discards `rhs` unreferenced. Never accumulate with `f = f && g`; use `waitForAllReady()` to wait for everything regardless of errors.
+- `Subspace::range()` spans `prefix + '\x00'` to `prefix + '\xff'`, so it excludes the subspace's own key: a value written at `s.pack(x)` is not returned by scanning `s.get(x).range()`.
+
+### Core Subsystems
+
+- **`flow/`** — Async runtime, event loop, tracing, deterministic random, arenas
+- **`fdbrpc/`** — Endpoint-addressed RPC, peer management, failure monitor, Sim2 (deterministic simulation network)
+- **`fdbclient/`** — Transaction API (`NativeAPI.cpp`), read-your-writes (`ReadYourWrites.cpp`), location cache, multi-version client
+- **`fdbserver/`** — All server roles, organized by subdirectory:
+  - `clustercontroller/` — Leader election, role recruitment, ServerDBInfo broadcasting
+  - `coordinator/` — Paxos-based coordination state (generation registers)
+  - `commitproxy/`, `grvproxy/`, `resolver/` — Transaction commit pipeline
+  - `tlog/`, `logsystem/` — Durable mutation log (tag-partitioned)
+  - `storageserver/` — Serves reads, applies mutations from TLogs
+  - `kvstore/` — Pluggable storage engines (RocksDB, SQLite, memory/DiskQueue)
+  - `datadistributor/` — Shard management, team building, data movement
+  - `ratekeeper/` — Back-pressure and throttling
+  - `workloads/` — Simulation test workloads
+
+### Simulation Testing
+
+`fdbserver -r simulation` runs the entire cluster in a single process using Sim2, a deterministic simulated network. `buggify()` calls (`flow/include/flow/Buggify.h`) inject faults (delays, failures, corruption). Tests are TOML files that compose workloads. This is FDB's primary testing strategy.
+
+- Determinism is per seed *and* binary. Any code change shifts the `deterministicRandom()` sequence, so the same seed on a patched binary is a different execution, not an A/B comparison. Reproduce a failure on the unpatched binary, and judge a fix by failure rates over many seeds.
+- A continuation can resume with a different simulated process current than the one that started waiting, e.g. when a future is shared between processes on one simulated machine. Code that binds to `g_simulator->getCurrentProcess()` should capture it on entry and `co_await g_simulator->onProcess(...)` back before binding.
+
+### Knobs
+
+Runtime-tunable parameters are declared in `fdbserver/core/include/fdbserver/core/Knobs.h`, `fdbclient/include/fdbclient/Knobs.h`, and `flow/include/flow/Knobs.h` (UPPER_CASE names). Access them via `SERVER_KNOBS`, `CLIENT_KNOBS`, or `FLOW_KNOBS`. Defaults and buggification ranges live in `fdbserver/core/ServerKnobs.cpp`, `fdbclient/ClientKnobs.cpp`, and `flow/Knobs.cpp`.
+
+## Compatibility
+
+Before changing a serialized type that persists on disk, inspect its `serializer()` and adjacent versioning or downgrade comments. Do not reorder, remove, or change encoded fields without the appropriate version gate or migration and compatibility coverage.
+
+## Naming Conventions
+
+- **Variables, functions, methods**: camelCase (`smoothTotal`, `getWorkerForRole`)
+- **Classes, structs, enums**: PascalCase (`StorageServer`, `RecoveryState`)
+- **Knobs/constants**: UPPER_CASE (`MAX_BATCH_SIZE`, `VERSIONS_PER_SECOND`)
+- **Globals**: `g_` prefix for important ones (`g_network`, `g_simulator`)
+
+## Code Formatting
+
+`clang-format` is used. Python code uses `black` and `flake8` (pre-commit hooks: `pip install pre-commit && pre-commit install`).
+
+Edit tracked `.cpp` and `.h` sources, not generated output under the build directory.
+
+## Source File Headers
+
+Every new `.cpp` / `.h` file starts with the standard Apache 2.0 license block, with the filename on line 2 and the current year on the copyright line. Copy from any existing file in the tree (e.g. `flow/Knobs.cpp`). Add file-purpose comments *after* the license block, not in place of it.
+
+## Code Comments
+
+General guidance: comments should maximize clarity. They should be clear without being verbose. They should be concise without being cryptic.
+
+Scope: the guidance here mainly governs inline and implementation comments. Comments on public-facing APIs are contract statements and must be clear, precise, and complete.
+
+Audience: assume the readers of FDB are senior engineers fluent in asynchronous and concurrent programming, distributed systems, and stateful complex systems generally. Calibrate "non-obvious" to that reader — do not explain the language, the standard library, Flow/actor idioms, or established patterns they already know. Reserve comments for what such a reader could not quickly infer from the code itself.
+
+Implementation comments should focus on important, non-obvious fundamental rationale, motivation, and explanation of extremely subtle phenomena. Writing down important invariants — and the preconditions a piece of code requires of its caller (e.g. a lock that must be held, or a version that must already be durable) — is also a good idea.
+
+Do not write comments about mundane day-to-day development refactorings — junk like `// This used to be part of xyzFunc in Foo.cpp but we moved it here so that aaaFunc could also call it`.
+
+Do not write caller-location / "happening elsewhere" comments — narration of who invokes this code or where it is used ("called from X", "used by Y"). They duplicate what a search answers instantly and rot when callers change; describe what the code requires and guarantees on its own terms. Stating a real invariant is fine — "recovery is the only path that repairs" — naming the callers that happen to exist today is not.
+
+After writing or changing a bunch of code, make a pass over it one last time to review the comments. Ask yourself: am I rambling? Am I repeating what the code is showing? Am I just telling stories here? Is the information I'm writing going to be relevant and important a week from now, a month from now, a year from now? Is it genuinely essential and **non-obvious from the code itself**?
+
+## Code Review
+
+When reviewing, state explicitly: what the change is for, whether it is correct, bugs, omissions, better approaches, and a clear LGTM / no / not-yet. Read a construct's history (`git log -L`, `git blame`) before proposing to change something that looks odd.
+
+## Branching
+
+PRs target `main`. Release branches receive cherry-picks rather than direct PRs — don't open backport PRs without confirming first.
+
+## Design Docs
+
+Before a design doc is considered finished (not at the start), reconcile it against `design/design-doc-template.md`.

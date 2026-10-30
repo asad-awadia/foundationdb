@@ -23,8 +23,9 @@
 #include "flow/Error.h"
 #include "flow/IRandom.h"
 #include "flow/Platform.h"
-#include "flow/TDMetric.actor.h"
+#include "flow/TDMetric.h"
 #include "flow/Trace.h"
+#include "flow/Util.h"
 #include <cstdint>
 #include <string>
 #pragma once
@@ -74,9 +75,10 @@ const int bulkLoadManifestFormatVersion = 1;
 // TODO(BulkDump): use this everywhere
 std::string appendToPath(const std::string& path, const std::string& append);
 
-// Constructs a URL with the path modified to include "data/" prefix.
+// Constructs a direct object URL with the path modified to include the backup container's data tree.
 // This is used for BulkDump/BulkLoad to write under the backup container's data directory,
-// consistent with where BackupContainerS3BlobStore stores other backup files.
+// consistent with where BackupContainerBlobStore stores other backup files.  Any object key prefix
+// is materialized in the path and removed from the returned URL's query.
 // Input:  blobstore://creds@host/backup_container?bucket=... , "bulkdump_data"
 // Output: blobstore://creds@host/data/backup_container/bulkdump_data?bucket=...
 std::string getBackupDataPath(const std::string& url, const std::string& suffix);
@@ -103,7 +105,7 @@ struct BulkLoadByteSampleSetting {
 	}
 
 	bool isValid() const {
-		if (method.size() == 0) {
+		if (method.empty()) {
 			return false;
 		}
 		return true;
@@ -188,7 +190,7 @@ public:
 		}
 	}
 
-	BulkLoadFileSet(const std::string& rootPath) : rootPath(rootPath) {
+	explicit BulkLoadFileSet(const std::string& rootPath) : rootPath(rootPath) {
 		if (rootPath.empty()) {
 			TraceEvent(SevError, "BulkLoadFileSetProvideInvalidPath")
 			    .suppressFor(10.0)
@@ -213,6 +215,18 @@ public:
 		}
 		if (!hasDataFile() && hasByteSampleFile()) {
 			// If bytes sample file exists, the data file must exist.
+			return false;
+		}
+		// Reject manifest-supplied path fields that could escape the local
+		// staging root via absolute paths or ".." traversal. These fields are
+		// read verbatim from an operator-supplied object store; getFolder()
+		// joins relativePath onto rootPath, and the file-name fields are
+		// appended to that folder, so any of them can drive a path traversal
+		// at the sink (e.g. "[RelativePath]: ../../../../var/lib/foundationdb"
+		// would drive eraseDirectoryRecursive()/file writes outside the root).
+		// Empty fields are allowed (callers treat them as absent).
+		if (!relativePathIsContained(relativePath) || !relativePathIsContained(manifestFileName) ||
+		    !relativePathIsContained(dataFileName) || !relativePathIsContained(byteSampleFileName)) {
 			return false;
 		}
 		return true;
@@ -379,7 +393,7 @@ public:
 	// [ByteSampleOverhead]: 100, [ByteSampleMinimalProbability]: 0.500000, [loadType]: 1, [TransportMethod]: 1"
 	// To decode the string, we firstly split the string by ", ". Then, for each part, we remove "[*]: ". Finally, we
 	// convert the remain string for each part to the fields defined in the BulkLoadManifest.
-	BulkLoadManifest(const std::string& rawString) {
+	explicit BulkLoadManifest(const std::string& rawString) {
 		try {
 			std::vector<std::string> parts = splitString(rawString, ", ");
 			formatVersion = std::stoi(stringRemovePrefix(parts[0], "[FormatVersion]: "));
@@ -565,7 +579,7 @@ public:
 
 	BulkLoadManifestSet() = default;
 
-	BulkLoadManifestSet(int inputMaxCount) { maxCount = inputMaxCount; }
+	explicit BulkLoadManifestSet(int inputMaxCount) { maxCount = inputMaxCount; }
 
 	bool isValid() const {
 		if (maxCount == 0) {
@@ -866,7 +880,7 @@ public:
 		                  ", [JobRange]: " + jobRange.toString() +
 		                  ", [Phase]: " + convertBulkLoadJobPhaseToString(phase) +
 		                  ", [TransportMethod]: " + convertBulkLoadTransportMethodToString(transportMethod);
-		res = res + ", [SubmitTime]: " + std::to_string(submitTime);
+		res = res + ", [SubmitTime]: " + formatTimeISO8601(submitTime);
 		res = res + ", [SinceSubmitMins]: " + std::to_string((now() - submitTime) / 60.0);
 		if (taskCount.present()) {
 			res = res + ", [TaskCount]: " + std::to_string(taskCount.get());
@@ -964,7 +978,7 @@ public:
 	// "[FormatVersion]: 1, [ManifestCount]: 2"
 	// To decode the string, we firstly split the string by ", ". Then, for each part, we remove "[*]: ". Finally,
 	// we convert the remain string for each part to the fields defined in the BulkLoadJobManifestFileHeader.
-	BulkLoadJobManifestFileHeader(const std::string& rawString) {
+	explicit BulkLoadJobManifestFileHeader(const std::string& rawString) {
 		try {
 			std::vector<std::string> parts = splitString(rawString, ", ");
 			formatVersion = std::stoi(stringRemovePrefix(parts[0], "[FormatVersion]: "));
@@ -988,6 +1002,8 @@ public:
 			throw bulkload_manifest_decode_error();
 		}
 	}
+
+	size_t getManifestCount() const { return manifestCount; }
 
 	bool isValid() const { return formatVersion > 0 && manifestCount > 0; }
 
@@ -1016,7 +1032,7 @@ public:
 	// 50705947, [Bytes]: 6889" To decode the string, we firstly split the string by ", ". Then, for each part, we
 	// remove "[*]: ". Finally, we convert the remain string for each part to the fields defined in the
 	// BulkLoadJobFileManifestEntry.
-	BulkLoadJobFileManifestEntry(const std::string& rawString) {
+	explicit BulkLoadJobFileManifestEntry(const std::string& rawString) {
 		try {
 			std::vector<std::string> parts = splitString(rawString, ", ");
 			if (parts.size() != 5) {
@@ -1042,7 +1058,7 @@ public:
 	}
 
 	// Used when dumping
-	BulkLoadJobFileManifestEntry(const BulkLoadManifest& manifest)
+	explicit BulkLoadJobFileManifestEntry(const BulkLoadManifest& manifest)
 	  : beginKey(manifest.getBeginKey()), endKey(manifest.getEndKey()),
 	    manifestRelativePath(manifest.getManifestRelativePath()), version(manifest.getVersion()),
 	    bytes(manifest.getTotalBytes()) {
@@ -1060,7 +1076,11 @@ public:
 
 	std::string getManifestRelativePath() const { return manifestRelativePath; }
 
-	bool isValid() const { return beginKey < endKey && version != invalidVersion; }
+	bool isValid() const {
+		return beginKey < endKey && version != invalidVersion && relativePathIsContained(manifestRelativePath);
+	}
+
+	Version getVersion() const { return version; }
 
 	bool hasEmptyData() const { return bytes == 0; }
 
@@ -1093,7 +1113,7 @@ public:
 
 	SSBulkLoadMetadata() : dataMoveId(UID()), conductBulkLoad(false) {};
 
-	SSBulkLoadMetadata(const UID& dataMoveId) : dataMoveId(dataMoveId) {
+	explicit SSBulkLoadMetadata(const UID& dataMoveId) : dataMoveId(dataMoveId) {
 		conductBulkLoad = getConductBulkLoadFromDataMoveId(dataMoveId);
 		return;
 	}

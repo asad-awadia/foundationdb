@@ -22,6 +22,8 @@
 #define FDBCLIENT_STORAGESERVERINTERFACE_H
 #pragma once
 
+#include <utility>
+
 #include "fdbclient/Audit.h"
 #include "fdbclient/BulkDumping.h"
 #include "fdbclient/FDBTypes.h"
@@ -31,12 +33,12 @@
 #include "fdbrpc/Locality.h"
 #include "fdbrpc/QueueModel.h"
 #include "fdbrpc/fdbrpc.h"
-#include "fdbrpc/LoadBalance.actor.h"
+#include "fdbrpc/LoadBalance.h"
 #include "fdbrpc/Stats.h"
 #include "fdbrpc/TimedRequest.h"
-#include "fdbrpc/TSSComparison.h"
+#include "fdbclient/TSSComparison.h"
 #include "fdbclient/CommitTransaction.h"
-#include "fdbclient/TagThrottle.actor.h"
+#include "fdbclient/TagThrottle.h"
 #include "fdbclient/Tracing.h"
 #include "flow/UnitTest.h"
 #include "fdbclient/VersionVector.h"
@@ -86,6 +88,7 @@ struct UpdateCommitCostRequest {
 
 struct StorageServerInterface {
 	constexpr static FileIdentifier file_identifier = 15302073;
+	constexpr static int kNumAdjustedEndpoints = 26;
 	enum { BUSY_ALLOWED = 0, BUSY_FORCE = 1, BUSY_LOCAL = 2 };
 
 	enum { LocationAwareLoadBalance = 1 };
@@ -141,6 +144,17 @@ public:
 	UID id() const { return uniqueID; }
 	bool isAcceptingRequests() const { return acceptingRequests; }
 	void startAcceptingRequests() { acceptingRequests = true; }
+
+	std::vector<UID> getEndpointTokens() const {
+		// Token at index 0 is the base `getValue` endpoint; adjusted endpoints start at 1.
+		std::vector<UID> tokens;
+		tokens.reserve(kNumAdjustedEndpoints + 1);
+		tokens.push_back(getValue.getEndpoint().token);
+		for (int i = 1; i <= kNumAdjustedEndpoints; ++i) {
+			tokens.push_back(getValue.getEndpoint().getAdjustedEndpoint(i).token);
+		}
+		return tokens;
+	}
 	void stopAcceptingRequests() { acceptingRequests = false; }
 	bool isTss() const { return tssPairID.present(); }
 	std::string toString() const { return id().shortString(); }
@@ -158,6 +172,10 @@ public:
 
 		if (Ar::isDeserializing) {
 			initEndpointsFromGetValue();
+			if (FLOW_KNOBS->STALE_PEER_OBSERVABILITY && g_network && g_network->global(INetwork::enFlowTransport)) {
+				FlowTransport::transport().interfaceTracker.created(
+				    getValue.getEndpoint().getPrimaryAddress(), "SS", getEndpointTokens());
+			}
 		}
 	}
 	bool operator==(StorageServerInterface const& s) const { return uniqueID == s.uniqueID; }
@@ -174,8 +192,8 @@ struct StorageInfo : NonCopyable, public ReferenceCounted<StorageInfo> {
 struct StorageServerMetaInfo : public StorageServerInterface {
 	Optional<StorageMetadataType> metadata;
 
-	StorageServerMetaInfo(const StorageServerInterface& interface,
-	                      Optional<StorageMetadataType> metadata = Optional<StorageMetadataType>())
+	explicit StorageServerMetaInfo(const StorageServerInterface& interface,
+	                               Optional<StorageMetadataType> metadata = Optional<StorageMetadataType>())
 	  : StorageServerInterface(interface), metadata(metadata) {}
 };
 
@@ -185,7 +203,7 @@ struct ServerCacheInfo {
 	std::vector<Reference<StorageInfo>> dest_info;
 
 	void populateTags() {
-		if (tags.size())
+		if (!tags.empty())
 			return;
 
 		for (const auto& info : src_info) {
@@ -204,7 +222,7 @@ struct GetValueReply : public LoadBalancedReply {
 	bool cached;
 
 	GetValueReply() : cached(false) {}
-	GetValueReply(Optional<Value> value, bool cached) : value(value), cached(cached) {}
+	GetValueReply(Optional<Value> value, bool cached) : value(std::move(value)), cached(cached) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
@@ -223,7 +241,7 @@ struct GetValueRequest : TimedRequest {
 	VersionVector ssLatestCommitVersions; // includes the latest commit versions, as known
 	                                      // to this client, of all storage replicas that
 	                                      // serve the given key
-	GetValueRequest() {}
+	GetValueRequest() = default;
 
 	bool verify() const { return true; }
 
@@ -233,8 +251,8 @@ struct GetValueRequest : TimedRequest {
 	                Optional<TagSet> tags,
 	                Optional<ReadOptions> options,
 	                VersionVector latestCommitVersions)
-	  : spanContext(spanContext), key(key), version(ver), tags(tags), options(options),
-	    ssLatestCommitVersions(latestCommitVersions) {}
+	  : spanContext(spanContext), key(key), version(ver), tags(std::move(tags)), options(options),
+	    ssLatestCommitVersions(std::move(latestCommitVersions)) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
@@ -266,7 +284,7 @@ struct WatchValueRequest {
 	Optional<UID> debugID;
 	ReplyPromise<WatchValueReply> reply;
 
-	WatchValueRequest() {}
+	WatchValueRequest() = default;
 
 	bool verify() const { return true; }
 
@@ -318,7 +336,7 @@ struct GetKeyValuesRequest : TimedRequest {
 	                                      // serve the given key
 	Optional<TaskPriority> taskID; // includes the information about read purpose
 
-	GetKeyValuesRequest() {}
+	GetKeyValuesRequest() = default;
 
 	bool verify() const { return true; }
 
@@ -374,7 +392,7 @@ struct GetMappedKeyValuesRequest : TimedRequest {
 	                                      // serve the given key range
 	Optional<TaskPriority> taskID; // includes the information about read purpose
 
-	GetMappedKeyValuesRequest() {}
+	GetMappedKeyValuesRequest() = default;
 
 	bool verify() const { return true; }
 
@@ -406,7 +424,7 @@ struct GetKeyValuesStreamReply : public ReplyPromiseStreamReply {
 	bool cached = false;
 
 	GetKeyValuesStreamReply() : version(invalidVersion), more(false), cached(false) {}
-	GetKeyValuesStreamReply(GetKeyValuesReply r)
+	explicit GetKeyValuesStreamReply(GetKeyValuesReply r)
 	  : arena(r.arena), data(r.data), version(r.version), more(r.more), cached(r.cached) {}
 
 	int expectedSize() const { return sizeof(GetKeyValuesStreamReply) + data.expectedSize(); }
@@ -438,7 +456,7 @@ struct GetKeyValuesStreamRequest {
 	                                      // to this client, of all storage replicas that
 	                                      // serve the given key range
 
-	GetKeyValuesStreamRequest() {}
+	GetKeyValuesStreamRequest() = default;
 
 	bool verify() const { return true; }
 
@@ -486,7 +504,7 @@ struct GetKeyRequest : TimedRequest {
 	                                      // to this client, of all storage replicas that
 	                                      // serve the given key
 
-	GetKeyRequest() {}
+	GetKeyRequest() = default;
 
 	bool verify() const { return true; }
 
@@ -496,8 +514,8 @@ struct GetKeyRequest : TimedRequest {
 	              Optional<TagSet> tags,
 	              Optional<ReadOptions> options,
 	              VersionVector latestCommitVersions)
-	  : spanContext(spanContext), sel(sel), version(version), tags(tags), options(options),
-	    ssLatestCommitVersions(latestCommitVersions) {}
+	  : spanContext(spanContext), sel(sel), version(version), tags(std::move(tags)), options(options),
+	    ssLatestCommitVersions(std::move(latestCommitVersions)) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
@@ -641,7 +659,7 @@ struct WaitMetricsRequest {
 	// TODO(gglass): this was tenant related.  See about removing it.
 	Version legacyVersion;
 
-	WaitMetricsRequest() {}
+	WaitMetricsRequest() = default;
 
 	bool verify() const { return true; }
 
@@ -679,7 +697,7 @@ struct SplitMetricsRequest {
 
 	bool verify() const { return true; }
 
-	SplitMetricsRequest() {}
+	SplitMetricsRequest() = default;
 	SplitMetricsRequest(KeyRangeRef const& keys,
 	                    StorageMetrics const& limits,
 	                    StorageMetrics const& used,
@@ -751,8 +769,8 @@ struct ReadHotSubRangeRequest {
 	uint8_t type = SplitType::BYTES;
 	int chunkCount = 1;
 
-	ReadHotSubRangeRequest() {}
-	ReadHotSubRangeRequest(KeyRangeRef const& keys, SplitType type = SplitType::BYTES, int chunkCount = 1)
+	ReadHotSubRangeRequest() = default;
+	explicit ReadHotSubRangeRequest(KeyRangeRef const& keys, SplitType type = SplitType::BYTES, int chunkCount = 1)
 	  : keys(arena, keys), type(type), chunkCount(chunkCount) {}
 
 	template <class Ar>
@@ -779,14 +797,16 @@ struct SplitRangeRequest {
 	Arena arena;
 	KeyRangeRef keys;
 	int64_t chunkSize;
+	int limit = -1;
 	ReplyPromise<SplitRangeReply> reply;
 
-	SplitRangeRequest() {}
-	SplitRangeRequest(KeyRangeRef const& keys, int64_t chunkSize) : keys(arena, keys), chunkSize(chunkSize) {}
+	SplitRangeRequest() = default;
+	SplitRangeRequest(KeyRangeRef const& keys, int64_t chunkSize, int limit = -1)
+	  : keys(arena, keys), chunkSize(chunkSize), limit(limit) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, keys, chunkSize, reply, arena);
+		serializer(ar, keys, chunkSize, reply, limit, arena);
 	}
 };
 
@@ -798,7 +818,7 @@ struct ChangeFeedStreamReply : public ReplyPromiseStreamReply {
 	Version minStreamVersion = invalidVersion;
 	Version popVersion = invalidVersion;
 
-	ChangeFeedStreamReply() {}
+	ChangeFeedStreamReply() = default;
 
 	int expectedSize() const { return sizeof(ChangeFeedStreamReply) + mutations.expectedSize(); }
 
@@ -833,7 +853,7 @@ struct ChangeFeedStreamRequest {
 
 	ReplyPromiseStream<ChangeFeedStreamReply> reply;
 
-	ChangeFeedStreamRequest() {}
+	ChangeFeedStreamRequest() = default;
 	template <class Ar>
 	void serialize(Ar& ar) {
 		serializer(ar,
@@ -861,7 +881,7 @@ struct ChangeFeedPopRequest {
 	KeyRange range;
 	ReplyPromise<Void> reply;
 
-	ChangeFeedPopRequest() {}
+	ChangeFeedPopRequest() = default;
 	ChangeFeedPopRequest(Key const& rangeID, Version version, KeyRange const& range)
 	  : rangeID(rangeID), version(version), range(range) {}
 
@@ -882,7 +902,7 @@ struct GetCheckpointRequest {
 	Optional<UID> actionId;
 	ReplyPromise<CheckpointMetaData> reply;
 
-	GetCheckpointRequest() {}
+	GetCheckpointRequest() = default;
 	GetCheckpointRequest(std::vector<KeyRange> ranges,
 	                     Version version,
 	                     CheckpointFormat format,
@@ -901,8 +921,8 @@ struct FetchCheckpointReply : public ReplyPromiseStreamReply {
 	Standalone<StringRef> token; // Serialized data specific to a particular checkpoint format.
 	Standalone<StringRef> data;
 
-	FetchCheckpointReply() {}
-	FetchCheckpointReply(StringRef token) : token(token) {}
+	FetchCheckpointReply() = default;
+	explicit FetchCheckpointReply(StringRef token) : token(token) {}
 
 	int expectedSize() const { return data.expectedSize(); }
 
@@ -973,7 +993,7 @@ struct OverlappingChangeFeedEntry {
 		       stopVersion == r.stopVersion && feedMetadataVersion == r.feedMetadataVersion;
 	}
 
-	OverlappingChangeFeedEntry() {}
+	OverlappingChangeFeedEntry() = default;
 	OverlappingChangeFeedEntry(KeyRef const& feedId,
 	                           KeyRangeRef const& range,
 	                           Version emptyVersion,
@@ -1020,7 +1040,7 @@ struct OverlappingChangeFeedsRequest {
 	Version minVersion;
 	ReplyPromise<OverlappingChangeFeedsReply> reply;
 
-	OverlappingChangeFeedsRequest() {}
+	OverlappingChangeFeedsRequest() = default;
 	explicit OverlappingChangeFeedsRequest(KeyRange const& range) : range(range) {}
 
 	template <class Ar>
@@ -1035,7 +1055,7 @@ struct ChangeFeedVersionUpdateReply {
 	constexpr static FileIdentifier file_identifier = 4246160;
 	Version version = 0;
 
-	ChangeFeedVersionUpdateReply() {}
+	ChangeFeedVersionUpdateReply() = default;
 	explicit ChangeFeedVersionUpdateReply(Version version) : version(version) {}
 
 	template <class Ar>
@@ -1051,7 +1071,7 @@ struct ChangeFeedVersionUpdateRequest {
 	Version minVersion;
 	ReplyPromise<ChangeFeedVersionUpdateReply> reply;
 
-	ChangeFeedVersionUpdateRequest() {}
+	ChangeFeedVersionUpdateRequest() = default;
 	explicit ChangeFeedVersionUpdateRequest(Version minVersion) : minVersion(minVersion) {}
 
 	template <class Ar>
@@ -1163,7 +1183,7 @@ struct GetHotShardsReply {
 	constexpr static FileIdentifier file_identifier = 3828140;
 	std::vector<KeyRange> hotShards;
 
-	GetHotShardsReply() {}
+	GetHotShardsReply() = default;
 	explicit GetHotShardsReply(std::vector<KeyRange> hotShards) : hotShards(hotShards) {}
 
 	template <class Ar>
@@ -1176,7 +1196,7 @@ struct GetHotShardsRequest {
 	constexpr static FileIdentifier file_identifier = 3828141;
 	ReplyPromise<GetHotShardsReply> reply;
 
-	GetHotShardsRequest() {}
+	GetHotShardsRequest() = default;
 
 	template <class Ar>
 	void serialize(Ar& ar) {
@@ -1194,7 +1214,7 @@ struct CheckSumMetaData {
 	Version version;
 	StringRef checkSumValue;
 
-	CheckSumMetaData() {}
+	CheckSumMetaData() = default;
 	CheckSumMetaData(KeyRange range, Version version, StringRef checkSumValue)
 	  : range(range), version(version), checkSumValue(checkSumValue) {}
 
@@ -1209,7 +1229,7 @@ struct GetStorageCheckSumReply {
 	std::vector<CheckSumMetaData> checkSums;
 	uint8_t checkSumMethod;
 
-	GetStorageCheckSumReply() {}
+	GetStorageCheckSumReply() = default;
 	GetStorageCheckSumReply(const std::vector<CheckSumMetaData>& checkSums, CheckSumMethod checkSumMethod)
 	  : checkSums(checkSums), checkSumMethod(static_cast<uint8_t>(checkSumMethod)) {}
 
@@ -1226,7 +1246,7 @@ struct GetStorageCheckSumRequest {
 	uint8_t checkSumMethod;
 	ReplyPromise<GetStorageCheckSumReply> reply;
 
-	GetStorageCheckSumRequest() {}
+	GetStorageCheckSumRequest() = default;
 	GetStorageCheckSumRequest(const std::vector<std::pair<KeyRange, Optional<Version>>>& ranges,
 	                          Optional<UID> actionId,
 	                          CheckSumMethod checkSumMethod)
@@ -1244,7 +1264,7 @@ struct BulkDumpRequest {
 	BulkDumpState bulkDumpState;
 	ReplyPromise<BulkDumpState> reply;
 
-	BulkDumpRequest() {}
+	BulkDumpRequest() = default;
 	BulkDumpRequest(const std::vector<UID>& checksumServers, const BulkDumpState& bulkDumpState)
 	  : checksumServers(checksumServers), bulkDumpState(bulkDumpState) {};
 
@@ -1266,5 +1286,7 @@ inline int mvccStorageBytes(int mutationBytes) {
 	return VersionedMap<KeyRef, ValueOrClearToRef>::overheadPerItem * 2 +
 	       (mutationBytes + MutationRef::OVERHEAD_BYTES) * 2;
 }
+
+#include "fdbclient/StorageServerLoadBalance.h"
 
 #endif

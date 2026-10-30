@@ -27,7 +27,7 @@
 #include "fdbrpc/Locality.h"
 #include "fdbclient/CommitProxyInterface.h"
 #include "fdbclient/ClusterInterface.h"
-#include "fdbrpc/WellKnownEndpoints.h"
+#include "fdbclient/WellKnownEndpoints.h"
 #include "flow/Hostname.h"
 
 const int MAX_CLUSTER_FILE_BYTES = 60000;
@@ -38,10 +38,10 @@ struct ClientLeaderRegInterface {
 	RequestStream<struct CheckDescriptorMutableRequest> checkDescriptorMutable;
 	Optional<Hostname> hostname;
 
-	ClientLeaderRegInterface() {}
-	ClientLeaderRegInterface(NetworkAddress remote);
-	ClientLeaderRegInterface(INetwork* local);
-	ClientLeaderRegInterface(Hostname hostname) : hostname(hostname) {}
+	ClientLeaderRegInterface() = default;
+	explicit ClientLeaderRegInterface(NetworkAddress remote);
+	explicit ClientLeaderRegInterface(INetwork* local);
+	explicit ClientLeaderRegInterface(Hostname hostname) : hostname(hostname) {}
 
 	bool operator==(const ClientLeaderRegInterface& rhs) const {
 		return getLeader == rhs.getLeader && openDatabase == rhs.openDatabase;
@@ -65,8 +65,8 @@ class ClusterConnectionString {
 public:
 	constexpr static FileIdentifier file_identifier = 13602011;
 
-	ClusterConnectionString() {}
-	ClusterConnectionString(const std::string& connectionString);
+	ClusterConnectionString() = default;
+	explicit ClusterConnectionString(const std::string& connectionString);
 	ClusterConnectionString(const std::vector<NetworkAddress>& coordinators, Key key);
 	ClusterConnectionString(const std::vector<Hostname>& hosts, Key key);
 
@@ -119,9 +119,9 @@ FDB_BOOLEAN_PARAM(ConnectionStringNeedsPersisted);
 // one that is only stored in memory.
 class IClusterConnectionRecord {
 public:
-	IClusterConnectionRecord(ConnectionStringNeedsPersisted connectionStringNeedsPersisted)
+	explicit IClusterConnectionRecord(ConnectionStringNeedsPersisted connectionStringNeedsPersisted)
 	  : connectionStringNeedsPersisted(connectionStringNeedsPersisted) {}
-	virtual ~IClusterConnectionRecord() {}
+	virtual ~IClusterConnectionRecord() = default;
 
 	// Returns the connection string currently held in this object. This may not match the stored record if it hasn't
 	// been persisted or if the persistent storage for the record has been modified externally.
@@ -194,7 +194,7 @@ struct LeaderInfo {
 	bool forward;
 
 	LeaderInfo() : forward(false) {}
-	LeaderInfo(UID changeID) : changeID(changeID), forward(false) {}
+	explicit LeaderInfo(UID changeID) : changeID(changeID), forward(false) {}
 
 	bool operator<(LeaderInfo const& r) const { return changeID < r.changeID; }
 	bool operator>(LeaderInfo const& r) const { return r < *this; }
@@ -246,7 +246,7 @@ struct GetLeaderRequest {
 	UID knownLeader;
 	ReplyPromise<Optional<LeaderInfo>> reply;
 
-	GetLeaderRequest() {}
+	GetLeaderRequest() = default;
 	explicit GetLeaderRequest(Key key, UID kl) : key(key), knownLeader(kl) {}
 
 	bool verify() const { return true; }
@@ -299,7 +299,10 @@ public:
 
 	explicit ClientCoordinators(Reference<IClusterConnectionRecord> ccr);
 	explicit ClientCoordinators(Key clusterKey, std::vector<NetworkAddress> coordinators);
-	ClientCoordinators() {}
+	ClientCoordinators() = default;
+
+	// Requests a leader from each coordinator, in clientLeaderServers order.
+	std::vector<Future<Optional<LeaderInfo>>> getLeaderReplies() const;
 };
 
 struct ProtocolInfoReply {
@@ -347,7 +350,7 @@ struct CheckDescriptorMutableReply {
 struct CheckDescriptorMutableRequest {
 	constexpr static FileIdentifier file_identifier = 214729;
 	ReplyPromise<CheckDescriptorMutableReply> reply;
-	CheckDescriptorMutableRequest() {}
+	CheckDescriptorMutableRequest() = default;
 
 	template <class Ar>
 	void serialize(Ar& ar) {

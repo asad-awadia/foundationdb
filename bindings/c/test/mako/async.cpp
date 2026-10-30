@@ -74,7 +74,7 @@ void ResumableStateForPopulate::runOneTick() {
 					stats.incrOpCount(OP_COMMIT);
 					stats.incrOpCount(OP_TRANSACTION);
 					tx.reset();
-					setTransactionTimeoutIfEnabled(args, tx);
+					setTransactionOptionsIfEnabled(args, tx);
 					watch_tx.startFromStop();
 					key_checkpoint = i + 1;
 					if (i != key_end) {
@@ -101,15 +101,15 @@ void ResumableStateForRunWorkload::postNextTick() {
 
 void ResumableStateForRunWorkload::runOneTick() {
 	assert(iter != OpEnd);
+	auto f = Future{};
+	// to minimize context switch overhead, repeat immediately completed ops
+	// in a loop, not an async continuation.
+repeat_immediate_steps:
 	if (iter.step == 0 /* first step */)
 		prepareKeys(iter.op, key1, key2, args);
 	watch_step.start();
 	if (iter.step == 0)
 		watch_op = Stopwatch(watch_step.getStart());
-	auto f = Future{};
-	// to minimize context switch overhead, repeat immediately completed ops
-	// in a loop, not an async continuation.
-repeat_immediate_steps:
 	f = opTable[iter.op].stepFunction(iter.step)(tx, args, key1, key2, val);
 	if (!f) {
 		// immediately completed client-side ops: e.g. set, setrange, clear, clearrange, ...
@@ -165,7 +165,7 @@ void ResumableStateForRunWorkload::updateStepStats() {
 			stats.addLatency(OP_COMMIT, step_latency);
 		}
 		tx.reset();
-		setTransactionTimeoutIfEnabled(args, tx);
+		setTransactionOptionsIfEnabled(args, tx);
 		stats.incrOpCount(OP_COMMIT);
 		needs_commit = false;
 	}
@@ -211,7 +211,7 @@ void ResumableStateForRunWorkload::onTransactionSuccess() {
 				stats.incrOpCount(OP_COMMIT);
 				stats.incrOpCount(OP_TRANSACTION);
 				tx.reset();
-				setTransactionTimeoutIfEnabled(args, tx);
+				setTransactionOptionsIfEnabled(args, tx);
 				watch_tx.startFromStop();
 				onIterationEnd(FutureRC::OK);
 			}
@@ -226,7 +226,7 @@ void ResumableStateForRunWorkload::onTransactionSuccess() {
 		stats.incrOpCount(OP_TRANSACTION);
 		watch_tx.startFromStop();
 		tx.reset();
-		setTransactionTimeoutIfEnabled(args, tx);
+		setTransactionOptionsIfEnabled(args, tx);
 		onIterationEnd(FutureRC::OK);
 	}
 }
@@ -238,6 +238,9 @@ void ResumableStateForRunWorkload::onIterationEnd(FutureRC rc) {
 	if (ended()) {
 		signalEnd();
 	} else {
+		if (rc == FutureRC::RETRY) {
+			setTransactionOptionsIfEnabled(args, tx);
+		}
 		iter = getOpBegin(args);
 		needs_commit = false;
 		postNextTick();

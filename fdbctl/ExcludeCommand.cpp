@@ -22,12 +22,11 @@ I * Licensed under the Apache License, Version 2.0 (the "License");
 #include "fdbctl/ControlCommands.h"
 
 #include "fdbclient/IClientApi.h"
-#include "fdbclient/ManagementAPI.actor.h"
+#include "fdbclient/ManagementAPI.h"
 #include "fdbclient/CoordinationInterface.h"
 #include "fdbclient/Schemas.h"
 #include "fdbclient/StorageServerInterface.h"
-#include "flow/genericactors.actor.h"
-#include "fdbctl/ControlCommands.h"
+#include "flow/genericactors.h"
 #include "fmt/format.h"
 #include <boost/algorithm/string.hpp>
 
@@ -37,90 +36,17 @@ namespace fdbctl {
 namespace utils {
 
 Future<std::vector<std::string>> getExcludedServers(Reference<IDatabase> db) {
-	Reference<ITransaction> tr = db->createTransaction();
-	loop {
-		Error err;
-		try {
-			ThreadFuture<RangeResult> resultFuture =
-			    tr->getRange(special_keys::excludedServersSpecialKeyRange, CLIENT_KNOBS->TOO_MANY);
-			RangeResult r = co_await safeThreadFutureToFuture(resultFuture);
-			ASSERT(!r.more && r.size() < CLIENT_KNOBS->TOO_MANY);
-
-			std::vector<std::string> exclusions;
-			for (const auto& i : r) {
-				auto addr = i.key.removePrefix(special_keys::excludedServersSpecialKeyRange.begin).toString();
-				exclusions.push_back(addr);
-			}
-			co_return exclusions;
-		} catch (Error& e) {
-			if (e.code() == error_code_actor_cancelled) {
-				throw e;
-			}
-
-			TraceEvent(SevWarn, "GetExcludedServersError").error(e);
-			err = e;
-		}
-
-		co_await safeThreadFutureToFuture(tr->onError(err));
-	}
+	return getManagementApiSpecialKeyValues(
+	    db, special_keys::excludedServersSpecialKeyRange, "GetExcludedServersError");
 }
 
 Future<std::vector<std::string>> getFailedServers(Reference<IDatabase> db) {
-	Reference<ITransaction> tr = db->createTransaction();
-	loop {
-		Error err;
-		try {
-			ThreadFuture<RangeResult> resultFuture =
-			    tr->getRange(special_keys::failedServersSpecialKeyRange, CLIENT_KNOBS->TOO_MANY);
-			RangeResult r = co_await safeThreadFutureToFuture(resultFuture);
-			ASSERT(!r.more && r.size() < CLIENT_KNOBS->TOO_MANY);
-
-			std::vector<std::string> exclusions;
-			for (const auto& i : r) {
-				auto addr = i.key.removePrefix(special_keys::failedServersSpecialKeyRange.begin).toString();
-				exclusions.push_back(addr);
-			}
-
-			co_return exclusions;
-		} catch (Error& e) {
-			if (e.code() == error_code_actor_cancelled) {
-				throw e;
-			}
-
-			TraceEvent(SevWarn, "GetExcludedServersError").error(e);
-			err = e;
-		}
-
-		co_await safeThreadFutureToFuture(tr->onError(err));
-	}
+	return getManagementApiSpecialKeyValues(db, special_keys::failedServersSpecialKeyRange, "GetExcludedServersError");
 }
 
 Future<std::vector<std::string>> getExcludedLocalities(Reference<IDatabase> db) {
-	Reference<ITransaction> tr = db->createTransaction();
-	loop {
-		Error err;
-		try {
-			ThreadFuture<RangeResult> resultFuture =
-			    tr->getRange(special_keys::excludedLocalitySpecialKeyRange, CLIENT_KNOBS->TOO_MANY);
-			RangeResult r = co_await safeThreadFutureToFuture(resultFuture);
-			ASSERT(!r.more && r.size() < CLIENT_KNOBS->TOO_MANY);
-
-			std::vector<std::string> excludedLocalities;
-			for (const auto& i : r) {
-				auto locality = i.key.removePrefix(special_keys::excludedLocalitySpecialKeyRange.begin).toString();
-				excludedLocalities.push_back(locality);
-			}
-			co_return excludedLocalities;
-		} catch (Error& e) {
-			if (e.code() == error_code_actor_cancelled) {
-				throw e;
-			}
-
-			TraceEvent(SevWarn, "GetExcludedLocalitiesError").error(e);
-			err = e;
-		}
-		co_await safeThreadFutureToFuture(tr->onError(err));
-	}
+	return getManagementApiSpecialKeyValues(
+	    db, special_keys::excludedLocalitySpecialKeyRange, "GetExcludedLocalitiesError");
 }
 
 Future<std::set<NetworkAddress>> getInProgressExclusion(Reference<ITransaction> tr) {
@@ -137,32 +63,8 @@ Future<std::set<NetworkAddress>> getInProgressExclusion(Reference<ITransaction> 
 }
 
 Future<std::vector<std::string>> getFailedLocalities(Reference<IDatabase> db) {
-	Reference<ITransaction> tr = db->createTransaction();
-	loop {
-		Error err;
-		try {
-			ThreadFuture<RangeResult> resultFuture =
-			    tr->getRange(special_keys::failedLocalitySpecialKeyRange, CLIENT_KNOBS->TOO_MANY);
-			RangeResult r = co_await safeThreadFutureToFuture(resultFuture);
-			ASSERT(!r.more && r.size() < CLIENT_KNOBS->TOO_MANY);
-
-			std::vector<std::string> excludedLocalities;
-			for (const auto& i : r) {
-				auto locality = i.key.removePrefix(special_keys::failedLocalitySpecialKeyRange.begin).toString();
-				excludedLocalities.push_back(locality);
-			}
-			co_return excludedLocalities;
-		} catch (Error& e) {
-			if (e.code() == error_code_actor_cancelled) {
-				throw e;
-			}
-
-			TraceEvent(SevWarn, "GetFailedLocalitiesError").error(e);
-			err = e;
-		}
-
-		co_await safeThreadFutureToFuture(tr->onError(err));
-	}
+	return getManagementApiSpecialKeyValues(
+	    db, special_keys::failedLocalitySpecialKeyRange, "GetFailedLocalitiesError");
 }
 
 } // namespace utils
@@ -173,24 +75,26 @@ Future<Void> excludeServersAndLocalities(Reference<IDatabase> db,
                                          bool failed,
                                          bool force) {
 	Reference<ITransaction> tr = db->createTransaction();
-	loop {
+	while (true) {
 		Error err;
 		tr->setOption(FDBTransactionOptions::SPECIAL_KEY_SPACE_ENABLE_WRITES);
 		tr->setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 		try {
-			if (force && servers.size())
+			if (force && !servers.empty()) {
 				tr->set(failed ? special_keys::failedForceOptionSpecialKey
 				               : special_keys::excludedForceOptionSpecialKey,
 				        ValueRef());
+			}
 			for (const auto& s : servers) {
 				Key addr = failed ? special_keys::failedServersSpecialKeyRange.begin.withSuffix(s.toString())
 				                  : special_keys::excludedServersSpecialKeyRange.begin.withSuffix(s.toString());
 				tr->set(addr, ValueRef());
 			}
-			if (force && localities.size())
+			if (force && !localities.empty()) {
 				tr->set(failed ? special_keys::failedLocalityForceOptionSpecialKey
 				               : special_keys::excludedLocalityForceOptionSpecialKey,
 				        ValueRef());
+			}
 			for (const auto& l : localities) {
 				Key addr = failed ? special_keys::failedLocalitySpecialKeyRange.begin.withSuffix(l)
 				                  : special_keys::excludedLocalitySpecialKeyRange.begin.withSuffix(l);
@@ -225,7 +129,7 @@ Future<std::set<NetworkAddress>> checkForExcludingServers(Reference<IDatabase> d
                                                           bool waitForAllExcluded) {
 	std::set<NetworkAddress> inProgressExclusion;
 	Reference<ITransaction> tr = db->createTransaction();
-	loop {
+	while (true) {
 		Error err;
 		inProgressExclusion.clear();
 		try {
@@ -262,6 +166,7 @@ Future<std::set<NetworkAddress>> checkForExcludingServers(Reference<IDatabase> d
 				break;
 
 			co_await delayJittered(1.0); // SOMEDAY: watches!
+			continue;
 		} catch (Error& e) {
 			if (e.code() == error_code_actor_cancelled) {
 				throw;
@@ -284,7 +189,7 @@ Future<grpc::Status> exclude(Reference<IDatabase> db, const ExcludeRequest* req,
 		Future<bool> future_workers = utils::getWorkersProcessData(db, &workers);
 		Future<Void> future_server_interfaces = utils::getStorageServerInterfaces(db, &server_interfaces);
 
-		co_await success(future_workers);
+		co_await future_workers;
 		co_await future_server_interfaces;
 
 		bool force = req->force();
@@ -356,9 +261,7 @@ Future<grpc::Status> exclude(Reference<IDatabase> db, const ExcludeRequest* req,
 		std::set<AddressExclusion> absentExclusions;
 		for (const auto& addr : exclusionSet) {
 			auto worker = workerPorts.find(addr.ip);
-			if (worker == workerPorts.end())
-				absentExclusions.insert(addr);
-			else if (addr.port > 0 && worker->second.count(addr.port) == 0)
+			if (worker == workerPorts.end() || (addr.port > 0 && !worker->second.contains(addr.port)))
 				absentExclusions.insert(addr);
 		}
 

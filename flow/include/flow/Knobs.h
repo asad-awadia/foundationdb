@@ -104,8 +104,39 @@ public:
 	double HOSTNAME_RECONNECT_INIT_INTERVAL;
 	double HOSTNAME_RECONNECT_MAX_INTERVAL;
 	bool ENABLE_COORDINATOR_DNS_CACHE;
+	double COORDINATOR_DNS_CACHE_REFRESH_INTERVAL;
+	double COORDINATOR_DNS_CACHE_TTL;
 	double CACHE_REFRESH_INTERVAL_WHEN_ALL_ALTERNATIVES_FAILED;
 
+	// When true, enables tracing to debug stale peer issues (see StalePeerTest.toml).
+	// Not recommended for production due to potential performance overhead.
+	//
+	// Debugging workflow: if a simulation test fails with a dangling peer reference
+	// error, re-run the same seed with stale_peer_observability=true. This causes
+	// interfaceTracker to emit trace events recording creation and destruction at
+	// different layers of the RPC stack: interface, request stream, flow receiver.
+	// See InterfaceTracker-related traces in FlowTransport.cpp. These traces include
+	// backtraces that can be used to identify where the leak originated. From there,
+	// reason about what the code is doing, why it runs into the stale peer issue,
+	// and what can be done to prune the stale peers. The fix will vary case by case.
+	bool STALE_PEER_OBSERVABILITY;
+
+	// Used for two purposes off the same value: (1) eviction age -- an address is
+	// pruned from TransportData::persistentConnectFailedCount once it has had no
+	// connect failure for this many seconds; and (2) sweep cadence -- the prune
+	// scan runs at most once per this interval (and only when triggered by a
+	// connect failure). Bounds that map and the locationCachePeerEvictor
+	// snapshot/streak maps it feeds. 0 disables pruning. Coupling both onto one
+	// knob is a deliberate simplification: sweep about as often as the eviction
+	// horizon.
+	//
+	// NOTE: this value should be set to a multiple of LOCATION_CACHE_PEER_EVICTOR_DELAY
+	// so that a dead address is not pruned from this map before the evictor has a
+	// chance to observe its failure delta and evict the corresponding location cache entries.
+	// It should also be a multiple of the reconnect interval, so that an address that is
+	// still being targeted by RPCs re-fails and refreshes its timestamp before the TTL,
+	// and is never pruned while actively dead.
+	double PERSISTENT_CONNECT_FAILED_COUNT_TTL;
 	double DELAY_JITTER_OFFSET;
 	double DELAY_JITTER_RANGE;
 	double BUSY_WAIT_THRESHOLD;
@@ -124,6 +155,17 @@ public:
 	bool ABORT_ON_FAILURE;
 
 	double MEMORY_USAGE_CHECK_INTERVAL;
+
+	// Per-call-site sampled memory tracker. See design/memory-tracker.md and flow/MemoryTracker.h.
+	// All of these are startup-only: they are read once and not meant to change at runtime
+	// (dynamic enable/disable is a Non-requirement -- edit the config and restart).
+	int MEMORY_TRACKING_SAMPLE_INVERSE; // 0=off, N=1-in-N
+	int64_t MEMORY_TRACKING_FORCE_SAMPLE_BYTES; // always sample allocations >= this many bytes; -1 disables
+	bool MEMORY_TRACKING_LIVE_TRACKING; // when false, skip the pointer-keyed live-block table
+	double MEMORY_TRACKING_REPORT_INTERVAL; // seconds between dumps; 0 disables reporting
+	int64_t MEMORY_TRACKING_REPORT_BYTES_THRESHOLD; // sites with live bytes >= this are reported each dump (~1% of an 8
+	                                                // GB target RSS)
+	int MEMORY_TRACKING_FRAMES; // captured stack depth (1..MEMORY_TRACKER_MAX_FRAMES)
 
 	// Chaos testing
 	bool ENABLE_CHAOS_FEATURES;
@@ -161,6 +203,7 @@ public:
 	double CONNECTION_MONITOR_UNREFERENCED_CLOSE_DELAY;
 
 	// FlowTransport
+	double CONNECTION_EVENT_SUPPRESS_FOR;
 	double CONNECTION_REJECTED_MESSAGE_DELAY;
 	double CONNECTION_ID_TIMEOUT;
 	double CONNECTION_CLEANUP_DELAY;
@@ -212,7 +255,6 @@ public:
 	int64_t SIM_PAGE_CACHE_64K;
 	int64_t BUGGIFY_SIM_PAGE_CACHE_4K;
 	int64_t BUGGIFY_SIM_PAGE_CACHE_64K;
-	int64_t BLOB_WORKER_PAGE_CACHE;
 	std::string CACHE_EVICTION_POLICY; // for now, "random", "lru", are supported
 	int MAX_EVICT_ATTEMPTS;
 	double PAGE_CACHE_TRUNCATE_LOOKUP_FRACTION;
@@ -224,10 +266,6 @@ public:
 	// AsyncFileEIO
 	int EIO_MAX_PARALLELISM;
 	int EIO_USE_ODIRECT;
-
-	// AsyncFileEncrypted
-	int ENCRYPTION_BLOCK_SIZE;
-	int MAX_DECRYPTED_BLOCKS;
 
 	// AsyncFileKAIO
 	int MAX_OUTSTANDING;
@@ -299,6 +337,7 @@ public:
 	double MAX_BUGGIFIED_DELAY;
 	double MAX_RUNLOOP_SLEEP_DELAY;
 	int SIM_CONNECT_ERROR_MODE;
+	double SIM_DNS_REMOVAL_MAX_DELAY;
 	double SIM_SPEEDUP_AFTER_SECONDS;
 	int MAX_TRACE_LINES;
 
@@ -400,5 +439,6 @@ public:
 // Flow knobs are needed before the knob collections are available, so a global FlowKnobs object is used to bootstrap
 extern FlowKnobs bootstrapGlobalFlowKnobs;
 extern FlowKnobs const* FLOW_KNOBS;
+void resetFlowKnobs(class Randomize randomize, class IsSimulated isSimulated);
 
 #endif

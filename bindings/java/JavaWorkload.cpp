@@ -27,6 +27,7 @@
 #include "com_apple_foundationdb_testing_WorkloadContext.h"
 
 #include <jni.h>
+#include <cstdlib>
 #include <set>
 #include <iostream>
 #include <boost/algorithm/string.hpp>
@@ -80,7 +81,6 @@ void printTrace(JNIEnv* env, jclass, jlong logger, jint severity, jstring messag
 	} else if (severity < 40) {
 		sev = FDBSeverity::WarnAlways;
 	} else {
-		assert(false);
 		std::abort();
 	}
 	log->trace(sev, msg, detailsMap);
@@ -90,17 +90,17 @@ void printTrace(JNIEnv* env, jclass, jlong logger, jint severity, jstring messag
 }
 
 jlong getProcessID(JNIEnv* env, jclass, jlong self) {
-	FDBWorkloadContext* context = reinterpret_cast<FDBWorkloadContext*>(self);
+	auto* context = reinterpret_cast<FDBWorkloadContext*>(self);
 	return jlong(context->getProcessID());
 }
 
 void setProcessID(JNIEnv* env, jclass, jlong self, jlong processID) {
-	FDBWorkloadContext* context = reinterpret_cast<FDBWorkloadContext*>(self);
+	auto* context = reinterpret_cast<FDBWorkloadContext*>(self);
 	context->setProcessID(processID);
 }
 
 jboolean getOptionBool(JNIEnv* env, jclass, jlong self, jstring name, jboolean defaultValue) {
-	FDBWorkloadContext* context = reinterpret_cast<FDBWorkloadContext*>(self);
+	auto* context = reinterpret_cast<FDBWorkloadContext*>(self);
 	jboolean isCopy = true;
 	const char* utf = env->GetStringUTFChars(name, &isCopy);
 	auto res = jboolean(context->getOption(utf, bool(defaultValue)));
@@ -111,7 +111,7 @@ jboolean getOptionBool(JNIEnv* env, jclass, jlong self, jstring name, jboolean d
 }
 
 jlong getOptionLong(JNIEnv* env, jclass, jlong self, jstring name, jlong defaultValue) {
-	FDBWorkloadContext* context = reinterpret_cast<FDBWorkloadContext*>(self);
+	auto* context = reinterpret_cast<FDBWorkloadContext*>(self);
 	jboolean isCopy = true;
 	const char* utf = env->GetStringUTFChars(name, &isCopy);
 	auto res = jlong(context->getOption(utf, long(defaultValue)));
@@ -122,7 +122,7 @@ jlong getOptionLong(JNIEnv* env, jclass, jlong self, jstring name, jlong default
 }
 
 jdouble getOptionDouble(JNIEnv* env, jclass, jlong self, jstring name, jdouble defaultValue) {
-	FDBWorkloadContext* context = reinterpret_cast<FDBWorkloadContext*>(self);
+	auto* context = reinterpret_cast<FDBWorkloadContext*>(self);
 	jboolean isCopy = true;
 	const char* utf = env->GetStringUTFChars(name, &isCopy);
 	auto res = jdouble(context->getOption(utf, double(defaultValue)));
@@ -133,7 +133,7 @@ jdouble getOptionDouble(JNIEnv* env, jclass, jlong self, jstring name, jdouble d
 }
 
 jstring getOptionString(JNIEnv* env, jclass, jlong self, jstring name, jstring defaultValue) {
-	FDBWorkloadContext* context = reinterpret_cast<FDBWorkloadContext*>(self);
+	auto* context = reinterpret_cast<FDBWorkloadContext*>(self);
 	jboolean isCopy;
 	jboolean defIsCopy;
 	const char* nameStr = env->GetStringUTFChars(name, &isCopy);
@@ -149,23 +149,23 @@ jstring getOptionString(JNIEnv* env, jclass, jlong self, jstring name, jstring d
 }
 
 jint getClientID(JNIEnv* env, jclass, jlong self) {
-	FDBWorkloadContext* context = reinterpret_cast<FDBWorkloadContext*>(self);
+	auto* context = reinterpret_cast<FDBWorkloadContext*>(self);
 	return jint(context->clientId());
 }
 
 jint getClientCount(JNIEnv* env, jclass, jlong self) {
-	FDBWorkloadContext* context = reinterpret_cast<FDBWorkloadContext*>(self);
+	auto* context = reinterpret_cast<FDBWorkloadContext*>(self);
 	return jint(context->clientCount());
 }
 
 jlong getSharedRandomNumber(JNIEnv* env, jclass, jlong self) {
-	FDBWorkloadContext* context = reinterpret_cast<FDBWorkloadContext*>(self);
+	auto* context = reinterpret_cast<FDBWorkloadContext*>(self);
 	return jlong(context->sharedRandomNumber());
 }
 
 struct JavaPromise {
 	GenericPromise<bool> impl;
-	JavaPromise(GenericPromise<bool>&& promise) : impl(std::move(promise)) {}
+	explicit JavaPromise(GenericPromise<bool>&& promise) : impl(std::move(promise)) {}
 
 	void send(bool val) {
 		impl.send(val);
@@ -235,7 +235,7 @@ struct JVM {
 		}
 	}
 
-	JVM(FDBLogger* log) : log(log) {
+	explicit JVM(FDBLogger* log) : log(log) {
 		try {
 			log->trace(FDBSeverity::Debug, "InitializeJVM", {});
 			JavaVMInitArgs args;
@@ -324,7 +324,7 @@ struct JVM {
 		if (!env) {
 			throw JNIError{};
 		}
-		if (classPath.count(path) > 0) {
+		if (classPath.contains(path)) {
 			// already added
 			return;
 		}
@@ -423,6 +423,8 @@ struct JVM {
 		auto clazz = getClass("com/apple/foundationdb/testing/Promise");
 		auto res = env->NewObject(clazz, getMethod(clazz, "<init>", "(J)V"), reinterpret_cast<jlong>(p.get()));
 		checkException();
+		// Java's nativePromise now owns p; JavaPromise::send deletes it after fulfillment.
+		// NOLINTNEXTLINE(bugprone-unused-return-value)
 		p.release();
 		return res;
 	}
@@ -604,7 +606,7 @@ struct JavaWorkload final : FDBWorkload {
 struct JavaWorkloadFactory : FDBWorkloadFactory {
 	FDBLogger* log;
 	std::weak_ptr<JVM> jvm;
-	JavaWorkloadFactory(FDBLogger* log) : log(log) {}
+	explicit JavaWorkloadFactory(FDBLogger* log) : log(log) {}
 	JavaWorkloadFactory(const JavaWorkloadFactory&) = delete;
 	JavaWorkloadFactory& operator=(const JavaWorkloadFactory&) = delete;
 	std::shared_ptr<FDBWorkload> create(const std::string& name) override {

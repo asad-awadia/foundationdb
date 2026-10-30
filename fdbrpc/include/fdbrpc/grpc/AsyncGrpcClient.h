@@ -23,7 +23,6 @@
 #define FDBRPC_FLOW_ASYNC_GRPC_CLIENT_H
 
 #include <memory>
-#undef loop
 #include <grpcpp/grpcpp.h>
 
 #include "flow/flow.h"
@@ -47,9 +46,7 @@ class AsyncGrpcClient {
 public:
 	using Rpc = typename ServiceType::Stub;
 
-	AsyncGrpcClient() {
-		// Isn't necessary unless initialized mid-block using Flow actor compiler.
-	}
+	AsyncGrpcClient() = default;
 
 	AsyncGrpcClient(const std::string& endpoint, std::shared_ptr<AsyncTaskExecutor> pool)
 	  : pool_(pool), channel_(grpc::CreateChannel(endpoint, grpc::InsecureChannelCredentials())),
@@ -108,7 +105,7 @@ public:
 				promise.send(response);
 			} else {
 				// std::cout << "Error: " << status.error_message() << std::endl;
-				promise.sendError(grpc_error()); // TODO (Vishesh): Propogate the gRPC error codes.
+				promise.sendError(grpc_error()); // TODO (Vishesh): Propagate the gRPC error codes.
 			}
 		});
 
@@ -141,7 +138,7 @@ public:
 				std::cout << "sent end of stream from client.\n";
 				promise.sendError(end_of_stream());
 			} else {
-				promise.sendError(grpc_error()); // TODO (Vishesh): Propogate the gRPC error codes.
+				promise.sendError(grpc_error()); // TODO (Vishesh): Propagate the gRPC error codes.
 			}
 		});
 
@@ -164,7 +161,7 @@ public:
 	// 		if (status.ok()) {
 	// 			promise->sendError(end_of_stream());
 	// 		} else {
-	// 			promise->sendError(grpc_error()); // TODO (Vishesh): Propogate the gRPC error codes.
+	// 			promise->sendError(grpc_error()); // TODO (Vishesh): Propagate the gRPC error codes.
 	// 		}
 	// 	});
 

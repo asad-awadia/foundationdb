@@ -18,8 +18,6 @@
  * limitations under the License.
  */
 
-#include <iostream>
-
 #include "flow/Error.h"
 #include "flow/Knobs.h"
 #include "flow/Trace.h"
@@ -39,8 +37,9 @@ Error Error::fromUnvalidatedCode(int code) {
 		Error e = Error::fromCode(error_code_unknown_error);
 		TraceEvent(SevWarn, "ConvertedUnvalidatedErrorCode").error(e).detail("OriginalCode", code);
 		return e;
-	} else
+	} else {
 		return Error::fromCode(code);
+	}
 }
 
 bool Error::isDiskError() const {
@@ -215,7 +214,6 @@ const std::set<int> transactionRetryableErrors = { error_code_not_committed,
 	                                               error_code_process_behind,
 	                                               error_code_batch_transaction_throttled,
 	                                               error_code_tag_throttled,
-	                                               error_code_proxy_tag_throttled,
 	                                               // maybe committed error
 	                                               error_code_cluster_version_changed,
 	                                               error_code_commit_unknown_result };

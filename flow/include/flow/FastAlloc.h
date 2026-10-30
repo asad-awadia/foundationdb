@@ -32,13 +32,6 @@
 // #define ALLOC_INSTRUMENTATION_STDOUT ENABLED(NOT_IN_CLEAN)
 
 // #define ALLOC_INSTRUMENTATION ENABLED(NOT_IN_CLEAN)
-//  The form "(1==1)" in this context is used to satisfy both clang and vc++ with a single syntax.  Clang rejects "1"
-//  and vc++ rejects "true".
-// FIXME: this has been set to true for 4+ years.  We probably do not need the "not thread safe"
-// version of the code.  Consider removing this and just making it thread safe.
-// Also, explain why thread safety is required here and not elsewhere (e.g. Arena and ArenaBlock).
-#define FASTALLOC_THREAD_SAFE (FLOW_THREAD_SAFE || (1 == 1))
-
 #if VALGRIND
 #include <drd.h>
 #include <memcheck.h>
@@ -52,11 +45,13 @@ bool valgrindPrecise();
 #include "flow/Hash3.h"
 
 #include <assert.h>
+#include <array>
 #include <atomic>
 #include <vector>
 #include <cstdlib>
 #include <cstdio>
 #include <unordered_map>
+#include <utility>
 
 #if defined(ALLOC_INSTRUMENTATION) && defined(__linux__)
 #include <execinfo.h>
@@ -112,6 +107,15 @@ void recordDeallocation(void* ptr);
 #endif
 
 inline constexpr auto kFastAllocMagazineBytes = 128 << 10;
+
+inline constexpr std::array FAST_ALLOCATOR_SIZES{ 16, 32, 64, 96, 128, 256, 512, 1024, 2048, 4096, 8192, 16384 };
+
+template <class Visitor>
+void forEachFastAllocatorSize(Visitor&& visitor) {
+	[&]<std::size_t... Indices>(std::index_sequence<Indices...>) {
+		(static_cast<void>(visitor.template operator()<FAST_ALLOCATOR_SIZES[Indices]>()), ...);
+	}(std::make_index_sequence<FAST_ALLOCATOR_SIZES.size()>{});
+}
 
 template <int Size>
 class FastAllocator {
@@ -174,8 +178,6 @@ private:
 
 		return data;
 	}
-	static void* freelist;
-
 	static void getMagazine();
 	static void releaseMagazine(void*);
 };
@@ -195,19 +197,16 @@ void countedDelete(size_t nbytes, void* ptr);
 namespace keepalive_allocator {
 
 namespace detail {
-extern bool g_active;
+extern thread_local bool g_active;
 } // namespace detail
 
 inline bool isActive() noexcept {
 	return detail::g_active;
 }
 
-// While this scope is active, default allocate() and free() function is overridden for Arena and PacketBuffer to test
-// correct post-use memory policy: e.g. secure deletion of sensitive contents. Any (de)allocation of ArenaBlock and
-// PacketBuffer is tracked while this scope is active. To ensure correct state management, at most one instance of this
-// object may exist at any given time. Any tracked allocation during this scope must be freed BEFORE the scope
-// destructs. Any trackable (ArenaBlock, PacketBuffer) allocation before the scope must be freed AFTER the scope
-// destructs.
+// While this scope is active on the current thread, ArenaBlock and PacketBuffer allocations are kept alive to test
+// post-use memory policy, such as secure deletion of sensitive contents. At most one scope may exist per thread.
+// Tracked allocations must be freed before the scope destructs; allocations made before it must be freed afterward.
 class ActiveScope {
 public:
 	ActiveScope();

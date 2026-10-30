@@ -23,7 +23,7 @@
 #pragma once
 
 #include "fdbclient/FDBTypes.h"
-#include "flow/TDMetric.actor.h"
+#include "flow/TDMetric.h"
 #include "flow/swift_support.h"
 #include <queue>
 
@@ -82,12 +82,12 @@ struct Notified {
 		val = std::move(r.val);
 	}
 
-	int numWaiting() { return waiting.size(); }
+	int numWaiting() const { return waiting.size(); }
 
 private:
 	using Item = std::pair<ValueType, Promise<Void>>;
 	struct ItemCompare {
-		bool operator()(const Item& a, const Item& b) { return a.first > b.first; }
+		bool operator()(const Item& a, const Item& b) const { return a.first > b.first; }
 	};
 	std::priority_queue<Item, std::vector<Item>, ItemCompare> waiting;
 	T val;

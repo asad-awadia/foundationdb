@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cstring>
 #include <regex>
 #include <set>
 #include <string>
@@ -35,17 +36,20 @@
 #include "flow/FastRef.h"
 #include "flow/ProtocolVersion.h"
 #include "flow/flow.h"
+#include "fdbclient/ProcessClass.h"
+#include "fdbclient/ProcessData.h"
 #include "fdbclient/Status.h"
 #include "fdbrpc/Locality.h"
 
-typedef int64_t Version;
-typedef uint64_t LogEpoch;
-typedef uint64_t Sequence;
-typedef StringRef KeyRef;
-typedef StringRef ValueRef;
-typedef int64_t Generation;
-typedef UID SpanID;
-typedef uint64_t CoordinatorsHash;
+using Version = int64_t;
+using CDCStreamId = uint64_t;
+using LogEpoch = uint64_t;
+using Sequence = uint64_t;
+using KeyRef = StringRef;
+using ValueRef = StringRef;
+using Generation = int64_t;
+using SpanID = UID;
+using CoordinatorsHash = uint64_t;
 
 // invalidKey is intentionally far beyond the system space.  It is meant to be used as a safe initial value for a key
 // before it is set to something meaningful to avoid mistakes where a default constructed key is written to instead of
@@ -61,6 +65,8 @@ enum {
 	tagLocalityLogRouterMapped = -6, // The pseudo tag used by log routers to pop the real LogRouter tag (i.e., -2)
 	tagLocalityTxs = -7,
 	tagLocalityBackup = -8, // used by backup role to pop from TLogs
+	tagLocalityRangePartitionedBackup = -9, // used by range-partitioned backup workers
+	tagLocalityCDC = -10, // used by native change data capture streams
 	tagLocalityInvalid = -99
 }; // The TLog and LogRouter require these number to be as compact as possible
 
@@ -161,7 +167,7 @@ struct TagsAndMessage {
 	StringRef message;
 	VectorRef<Tag> tags;
 
-	TagsAndMessage() {}
+	TagsAndMessage() = default;
 	TagsAndMessage(StringRef message, VectorRef<Tag> tags) : message(message), tags(tags) {}
 
 	// Loads tags and message from a serialized buffer. "rd" is checkpointed at
@@ -233,7 +239,7 @@ std::string describe(T const& item) {
 
 template <class K, class V>
 std::string describe(std::map<K, V> const& items, int max_items = -1) {
-	if (!items.size())
+	if (items.empty())
 		return "[no items]";
 
 	std::string s;
@@ -250,7 +256,7 @@ std::string describe(std::map<K, V> const& items, int max_items = -1) {
 
 template <class T>
 std::string describeList(T const& items, int max_items) {
-	if (!items.size())
+	if (items.empty())
 		return "[no items]";
 
 	std::string s;
@@ -314,7 +320,7 @@ inline bool equalsKeyAfter(const KeyRef& key, const KeyRef& compareKey) {
 
 struct KeyRangeRef {
 	const KeyRef begin, end;
-	KeyRangeRef() {}
+	KeyRangeRef() = default;
 	KeyRangeRef(const KeyRef& begin, const KeyRef& end) : begin(begin), end(end) {
 		if (begin > end) {
 			TraceEvent("InvertedRange").detail("Begin", begin).detail("End", end).backtrace();
@@ -386,7 +392,7 @@ struct KeyRangeRef {
 		} else {
 			serializer(ar, const_cast<KeyRef&>(begin), const_cast<KeyRef&>(end));
 		}
-		if (ar.isDeserializing && end == StringRef() && begin != StringRef()) {
+		if (ar.isDeserializing && end.empty() && !begin.empty()) {
 			ASSERT(begin[begin.size() - 1] == '\x00');
 			const_cast<KeyRef&>(end) = begin;
 			const_cast<KeyRef&>(begin) = end.substr(0, end.size() - 1);
@@ -453,11 +459,24 @@ inline std::vector<KeyRangeRef> operator-(const KeyRangeRef& lhs, const KeyRange
 struct KeyValueRef {
 	KeyRef key;
 	ValueRef value;
-	KeyValueRef() {}
+	KeyValueRef() = default;
+
 	KeyValueRef(const KeyRef& key, const ValueRef& value) : key(key), value(value) {}
-	KeyValueRef(Arena& a, const KeyValueRef& copyFrom) : key(a, copyFrom.key), value(a, copyFrom.value) {}
+
+	KeyValueRef(Arena& a, const KeyRef& key, const ValueRef& value) {
+		StringRef storage = makeString(key.size() + value.size(), a);
+		uint8_t* dst = mutateString(storage);
+
+		key.copyTo(dst);
+		value.copyTo(dst + key.size());
+
+		this->key = KeyRef(storage.begin(), key.size());
+		this->value = ValueRef(storage.begin() + key.size(), value.size());
+	}
+
+	KeyValueRef(Arena& a, const KeyValueRef& copyFrom) : KeyValueRef(a, copyFrom.key, copyFrom.value) {}
+
 	bool operator==(const KeyValueRef& r) const { return key == r.key && value == r.value; }
-	bool operator!=(const KeyValueRef& r) const { return key != r.key || value != r.value; }
 
 	int expectedSize() const { return key.expectedSize() + value.expectedSize(); }
 
@@ -662,9 +681,11 @@ public:
 	bool isLastLessOrEqual() const { return orEqual && offset == 0; }
 
 	// True iff, regardless of the contents of the database, lhs must resolve to a key > rhs
-	bool isDefinitelyGreater(KeyRef const& k) { return offset >= 1 && (isFirstGreaterOrEqual() ? key > k : key >= k); }
+	bool isDefinitelyGreater(KeyRef const& k) const {
+		return offset >= 1 && (isFirstGreaterOrEqual() ? key > k : key >= k);
+	}
 	// True iff, regardless of the contents of the database, lhs must resolve to a key < rhs
-	bool isDefinitelyLess(KeyRef const& k) { return offset <= 0 && (isLastLessOrEqual() ? key < k : key <= k); }
+	bool isDefinitelyLess(KeyRef const& k) const { return offset <= 0 && (isLastLessOrEqual() ? key < k : key <= k); }
 
 	template <class Ar>
 	void serialize(Ar& ar) {
@@ -706,7 +727,7 @@ struct Traceable<KeySelectorRef> : std::true_type {
 template <class Val>
 struct KeyRangeWith : KeyRange {
 	Val value;
-	KeyRangeWith() {}
+	KeyRangeWith() = default;
 	KeyRangeWith(const KeyRangeRef& range, const Val& value) : KeyRange(range), value(value) {}
 	bool operator==(const KeyRangeWith& r) const { return KeyRangeRef::operator==(r) && value == r.value; }
 
@@ -781,7 +802,7 @@ struct RangeResultRef : VectorRef<KeyValueRef> {
 		if (readThrough.present()) {
 			return readThrough.get();
 		}
-		ASSERT(size() > 0);
+		ASSERT(!empty());
 		return reverse ? back().key : keyAfter(back().key);
 	}
 
@@ -792,7 +813,7 @@ struct RangeResultRef : VectorRef<KeyValueRef> {
 		if (readThrough.present()) {
 			return firstGreaterOrEqual(readThrough.get());
 		}
-		ASSERT(size() > 0);
+		ASSERT(!empty());
 		return firstGreaterThan(back().key);
 	}
 
@@ -802,7 +823,7 @@ struct RangeResultRef : VectorRef<KeyValueRef> {
 		if (readThrough.present()) {
 			return firstGreaterOrEqual(readThrough.get());
 		}
-		ASSERT(size() > 0);
+		ASSERT(!empty());
 		return firstGreaterOrEqual(back().key);
 	}
 
@@ -854,7 +875,7 @@ struct GetValueReqAndResultRef {
 	KeyRef key;
 	Optional<ValueRef> result;
 
-	GetValueReqAndResultRef() {}
+	GetValueReqAndResultRef() = default;
 	GetValueReqAndResultRef(Arena& a, const GetValueReqAndResultRef& copyFrom)
 	  : key(a, copyFrom.key), result(a, copyFrom.result) {}
 
@@ -872,7 +893,7 @@ struct GetRangeReqAndResultRef {
 	KeySelectorRef begin, end;
 	RangeResultRef result;
 
-	GetRangeReqAndResultRef() {}
+	GetRangeReqAndResultRef() = default;
 	//	KeyValueRef(const KeyRef& key, const ValueRef& value) : key(key), value(value) {}
 	GetRangeReqAndResultRef(Arena& a, const GetRangeReqAndResultRef& copyFrom)
 	  : begin(a, copyFrom.begin), end(a, copyFrom.end), result(a, copyFrom.result) {}
@@ -981,7 +1002,7 @@ struct KeyValueStoreType {
 	};
 
 	KeyValueStoreType() : type(END) {}
-	KeyValueStoreType(StoreType type) : type(type) {
+	explicit(false) KeyValueStoreType(StoreType type) : type(type) {
 		if ((uint32_t)type > END)
 			this->type = END;
 	}
@@ -1038,7 +1059,7 @@ struct TLogVersion {
 	} version;
 
 	TLogVersion() : version(UNSET) {}
-	TLogVersion(Version v) : version(v) {}
+	explicit(false) TLogVersion(Version v) : version(v) {}
 
 	operator Version() const { return version; }
 
@@ -1083,7 +1104,7 @@ struct TLogSpillType {
 	};
 
 	TLogSpillType() : type(DEFAULT) {}
-	TLogSpillType(SpillType type) : type(type) {
+	explicit(false) TLogSpillType(SpillType type) : type(type) {
 		if ((uint32_t)type >= END) {
 			this->type = UNSET;
 		}
@@ -1135,7 +1156,7 @@ struct StorageBytes {
 	// Amount of space that could eventually be available for use after garbage collection
 	int64_t temp;
 
-	StorageBytes() {}
+	StorageBytes() = default;
 	StorageBytes(int64_t free, int64_t total, int64_t used, int64_t available, int64_t temp = 0)
 	  : free(free), total(total), used(used), available(available), temp(temp) {}
 
@@ -1163,7 +1184,7 @@ struct StorageBytes {
 };
 struct LogMessageVersion {
 	// Each message pushed into the log system has a unique, totally ordered LogMessageVersion
-	// See ILogSystem::push() for how these are assigned
+	// See LogSystem::push() for how these are assigned
 	Version version;
 	uint32_t sub;
 
@@ -1199,7 +1220,7 @@ struct LogMessageVersion {
 };
 
 inline bool addressExcluded(std::set<AddressExclusion> const& exclusions, NetworkAddress const& addr) {
-	return exclusions.count(AddressExclusion(addr.ip, addr.port)) || exclusions.count(AddressExclusion(addr.ip));
+	return exclusions.contains(AddressExclusion(addr.ip, addr.port)) || exclusions.contains(AddressExclusion(addr.ip));
 }
 
 struct ClusterControllerPriorityInfo {
@@ -1213,7 +1234,7 @@ struct ClusterControllerPriorityInfo {
 	}; // cannot be larger than 7 because of leader election mask
 
 	static DCFitness calculateDCFitness(Optional<Key> const& dcId, std::vector<Optional<Key>> const& dcPriority) {
-		if (!dcPriority.size()) {
+		if (dcPriority.empty()) {
 			return FitnessUnknown;
 		} else if (dcPriority.size() == 1) {
 			if (dcId == dcPriority[0]) {
@@ -1241,7 +1262,7 @@ struct ClusterControllerPriorityInfo {
 	}
 	bool operator!=(ClusterControllerPriorityInfo const& r) const { return !(*this == r); }
 	ClusterControllerPriorityInfo()
-	  : ClusterControllerPriorityInfo(/*ProcessClass::UnsetFit*/ 2,
+	  : ClusterControllerPriorityInfo(/* process class fitness: UnsetFit */ 2,
 	                                  false,
 	                                  ClusterControllerPriorityInfo::FitnessUnknown) {}
 	ClusterControllerPriorityInfo(uint8_t processClassFitness, bool isExcluded, uint8_t dcFitness)
@@ -1392,7 +1413,7 @@ struct StorageMigrationType {
 	enum MigrationType { DEFAULT = 1, UNSET = 0, DISABLED = 1, AGGRESSIVE = 2, GRADUAL = 3, END = 4 };
 
 	StorageMigrationType() : type(UNSET) {}
-	StorageMigrationType(MigrationType type) : type(type) {
+	explicit(false) StorageMigrationType(MigrationType type) : type(type) {
 		if ((uint32_t)type >= END) {
 			this->type = UNSET;
 		}
@@ -1436,7 +1457,7 @@ struct EncryptionAtRestModeDeprecated {
 	};
 
 	EncryptionAtRestModeDeprecated() : mode(DISABLED) {}
-	EncryptionAtRestModeDeprecated(Mode mode) : mode(mode) {
+	explicit(false) EncryptionAtRestModeDeprecated(Mode mode) : mode(mode) {
 		if ((uint32_t)mode >= END) {
 			this->mode = DISABLED;
 		}
@@ -1517,10 +1538,6 @@ struct Traceable<EncryptionAtRestModeDeprecated> : std::true_type {
 	static std::string toString(const EncryptionAtRestModeDeprecated& mode) { return mode.toString(); }
 };
 
-typedef StringRef ClusterNameRef;
-typedef Standalone<ClusterNameRef> ClusterName;
-
-// TODO(gglass): delete metacluster code and tenant code and reassess the need for this enum
 enum class ClusterType { STANDALONE, LEGACY_UNUSED_METACLUSTER_MANAGEMENT, LEGACY_UNUSED_METACLUSTER_DATA };
 
 struct GRVCacheSpace {
@@ -1579,9 +1596,9 @@ struct StorageMetadataType {
 	bool wrongConfiguredForWiggle = false;
 
 	StorageMetadataType() : createdTime(0) {}
-	StorageMetadataType(double t,
-	                    KeyValueStoreType storeType = KeyValueStoreType::END,
-	                    bool wrongConfiguredForWiggle = false)
+	explicit StorageMetadataType(double t,
+	                             KeyValueStoreType storeType = KeyValueStoreType::END,
+	                             bool wrongConfiguredForWiggle = false)
 	  : createdTime(t), storeType(storeType), wrongConfiguredForWiggle(wrongConfiguredForWiggle) {}
 
 	static double currentTime() { return g_network->timer(); }
@@ -1622,7 +1639,7 @@ struct StorageWiggleValue {
 	constexpr static FileIdentifier file_identifier = 732124;
 	UID id; // storage id
 
-	StorageWiggleValue(UID id = UID(0, 0)) : id(id) {}
+	explicit StorageWiggleValue(UID id = UID(0, 0)) : id(id) {}
 
 	// To change this serialization, ProtocolVersion::PerpetualWiggleMetadata must be updated, and downgrades need
 	// to be considered
@@ -1649,13 +1666,13 @@ struct ReadOptions {
 	Optional<UID> debugID;
 	Optional<Version> consistencyCheckStartVersion;
 
-	ReadOptions(Optional<UID> debugID = Optional<UID>(),
-	            ReadType type = ReadType::NORMAL,
-	            CacheResult cache = CacheResult::True,
-	            Optional<Version> version = Optional<Version>())
+	explicit ReadOptions(Optional<UID> debugID = Optional<UID>(),
+	                     ReadType type = ReadType::NORMAL,
+	                     CacheResult cache = CacheResult::True,
+	                     Optional<Version> version = Optional<Version>())
 	  : type(type), cacheResult(cache), debugID(debugID), consistencyCheckStartVersion(version) {}
 
-	ReadOptions(ReadType type, CacheResult cache = CacheResult::True) : ReadOptions({}, type, cache) {}
+	explicit ReadOptions(ReadType type, CacheResult cache = CacheResult::True) : ReadOptions({}, type, cache) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
@@ -1665,11 +1682,12 @@ struct ReadOptions {
 
 // Can be used to identify types (e.g. IDatabase) that can be used to create transactions with a `createTransaction`
 // function
-template <typename, typename = void>
+template <typename>
 struct transaction_creator_traits : std::false_type {};
 
 template <typename T>
-struct transaction_creator_traits<T, std::void_t<typename T::TransactionT>> : std::true_type {};
+    requires requires { typename T::TransactionT; }
+struct transaction_creator_traits<T> : std::true_type {};
 
 template <typename T>
 struct transaction_creator_traits<Reference<T>> : transaction_creator_traits<T> {};
@@ -1690,12 +1708,16 @@ struct Versionstamp {
 	bool operator<=(const Versionstamp& r) const { return !(*this > r); }
 	bool operator>=(const Versionstamp& r) const { return !(*this < r); }
 
-	Versionstamp() {}
+	Versionstamp() = default;
 	Versionstamp(Version version, uint16_t batchNumber) : version(version), batchNumber(batchNumber) {}
-	Versionstamp(Standalone<StringRef> str) {
+	explicit Versionstamp(Standalone<StringRef> str) {
 		ASSERT(str.size() == sizeof(Version) + sizeof(batchNumber));
-		version = bigEndian64(*reinterpret_cast<const Version*>(str.begin()));
-		batchNumber = bigEndian16(*reinterpret_cast<const uint16_t*>(str.begin() + sizeof(Version)));
+		Version encodedVersion;
+		uint16_t encodedBatchNumber;
+		std::memcpy(&encodedVersion, str.begin(), sizeof(encodedVersion));
+		std::memcpy(&encodedBatchNumber, str.begin() + sizeof(encodedVersion), sizeof(encodedBatchNumber));
+		version = bigEndian64(encodedVersion);
+		batchNumber = bigEndian16(encodedBatchNumber);
 	}
 
 	std::string toString() const { return fmt::format("{}.{}", version, batchNumber); }

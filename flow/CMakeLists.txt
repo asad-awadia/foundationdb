@@ -1,21 +1,12 @@
 find_package(Threads REQUIRED)
 
-option(FLOW_USE_ZSTD "Enable zstd compression in flow" OFF)
-
 fdb_find_sources(FLOW_SRCS)
-
-if(FLOW_USE_ZSTD)
-  # NOTE: To enable boost::iostreams with zstd library support, manually add
-  # zstd.cpp to source files is required. Ref:
-  # https://www.boost.org/doc/libs/1_79_0/libs/iostreams/doc/installation.html
-  list(APPEND FLOW_SRCS ../contrib/boost_zstd/zstd.cpp)
-endif()
 
 # Remove files with `main` defined so we can create a link test executable.
 list(REMOVE_ITEM FLOW_SRCS LinkTest.cpp)
 list(REMOVE_ITEM FLOW_SRCS TLSTest.cpp)
 list(REMOVE_ITEM FLOW_SRCS MkCertCli.cpp)
-list(REMOVE_ITEM FLOW_SRCS acac.cpp)
+list(REMOVE_ITEM FLOW_SRCS FlowTest.cpp)
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
   list(APPEND FLOW_SRCS aarch64/memcmp.S aarch64/memcpy.S)
@@ -49,15 +40,10 @@ if(NOT Jinja2_FOUND)
                           ${PROTOCOL_VERSION_VENV_DIR} OUTPUT_QUIET ERROR_QUIET)
   find_program(
     VENV_Python3_EXECUTABLE
-    NAMES python3 python3.exe
+    NAMES python3 python3.exe python.exe
     PATHS ${PROTOCOL_VERSION_VENV_DIR}/Scripts ${PROTOCOL_VERSION_VENV_DIR}/bin
-          REQUIRED
-    NO_DEFAULT_PATH NO_CACHE
+    REQUIRED NO_DEFAULT_PATH NO_CACHE
     DOC "Checking Python3 executable in virtual environment")
-  execute_process(COMMAND "${VENV_Python3_EXECUTABLE}" -m ensurepip
-                          COMMAND_ERROR_IS_FATAL ANY)
-  execute_process(COMMAND "${VENV_Python3_EXECUTABLE}" -m pip install --upgrade
-                          pip COMMAND_ERROR_IS_FATAL ANY)
   execute_process(
     COMMAND
       "${VENV_Python3_EXECUTABLE}" -m pip install -r
@@ -103,38 +89,35 @@ add_flow_target(STATIC_LIBRARY NAME flow_sampling SRCS ${FLOW_SRCS})
 add_dependencies(flow ProtocolVersion)
 add_dependencies(flow_sampling ProtocolVersion)
 
-if(FLOW_USE_ZSTD)
-  include(CompileZstd)
-  compile_zstd()
-
-  target_link_libraries(flow PRIVATE libzstd_static)
-  target_compile_definitions(flow PUBLIC ZSTD_LIB_SUPPORTED)
-endif()
-
 # When creating a static or shared library, undefined symbols will be ignored.
 # Since we want to ensure no symbols from other modules are used, create an
 # executable so the linker will throw errors if it can't find the declaration of
 # a symbol.
 add_flow_target(LINK_TEST NAME flowlinktest SRCS LinkTest.cpp)
-target_link_libraries(flowlinktest PRIVATE flow stacktrace)
+target_link_libraries(flowlinktest PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,flow>" stacktrace)
+
+add_flow_target(EXECUTABLE NAME flow_test SRCS FlowTest.cpp)
+register_fdb_unit_tests(flow_test)
+target_link_libraries(flow_test PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,flow>" fdbrpc)
 
 set(IS_ARM_MAC NO)
 if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
   set(IS_ARM_MAC YES)
 endif()
 
-foreach(ft flow flow_sampling flowlinktest)
+foreach(ft flow flow_sampling flowlinktest flow_test)
   target_include_directories(
     ${ft}
     PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
            "${CMAKE_CURRENT_BINARY_DIR}/include"
-           "${CMAKE_SOURCE_DIR}/contrib/libb64/include")
+           "${CMAKE_SOURCE_DIR}/contrib/libb64/include"
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
-  if(FLOW_USE_ZSTD)
-    target_include_directories(${ft} PRIVATE SYSTEM ${ZSTD_LIB_INCLUDE_DIR})
-  endif()
   if(USE_JEMALLOC)
     target_include_directories(${ft} PRIVATE ${jemalloc_INCLUDE_DIRS})
+    if(ft STREQUAL "flowlinktest" OR ft STREQUAL "flow_test")
+      target_link_libraries(${ft} PRIVATE jemalloc::jemalloc)
+    endif()
   endif()
 
   target_link_libraries(${ft} PRIVATE stacktrace)
@@ -180,18 +163,7 @@ foreach(ft flow flow_sampling flowlinktest)
   target_link_libraries(${ft} PUBLIC std::coroutines)
 endforeach()
 
-if(OPEN_FOR_IDE)
-  # AcAC requires actor transpiler
-  add_library(acac OBJECT acac.cpp)
-else()
-  add_executable(acac acac.cpp)
-endif()
-target_link_libraries(acac PUBLIC flow boost_target_program_options)
-
 target_compile_definitions(flow_sampling PRIVATE -DENABLE_SAMPLING)
-if(WIN32)
-  add_dependencies(flow_sampling_actors flow_actors)
-endif()
 
 if(OPEN_FOR_IDE)
   add_library(mkcert OBJECT MkCertCli.cpp)
@@ -199,6 +171,11 @@ else()
   add_executable(mkcert MkCertCli.cpp)
 endif()
 target_link_libraries(mkcert PUBLIC flow)
+
+if(NOT FOUNDATIONDB_CROSS_COMPILING) # FIXME(swift): make this work when
+                                     # x-compiling.
+  add_subdirectory(bench EXCLUDE_FROM_ALL)
+endif()
 
 set(FLOW_BINARY_DIR "${CMAKE_BINARY_DIR}/flow")
 if(WITH_SWIFT)
@@ -264,7 +241,7 @@ if(WITH_SWIFT)
   target_compile_options(
     flow_swift
     PRIVATE
-      "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-Xcc -std=c++20 -Xfrontend -validate-tbd-against-ir=none -Xcc -DNO_INTELLISENSE -Xcc -ivfsoverlay${CMAKE_BINARY_DIR}/flow/include/headeroverlay.yaml>"
+      "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-Xcc -std=c++20 -Xfrontend -validate-tbd-against-ir=none -Xcc -ivfsoverlay${CMAKE_BINARY_DIR}/flow/include/headeroverlay.yaml>"
   )
 
   # Ensure that C++ code in fdbserver can import Swift using a compatibility
@@ -281,8 +258,6 @@ if(WITH_SWIFT)
     FLAGS
     -Xcc
     -std=c++20
-    -Xcc
-    -DNO_INTELLISENSE
     -Xcc
     -ivfsoverlay${CMAKE_BINARY_DIR}/flow/include/headeroverlay.yaml
     # Important: This is needed to avoid including headers that depends on this
@@ -302,16 +277,12 @@ if(WITH_SWIFT)
     -Xcc
     -std=c++20
     -Xcc
-    -DNO_INTELLISENSE
-    -Xcc
     -ivfsoverlay${CMAKE_BINARY_DIR}/flow/include/headeroverlay.yaml)
 
-  add_dependencies(flow_swift_checked_continuation_header flow_actors
-                   boost_target ProtocolVersion)
+  add_dependencies(flow_swift_checked_continuation_header boost_target ProtocolVersion)
   add_dependencies(flow_swift_header flow_swift_checked_continuation_header)
   add_dependencies(flow_swift flow_swift_header)
 
-  add_dependencies(flow_swift flow_actors)
   add_dependencies(flow_swift boost_target)
   # TODO(swift): rdar://99107402 - this will only work once CMake 3.25 is
   # released: target_link_libraries(flow PRIVATE flow_swift)

@@ -1,4 +1,6 @@
 fdb_find_sources(FDBRPC_SRCS)
+list(REMOVE_ITEM FDBRPC_SRCS LinkTest.cpp)
+list(REMOVE_ITEM FDBRPC_SRCS fdbrpc_test.cpp)
 
 set(COMPILE_EIO OFF)
 
@@ -13,24 +15,20 @@ if(NOT WIN32)
   endif()
 endif()
 
-set(FDBRPC_SRCS_DISABLE_ACTOR_DIAGNOSTICS
-  ActorFuzz.actor.cpp
-  FlowTests.actor.cpp
-  dsltest.actor.cpp)
-
-add_flow_target(STATIC_LIBRARY NAME fdbrpc
-  SRCS ${FDBRPC_SRCS}
-  DISABLE_ACTOR_DIAGNOSTICS ${FDBRPC_SRCS_DISABLE_ACTOR_DIAGNOSTICS})
-add_flow_target(STATIC_LIBRARY NAME fdbrpc_sampling
-  SRCS ${FDBRPC_SRCS}
-  DISABLE_ACTOR_DIAGNOSTICS ${FDBRPC_SRCS_DISABLE_ACTOR_DIAGNOSTICS})
+add_flow_target(STATIC_LIBRARY NAME fdbrpc SRCS ${FDBRPC_SRCS})
+add_flow_target(STATIC_LIBRARY NAME fdbrpc_sampling SRCS ${FDBRPC_SRCS})
 
 add_flow_target(LINK_TEST NAME fdbrpclinktest SRCS LinkTest.cpp)
-target_link_libraries(fdbrpclinktest PRIVATE fdbrpc rapidjson)
+target_link_libraries(fdbrpclinktest PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,fdbrpc>" rapidjson)
 target_include_directories(fdbrpclinktest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libeio)
+
+add_flow_target(EXECUTABLE NAME fdbrpc_test SRCS fdbrpc_test.cpp)
+register_fdb_unit_tests(fdbrpc_test SIMULATION)
+target_link_libraries(fdbrpc_test PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,fdbrpc>" rapidjson)
 
 if(COMPILE_EIO)
   add_library(eio STATIC libeio/eio.c)
+  set_target_properties(eio PROPERTIES C_CLANG_TIDY "")
   if(USE_VALGRIND)
     target_link_libraries(eio PUBLIC valgrind)
   endif()
@@ -47,6 +45,7 @@ if(${COROUTINE_IMPL} STREQUAL libcoro)
     list(APPEND CORO_SRCS libcoroutine/context.c)
   endif()
   add_library(coro STATIC ${CORO_SRCS})
+  set_target_properties(coro PROPERTIES C_CLANG_TIDY "")
   target_link_libraries(coro PRIVATE flow)
   target_include_directories(coro PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/libcoroutine)
   if(WIN32)
@@ -60,25 +59,34 @@ if(${COROUTINE_IMPL} STREQUAL libcoro)
   endif()
 endif()
 
-target_include_directories(fdbrpc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(fdbrpc PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_BINARY_DIR}/include" PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libeio)
+target_include_directories(fdbrpc
+  PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_BINARY_DIR}/include"
+  PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/libeio")
 target_link_libraries(fdbrpc PUBLIC flow libb64 md5 PRIVATE rapidjson)
 
 if (WITH_GRPC)
   generate_grpc_protobuf(fdbrpc.file_transfer protos/file_transfer.proto)
 
-  target_link_libraries(fdbrpc PUBLIC proto_fdbrpc_test)
   target_include_directories(fdbrpc PUBLIC ${Protobuf_INCLUDE_DIRS} ${gRPC_INCLUDE_DIRS})
   target_link_libraries(fdbrpc PUBLIC gRPC::grpc++)
   target_link_libraries(fdbrpc PUBLIC proto_fdbrpc_test proto_fdbrpc_file_transfer)
 
-  target_link_libraries(fdbrpc_sampling PUBLIC proto_fdbrpc_test)
   target_include_directories(fdbrpc_sampling PUBLIC ${Protobuf_INCLUDE_DIRS} ${gRPC_INCLUDE_DIRS})
   target_link_libraries(fdbrpc_sampling PUBLIC gRPC::grpc++)
   target_link_libraries(fdbrpc_sampling PUBLIC proto_fdbrpc_test proto_fdbrpc_file_transfer)
 endif()
 
-target_include_directories(fdbrpc_sampling PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_BINARY_DIR}/include" PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libeio)
+target_include_directories(fdbrpc_sampling
+  PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_BINARY_DIR}/include"
+  PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/libeio")
 target_link_libraries(fdbrpc_sampling PUBLIC flow_sampling libb64 md5 PRIVATE rapidjson)
 
 if(${COROUTINE_IMPL} STREQUAL libcoro)
@@ -92,8 +100,10 @@ if(COMPILE_EIO)
 endif()
 
 target_compile_definitions(fdbrpc_sampling PRIVATE -DENABLE_SAMPLING)
-if(WIN32)
-  add_dependencies(fdbrpc_sampling_actors fdbrpc_actors)
+
+if(NOT FOUNDATIONDB_CROSS_COMPILING) # FIXME(swift): make this work when
+                                     # x-compiling.
+  add_subdirectory(bench EXCLUDE_FROM_ALL)
 endif()
 
 add_subdirectory(tests)

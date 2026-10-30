@@ -41,7 +41,7 @@ struct Tuple {
 		bool operator==(const UserTypeStr& other) const { return (code == other.code && str == other.str); }
 	};
 
-	Tuple() {}
+	Tuple() = default;
 
 	// Tuple parsing normally does not care of the final value is a numeric type and is incomplete.
 	// The exclude_incomplete will exclude such incomplete final numeric tuples from the result.
@@ -121,7 +121,7 @@ struct Tuple {
 	}
 
 private:
-	Tuple(const StringRef& data, bool exclude_incomplete = false, bool exclude_user_type = false);
+	explicit Tuple(const StringRef& data, bool exclude_incomplete = false, bool exclude_user_type = false);
 	Standalone<VectorRef<uint8_t>> data;
 	std::vector<size_t> offsets;
 };

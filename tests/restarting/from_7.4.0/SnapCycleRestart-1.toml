@@ -1,4 +1,7 @@
 [configuration]
+# Simulated snapshot restore only supports a single-region source cluster.
+generateFearless=false
+datacenters=1
 storageEngineExcludeTypes=[3,4,5]
 logAntiQuorum=0
 tenantModes = ['disabled']
@@ -16,7 +19,6 @@ clearAfterTest=false
     transactionsPerSecond=2500.0
     nodeCount=2500
     testDuration=10.0
-    expectedRate=0
 
     [[test.workload]]
     testName="SnapTest"

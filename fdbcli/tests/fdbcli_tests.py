@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import sys
 import shutil
 import os
 import subprocess
@@ -120,76 +119,6 @@ def maintenance(logger):
 
 
 @enable_logging()
-def quota(logger):
-    # Should be a noop
-    command = "quota clear green"
-    output = run_fdbcli_command(command)
-    logger.debug(command + " : " + output)
-    assert output == "Successfully cleared quota."
-
-    command = "quota get green total_throughput"
-    output = run_fdbcli_command(command)
-    logger.debug(command + " : " + output)
-    assert output == "<empty>"
-
-    # Ignored update
-    command = "quota set red total_throughput 49152"
-    output = run_fdbcli_command(command)
-    logger.debug(command + " : " + output)
-    assert output == "Successfully updated quota."
-
-    command = "quota set green total_throughput 32768"
-    output = run_fdbcli_command(command)
-    logger.debug(command + " : " + output)
-    assert output == "Successfully updated quota."
-
-    command = "quota set green reserved_throughput 16384"
-    output = run_fdbcli_command(command)
-    logger.debug(command + " : " + output)
-    assert output == "Successfully updated quota."
-
-    command = "quota set green storage 98765"
-    output = run_fdbcli_command(command)
-    logger.debug(command + " : " + output)
-    assert output == "Successfully updated quota."
-
-    command = "quota get green total_throughput"
-    output = run_fdbcli_command(command)
-    logger.debug(command + " : " + output)
-    assert output == "32768"
-
-    command = "quota get green reserved_throughput"
-    output = run_fdbcli_command(command)
-    logger.debug(command + " : " + output)
-    assert output == "16384"
-
-    command = "quota get green storage"
-    output = run_fdbcli_command(command)
-    logger.debug(command + " : " + output)
-    assert output == "98765"
-
-    command = "quota clear green"
-    output = run_fdbcli_command(command)
-    logger.debug(command + " : " + output)
-    assert output == "Successfully cleared quota."
-
-    command = "quota get green total_throughput"
-    output = run_fdbcli_command(command)
-    logger.debug(command + " : " + output)
-    assert output == "<empty>"
-
-    command = "quota get green storage"
-    output = run_fdbcli_command(command)
-    logger.debug(command + " : " + output)
-    assert output == "<empty>"
-
-    # Too few arguments, should log help message
-    command = "quota get green"
-    output = run_fdbcli_command(command)
-    logger.debug(command + " : " + output)
-
-
-@enable_logging()
 def setclass(logger):
     # get all processes' network addresses
     output1 = run_fdbcli_command("setclass")
@@ -297,6 +226,18 @@ def lockAndUnlock(logger):
     )
 
 
+def expensive_data_check_empty_all():
+    result = subprocess.run(
+        command_template + ["expensive_data_check all; sleep 0"],
+        capture_output=True,
+        env=fdbcli_env,
+    )
+    assert result.returncode != 0, (result.stdout, result.stderr)
+    assert b"ERROR: no processes to check" in result.stderr, result.stderr
+    assert b"remaining commands will not be executed" in result.stdout, result.stdout
+    assert b">>> sleep 0" not in result.stdout, result.stdout
+
+
 @enable_logging()
 def kill(logger):
     output1 = run_fdbcli_command("kill")
@@ -379,7 +320,7 @@ def suspend(logger):
     port = address.split(":")[1]
     logger.debug("Port: {}".format(port))
     # use the port number to find the exact fdb process we are connecting to
-    # child process like fdbserver -r flowprocess does not provide `datadir` in the command line
+    # auxiliary processes may not provide `datadir` in the command line
     pinfo = list(filter(lambda x: port in x and "datadir" in x, pinfos))
     assert len(pinfo) == 1
     pid = pinfo[0].split(" ")[0]
@@ -456,7 +397,7 @@ def versionepoch(logger):
     version11 = run_fdbcli_command("versionepoch commit")
     assert version11.startswith("Current read version is ")
     # the test can trigger recovery, thus we wait until the recovery is finished to move to the next test
-    wait_for_database_available(logger)
+    wait_for_database_fully_recovered(logger)
 
 
 def get_value_from_status_json(retry, *args):
@@ -471,6 +412,227 @@ def get_value_from_status_json(retry, *args):
     return result
 
 
+def status_json_file_region_failover_message():
+    status_json = {
+        "client": {
+            "cluster_file": {"path": "fdb.cluster", "up_to_date": True},
+            "coordinators": {"coordinators": [], "quorum_reachable": True},
+            "database_status": {"available": True, "healthy": False},
+            "messages": [],
+            "timestamp": 1417807090,
+        },
+        "cluster": {
+            "configuration": {
+                "redundancy_mode": "three_data_hall",
+                "storage_engine": "ssd-2",
+                "coordinators_count": 3,
+                "excluded_servers": [],
+            },
+            "data": {"state": {"name": "healthy", "healthy": True}},
+            "fault_tolerance": {
+                "max_zone_failures_without_losing_availability": -1,
+                "max_zone_failures_without_losing_data": -1,
+            },
+            "logs": [
+                {
+                    "epoch": 1,
+                    "current": True,
+                    "begin_version": 1,
+                    "possibly_losing_data": False,
+                    "log_interfaces": [
+                        {
+                            "id": "aaaaaaaaaaaaaaaa",
+                            "healthy": False,
+                            "address": "1.1.1.1:4500",
+                        }
+                    ],
+                }
+            ],
+            "machines": {},
+            "processes": {},
+        },
+    }
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as status_file:
+        json.dump(status_json, status_file)
+        status_file.flush()
+        result = subprocess.run(
+            [command_template[0], "--status-from-json", status_file.name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=fdbcli_env,
+        )
+
+    stdout = result.stdout.decode("utf-8")
+    stderr = result.stderr.decode("utf-8")
+    assert result.returncode == 0, stderr
+    assert "Warning: the database may have availability loss." in stdout
+    assert "may have data loss" not in stdout
+
+
+def status_json_file_missing_data_remote_region_message():
+    primary_line = "UNHEALTHY: No replicas remain of some data"
+    missing_data = {
+        "healthy": False,
+        "name": "missing_data",
+        "description": "No replicas remain of some data",
+        "min_replicas_remaining": 0,
+    }
+
+    def team_tracker(is_primary, name, healthy, state=None):
+        if state is None:
+            state = {"healthy": healthy, "name": name, "min_replicas_remaining": 3}
+        return {
+            "primary": is_primary,
+            "in_flight_bytes": 0,
+            "unhealthy_servers": 0,
+            "state": state,
+        }
+
+    def get_status_text(usable_regions, team_trackers, data_state=missing_data):
+        configuration = {
+            "redundancy_mode": "double",
+            "storage_engine": "ssd-2",
+            "coordinators_count": 1,
+            "excluded_servers": [],
+        }
+        if usable_regions is not None:
+            configuration["usable_regions"] = usable_regions
+        status_json = {
+            "client": {
+                "cluster_file": {"path": "fdb.cluster", "up_to_date": True},
+                "coordinators": {"coordinators": [], "quorum_reachable": True},
+                "database_status": {"available": True, "healthy": False},
+                "messages": [],
+                "timestamp": 1417807090,
+            },
+            "cluster": {
+                "configuration": configuration,
+                "data": {"state": data_state, "team_trackers": team_trackers},
+                "fault_tolerance": {
+                    "max_zone_failures_without_losing_availability": 1,
+                    "max_zone_failures_without_losing_data": 1,
+                },
+                "logs": [
+                    {
+                        "epoch": 1,
+                        "current": True,
+                        "begin_version": 1,
+                        "possibly_losing_data": False,
+                        "log_interfaces": [],
+                    }
+                ],
+                "machines": {},
+                "processes": {},
+            },
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as status_file:
+            json.dump(status_json, status_file)
+            status_file.flush()
+            result = subprocess.run(
+                [command_template[0], "--status-from-json", status_file.name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=fdbcli_env,
+            )
+        assert result.returncode == 0, result.stderr.decode("utf-8")
+        return result.stdout.decode("utf-8")
+
+    def expected_line(remote_summary):
+        return primary_line + " (primary); " + remote_summary + " (remote)"
+
+    def assert_no_remote_summary(output):
+        assert primary_line in output, output
+        assert "(primary)" not in output, output
+
+    primary_tracker = team_tracker(True, "missing_data", False, missing_data)
+
+    remote_cases = [
+        # (remote state name, remote healthy, expected summary)
+        ("healthy", True, "Healthy replicas"),
+        # A busy remote still holds a healthy copy.
+        ("healthy_rebalancing", True, "Healthy replicas"),
+        ("healing", False, "Healing replicas"),
+        # Reports healthy before it holds a full copy.
+        ("healthy_populating_region", True, "Populating replicas"),
+        # The remote lost data too.
+        ("missing_data", False, "No replicas remain of some data"),
+    ]
+    for name, healthy, summary in remote_cases:
+        output = get_status_text(
+            2, [primary_tracker, team_tracker(False, name, healthy)]
+        )
+        assert expected_line(summary) in output, (name, output)
+
+    # Remote listed before the primary: order must not matter.
+    output = get_status_text(2, [team_tracker(False, "healthy", True), primary_tracker])
+    assert expected_line("Healthy replicas") in output, output
+
+    # Single region with no remote entry: message unchanged.
+    output = get_status_text(1, [primary_tracker])
+    assert_no_remote_summary(output)
+
+    # Primary healing (not missing_data): other branches are untouched.
+    healing = {
+        "healthy": False,
+        "name": "healing",
+        "description": "Only one replica remains of some data",
+        "min_replicas_remaining": 1,
+    }
+    output = get_status_text(
+        2,
+        [
+            team_tracker(True, "healing", False, healing),
+            team_tracker(False, "healthy", True),
+        ],
+        healing,
+    )
+    assert "HEALING: Only one replica remains of some data" in output, output
+
+
+@enable_logging()
+def status_excluded_processes_message(logger):
+    # get all coordinators' address
+    coordinators = {
+        c["address"]
+        for c in get_value_from_status_json(
+            True, "client", "coordinators", "coordinators"
+        )
+    }
+    # Excluding the cluster controller's process forces a failover, and the new CC omits that process from status
+    # until it re-registers.
+    processes = get_value_from_status_json(True, "cluster", "processes")
+    cluster_controllers = {
+        p["address"]
+        for p in processes.values()
+        if any(r["role"] == "cluster_controller" for r in p.get("roles", []))
+    }
+    candidates = [
+        a
+        for a in get_fdb_process_addresses(logger)
+        if a not in coordinators and a not in cluster_controllers
+    ]
+    # make sure that we do not exclude any coordinator process because excluding coordinator will print the warning
+    assert candidates, "Need a process that is not a coordinator or the CC to exclude"
+    excluded_address = random.choice(candidates)
+    run_fdbcli_command("exclude", "FORCE", excluded_address)
+    try:
+        # The exclusion can trigger a recovery, during which status may be incomplete; retry until it settles.
+        expected = "(excluded processes: 1; processes with errors: "
+        deadline = time.time() + 20
+        while True:
+            status_output = run_fdbcli_command("status")
+            logger.debug(status_output)
+            if expected in status_output or time.time() > deadline:
+                break
+            time.sleep(1)
+        assert expected in status_output
+        assert "less " not in status_output
+    finally:
+        run_fdbcli_command("include", excluded_address)
+        wait_for_database_fully_recovered(logger)
+
+
 @enable_logging()
 def consistencycheck(logger):
     consistency_check_on_output = "ConsistencyCheck is on"
@@ -483,7 +645,6 @@ def consistencycheck(logger):
     run_fdbcli_command("consistencycheck", "on")
     output3 = run_fdbcli_command("consistencycheck")
     assert output3 == consistency_check_on_output
-
 
 
 @enable_logging()
@@ -602,6 +763,60 @@ def transaction(logger):
     assert output7 == "`key': not found"
 
 
+@enable_logging()
+def clearrange_prefix(logger):
+    """This test covers the clearrange fdbcli command with optional ENDKEY (prefix mode)."""
+    # Test 1: clearrange without writemode should fail
+    err1 = run_fdbcli_command_and_get_error("clearrange", "prefix")
+    assert (
+        err1 == "ERROR: writemode must be enabled to set or clear keys in the database."
+    )
+    # Test 2: set keys with a shared prefix and one without, then clearrange with prefix only
+    process = subprocess.Popen(
+        command_template[:-1],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        env=fdbcli_env,
+    )
+    transaction_flow = [
+        "writemode on",
+        "set prefix_aaa val1",
+        "set prefix_bbb val2",
+        "set prefix_ccc val3",
+        "set other_key val4",
+        "clearrange prefix_",
+        # verify prefix keys are gone
+        "get prefix_aaa",
+        "get prefix_bbb",
+        "get prefix_ccc",
+        # verify non-prefix key is still present
+        "get other_key",
+    ]
+    output1, _ = process.communicate(input="\n".join(transaction_flow).encode())
+    lines = list(filter(len, output1.decode().split("\n")))
+    logger.debug("Output lines: {}".format(lines))
+    # Find the get results (last 4 meaningful lines before the prompt)
+    get_results = [l for l in lines if "not found" in l or "is `" in l]
+    logger.debug("Get results: {}".format(get_results))
+    assert len(get_results) == 4
+    assert get_results[0] == "`prefix_aaa': not found"
+    assert get_results[1] == "`prefix_bbb': not found"
+    assert get_results[2] == "`prefix_ccc': not found"
+    assert get_results[3] == "`other_key' is `val4'"
+    # Cleanup: remove the remaining key
+    process = subprocess.Popen(
+        command_template[:-1],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        env=fdbcli_env,
+    )
+    cleanup_flow = [
+        "writemode on",
+        "clear other_key",
+    ]
+    process.communicate(input="\n".join(cleanup_flow).encode())
+
+
 def get_fdb_process_addresses(logger):
     # get all processes' network addresses
     output = run_fdbcli_command("kill")
@@ -648,7 +863,7 @@ def coordinators(logger):
         len(get_value_from_status_json(True, "client", "coordinators", "coordinators"))
         == 1
     )
-    wait_for_database_available(logger)
+    wait_for_database_fully_recovered(logger)
 
 
 @enable_logging(logging.DEBUG)
@@ -711,7 +926,7 @@ def exclude(logger):
     # check the include is successful
     output4 = run_fdbcli_command("exclude")
     assert no_excluded_process_output in output4
-    wait_for_database_available(logger)
+    wait_for_database_fully_recovered(logger)
 
 
 # read the system key 'k', need to enable the option first
@@ -746,13 +961,20 @@ def throttle(logger):
     # TODO : test manual throttling, not easy to do now
 
 
-def wait_for_database_available(logger):
-    # sometimes the change takes some time to have effect and the database can be unavailable at that time
-    # this is to wait until the database is available again
-    while not get_value_from_status_json(
-        True, "client", "database_status", "available"
-    ):
-        logger.debug("Database unavailable for now, wait for one second")
+def wait_for_database_fully_recovered(logger):
+    # Database availability precedes full recovery and is not sufficient before tests that
+    # make assertions about recovery generations.
+    while True:
+        status = json.loads(run_fdbcli_command("status", "json"))
+        available = status["client"]["database_status"]["available"]
+        recovery_state = status.get("cluster", {}).get("recovery_state", {}).get("name")
+        if available and recovery_state == "fully_recovered":
+            return
+        logger.debug(
+            "Database available: {}, recovery state: {}; wait for one second".format(
+                available, recovery_state
+            )
+        )
         time.sleep(1)
 
 
@@ -850,6 +1072,93 @@ def integer_options():
     assert error_output == b""
 
 
+def cdc_operator_commands():
+    status = json.loads(run_fdbcli_command("cdc status json"))
+    assert isinstance(status["read_version"], int)
+    assert isinstance(status["admission_enabled"], bool)
+    assert status["metadata_complete"] is True
+    assert status["metadata_drained"] is True
+    assert status["streams"] == []
+    assert status["tags"] == []
+    assert isinstance(status["proxies"], list)
+
+    invalid_commands = [
+        "cdc",
+        "cdc list",
+        "cdc status json extra",
+        "cdc remove missing 1",
+        'cdc remove "" 1 CONFIRM-DATA-LOSS',
+        "cdc remove missing 0 CONFIRM-DATA-LOSS",
+        "cdc remove missing -1 CONFIRM-DATA-LOSS",
+        "cdc remove missing +1 CONFIRM-DATA-LOSS",
+        "cdc remove missing 1x CONFIRM-DATA-LOSS",
+        "cdc remove missing 18446744073709551616 CONFIRM-DATA-LOSS",
+        "cdc remove missing 1 no",
+    ]
+    for command in invalid_commands:
+        result = subprocess.run(
+            command_template + [command], capture_output=True, env=fdbcli_env
+        )
+        assert result.returncode != 0, (command, result.stdout, result.stderr)
+
+    result = subprocess.run(
+        command_template
+        + ["cdc remove missing 18446744073709551615 CONFIRM-DATA-LOSS"],
+        capture_output=True,
+        env=fdbcli_env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert b"already absent" in result.stdout, result.stdout
+    assert b"Retired cleanup may still be pending" in result.stdout, result.stdout
+
+
+def audit_status_arguments():
+    invalid_commands = [
+        "get_audit_status",
+        "get_audit_status ha",
+        "get_audit_status ha id",
+        "get_audit_status ha progress",
+        "get_audit_status ha phase",
+    ]
+    for command in invalid_commands:
+        result = subprocess.run(
+            command_template + [command], capture_output=True, env=fdbcli_env
+        )
+        assert result.returncode != 0, (command, result.stdout, result.stderr)
+        assert result.stdout.startswith(b"Usage: get_audit_status "), (
+            command,
+            result.stdout,
+            result.stderr,
+        )
+
+    for command in [
+        "get_audit_status ha recent",
+        "get_audit_status ha recent 0",
+        "get_audit_status ha phase running",
+        "get_audit_status ha phase running 0",
+    ]:
+        result = subprocess.run(
+            command_template + [command], capture_output=True, env=fdbcli_env
+        )
+        assert result.returncode == 0, (command, result.stdout, result.stderr)
+
+
+def client_threads_per_version_env_ignored():
+    test_env = fdbcli_env.copy()
+    test_env["FDB_NETWORK_OPTION_CLIENT_THREADS_PER_VERSION"] = "not_an_integer"
+    process = subprocess.run(
+        command_template + ["status minimal"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=test_env,
+    )
+    assert process.returncode == 0
+    assert (
+        b"Environment variable network option could not be set"
+        not in process.stderr
+    )
+
+
 def tls_address_suffix():
     # fdbcli shall prevent a non-TLS fdbcli run from connecting to an all-TLS cluster
     preamble = "eNW1yf1M:eNW1yf1M@"
@@ -935,26 +1244,32 @@ if __name__ == "__main__":
         # advanceversion()
         consistencycheck()
         datadistribution()
+        expensive_data_check_empty_all()
         kill()
         lockAndUnlock()
         maintenance()
         profile()
-        # TODO: re-enable it until it's stable
+        # TODO: re-enable once stable
         # suspend()
         transaction()
-        # this is replaced by the "quota" command
+        clearrange_prefix()
+        # TODO: re-enable once stable
         # throttle()
         triggerddteaminfolog()
         versionepoch()
         integer_options()
         tls_address_suffix()
-        # TODO: fix the issue when running through the external client
-        # quota()
+        status_json_file_region_failover_message()
+        status_json_file_missing_data_remote_region_message()
         idempotency_ids()
+        cdc_operator_commands()
+        audit_status_arguments()
+        client_threads_per_version_env_ignored()
     else:
         assert args.process_number > 1, "Process number should be positive"
         coordinators()
         exclude()
+        status_excluded_processes_message()
         killall()
         # TODO: fix the failure where one process is not available after setclass call
         # setclass()

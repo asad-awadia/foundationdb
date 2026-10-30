@@ -64,6 +64,8 @@ public:
 #endif
 	}
 	void enter() {
+		// The architecture-specific body is selected by the preprocessor.
+		// NOLINTNEXTLINE(readability-braces-around-statements)
 		while (isLocked.test_and_set(std::memory_order_acquire))
 #if defined(__aarch64__)
 			__asm__ volatile("isb");
@@ -100,7 +102,7 @@ class ThreadSpinLockHolder {
 	ThreadSpinLock& lock;
 
 public:
-	ThreadSpinLockHolder(ThreadSpinLock& lock) : lock(lock) { lock.enter(); }
+	explicit ThreadSpinLockHolder(ThreadSpinLock& lock) : lock(lock) { lock.enter(); }
 	ThreadSpinLockHolder(const ThreadSpinLockHolder& lock) = delete;
 	~ThreadSpinLockHolder() { lock.leave(); }
 };
@@ -113,18 +115,18 @@ public:
 };
 class ThreadUnsafeSpinLockHolder {
 public:
-	ThreadUnsafeSpinLockHolder(ThreadUnsafeSpinLock&) {};
+	explicit ThreadUnsafeSpinLockHolder(ThreadUnsafeSpinLock&) {};
 };
 
 #if FLOW_THREAD_SAFE
 
-typedef ThreadSpinLock SpinLock;
-typedef ThreadSpinLockHolder SpinLockHolder;
+using SpinLock = ThreadSpinLock;
+using SpinLockHolder = ThreadSpinLockHolder;
 
 #else
 
-typedef ThreadUnsafeSpinLock SpinLock;
-typedef ThreadUnsafeSpinLockHolder SpinLockHolder;
+using SpinLock = ThreadUnsafeSpinLock;
+using SpinLockHolder = ThreadUnsafeSpinLockHolder;
 
 #endif
 
@@ -156,7 +158,7 @@ class MutexHolder {
 	Mutex& lock;
 
 public:
-	MutexHolder(Mutex& lock) : lock(lock) { lock.enter(); }
+	explicit MutexHolder(Mutex& lock) : lock(lock) { lock.enter(); }
 	~MutexHolder() { lock.leave(); }
 };
 

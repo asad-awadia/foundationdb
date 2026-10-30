@@ -19,8 +19,9 @@
  */
 #ifdef FLOW_GRPC_ENABLED
 #include "fdbctl/ControlCommands.h"
-#include "fdbclient/ManagementAPI.actor.h"
+#include "fdbclient/ManagementAPI.h"
 #include "fdbclient/Schemas.h"
+#include "fdbclient/StatusSchema.h"
 #include "fmt/format.h"
 #include <boost/algorithm/string.hpp>
 
@@ -33,7 +34,7 @@ Future<grpc::Status> getCoordinators(Reference<IDatabase> db,
                                      GetCoordinatorsReply* rep) {
 	Reference<ITransaction> tr = db->createTransaction();
 
-	loop {
+	while (true) {
 		Error err;
 		try {
 			ThreadFuture<Optional<Value>> processesF = tr->get(special_keys::coordinatorsProcessSpecialKey);
@@ -69,16 +70,16 @@ Future<grpc::Status> changeCoordinators(Reference<IDatabase> db,
 	// TODO: Reject request if intersection(new coordinators, old coordinators) = {}.
 	Reference<ITransaction> tr = db->createTransaction();
 	Error err;
-	loop {
+	while (true) {
 		tr->setOption(FDBTransactionOptions::SPECIAL_KEY_SPACE_ENABLE_WRITES);
 		try {
-			if (req->has_cluster_description() && req->cluster_description().size()) {
+			if (req->has_cluster_description() && !req->cluster_description().empty()) {
 				tr->set(special_keys::clusterDescriptionSpecialKey, req->cluster_description());
 			}
 
 			if (req->automatic_coordinators()) {
 				ASSERT(req->new_coordinator_addresses_size() == 0);
-				if (!auto_coordinators_str.size()) {
+				if (auto_coordinators_str.empty()) {
 					ThreadFuture<Optional<Value>> auto_coordinatorsF =
 					    tr->get(special_keys::coordinatorsAutoSpecialKey);
 					Optional<Value> auto_coordinators = co_await safeThreadFutureToFuture(auto_coordinatorsF);
@@ -95,7 +96,7 @@ Future<grpc::Status> changeCoordinators(Reference<IDatabase> db,
 					try {
 						if (Hostname::isHostname(new_coord)) {
 							const auto& hostname = Hostname::parse(new_coord);
-							if (new_coordinators_hostnames.count(hostname)) {
+							if (new_coordinators_hostnames.contains(hostname)) {
 								co_return grpc::Status(
 								    grpc::StatusCode::INVALID_ARGUMENT,
 								    fmt::format("passed redundant coordinators: {}", hostname.toString()));
@@ -104,7 +105,7 @@ Future<grpc::Status> changeCoordinators(Reference<IDatabase> db,
 							newCoordinatorsList.push_back(hostname.toString());
 						} else {
 							const auto& addr = NetworkAddress::parse(new_coord);
-							if (new_coordinators_addresses.count(addr)) {
+							if (new_coordinators_addresses.contains(addr)) {
 								co_return grpc::Status(
 								    grpc::StatusCode::INVALID_ARGUMENT,
 								    fmt::format("passed redundant coordinators: {}", addr.toString()));
@@ -182,7 +183,7 @@ Reference<ITransaction> getTransaction(Reference<IDatabase> db, Reference<ITrans
 Future<grpc::Status> getStatus(Reference<IDatabase> db, const GetStatusRequest* req, GetStatusReply* rep) {
 	Reference<ITransaction> tr = db->createTransaction();
 
-	loop {
+	while (true) {
 		Error err;
 		try {
 			ThreadFuture<Optional<Value>> statusValueF = tr->get("\xff\xff/status/json"_sr);
@@ -311,7 +312,7 @@ Future<grpc::Status> include(Reference<IDatabase> db, const IncludeRequest* req,
 	}
 
 	Reference<ITransaction> tr = db->createTransaction();
-	loop {
+	while (true) {
 		Error err;
 		tr->setOption(FDBTransactionOptions::SPECIAL_KEY_SPACE_ENABLE_WRITES);
 		try {
@@ -362,8 +363,7 @@ Future<grpc::Status> include(Reference<IDatabase> db, const IncludeRequest* req,
 void addInterfacesFromKVs(RangeResult& kvs,
                           std::map<Key, std::pair<Value, ClientLeaderRegInterface>>* address_interface) {
 	for (const auto& kv : kvs) {
-		ClientWorkerInterface workerInterf =
-		    BinaryReader::fromStringRef<ClientWorkerInterface>(kv.value, IncludeVersion());
+		auto workerInterf = BinaryReader::fromStringRef<ClientWorkerInterface>(kv.value, IncludeVersion());
 		ClientLeaderRegInterface leaderInterf(workerInterf.address());
 		StringRef ip_port = (kv.key.endsWith(":tls"_sr) ? kv.key.removeSuffix(":tls"_sr) : kv.key)
 		                        .removePrefix("\xff\xff/worker_interfaces/"_sr);
@@ -404,7 +404,7 @@ Future<Void> getWorkerInterfaces(Reference<ITransaction> tr,
 Future<grpc::Status> kill(Reference<IDatabase> db, const KillRequest* req, KillReply* rep) {
 	// TODO: Handle duration_seconds
 	// TODO: What if asked to kill itself?
-	if (req->all() && req->addresses().size() > 0) {
+	if (req->all() && !req->addresses().empty()) {
 		co_return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "ERROR: both fields `all` and `addresses` set");
 	}
 
@@ -412,7 +412,7 @@ Future<grpc::Status> kill(Reference<IDatabase> db, const KillRequest* req, KillR
 	std::map<Key, std::pair<Value, ClientLeaderRegInterface>> address_interface;
 	co_await getWorkerInterfaces(tr, &address_interface, true);
 
-	if (address_interface.size() == 0) {
+	if (address_interface.empty()) {
 		// TODO: Return more elaborate result.
 		co_return grpc::Status::OK;
 	}
@@ -422,9 +422,9 @@ Future<grpc::Status> kill(Reference<IDatabase> db, const KillRequest* req, KillR
 		for (const auto& [address, _] : address_interface) {
 			addressesVec.push_back(address.toString());
 		}
-	} else if (req->addresses().size() > 0) {
+	} else if (!req->addresses().empty()) {
 		for (const auto& addr : req->addresses()) {
-			if (!address_interface.count(StringRef(addr))) {
+			if (!address_interface.contains(StringRef(addr))) {
 				co_return grpc::Status(grpc::StatusCode::UNKNOWN, fmt::format("process `{}' not recognized", addr));
 			}
 			addressesVec.push_back(addr);
@@ -461,7 +461,7 @@ Future<std::string> getSpecialKeysFailureErrorMessage(Reference<ITransaction> tr
 Future<Void> getStorageServerInterfaces(Reference<IDatabase> db,
                                         std::map<std::string, StorageServerInterface>* interfaces) {
 	Reference<ITransaction> tr = db->createTransaction();
-	loop {
+	while (true) {
 		Error err;
 		interfaces->clear();
 		try {
@@ -469,7 +469,7 @@ Future<Void> getStorageServerInterfaces(Reference<IDatabase> db,
 			tr->setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 			tr->setOption(FDBTransactionOptions::LOCK_AWARE);
 			ThreadFuture<RangeResult> serverListF = tr->getRange(serverListKeys, CLIENT_KNOBS->TOO_MANY);
-			co_await success(safeThreadFutureToFuture(serverListF));
+			co_await safeThreadFutureToFuture(serverListF);
 			ASSERT(!serverListF.get().more);
 			ASSERT_LT(serverListF.get().size(), CLIENT_KNOBS->TOO_MANY);
 			RangeResult serverList = serverListF.get();
@@ -494,7 +494,7 @@ Future<Void> getStorageServerInterfaces(Reference<IDatabase> db,
 
 Future<bool> getWorkersProcessData(Reference<IDatabase> db, std::vector<ProcessData>* workers) {
 	Reference<ITransaction> tr = db->createTransaction();
-	loop {
+	while (true) {
 		Error err;
 		try {
 			tr->setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
@@ -503,8 +503,8 @@ Future<bool> getWorkersProcessData(Reference<IDatabase> db, std::vector<ProcessD
 			ThreadFuture<RangeResult> processClasses = tr->getRange(processClassKeys, CLIENT_KNOBS->TOO_MANY);
 			ThreadFuture<RangeResult> processData = tr->getRange(workerListKeys, CLIENT_KNOBS->TOO_MANY);
 
-			co_await success(safeThreadFutureToFuture(processClasses));
-			co_await success(safeThreadFutureToFuture(processData));
+			co_await safeThreadFutureToFuture(processClasses);
+			co_await safeThreadFutureToFuture(processData);
 
 			ASSERT(!processClasses.get().more && processClasses.get().size() < CLIENT_KNOBS->TOO_MANY);
 			ASSERT(!processData.get().more && processData.get().size() < CLIENT_KNOBS->TOO_MANY);

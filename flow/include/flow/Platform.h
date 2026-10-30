@@ -95,6 +95,20 @@
 #error Missing force inline
 #endif
 
+// Keep a function un-inlined and (on GCC) un-cloned so its address stays stable
+// for return-address matching in tests. GCC -O3 IPA cloning (.constprop/.isra)
+// otherwise runs the code under a synthetic clone symbol at a different address
+// than &fn, so a captured frame won't fall in [&fn, &fn+size); noclone disables
+// it. clang lacks noclone and doesn't clone this way, so it gets noinline only;
+// empty elsewhere (e.g. MSVC, which we cannot compile-test).
+#if defined(__clang__)
+#define force_noinline __attribute__((noinline))
+#elif defined(__GNUC__)
+#define force_noinline __attribute__((noinline, noclone))
+#else
+#define force_noinline
+#endif
+
 /*
  * Visual Studio (.NET 2003 and beyond) has an __assume compiler
  * intrinsic to hint to the compiler that a given condition is true
@@ -135,6 +149,10 @@
 #include <memory>
 #include <functional>
 #endif
+
+template <class T>
+class AsyncResult;
+class Void;
 
 // g++ requires that non-dependent names have to be looked up at
 // template definition, which makes circular dependencies a royal
@@ -377,6 +395,11 @@ std::string joinPath(std::string const& directory, std::string const& filename);
 // Relative paths remain relative and are NOT rebased on the current working directory.
 std::string cleanPath(std::string const& path);
 
+// Returns true if `path`, when joined onto a base directory, can only resolve to the base itself or something
+// within it. The check is purely lexical, so it does not account for symbolic links inside the base.  An empty path
+// is contained, as is "."; any ".." component is rejected, even one that stays within the base.
+bool relativePathIsContained(const std::string& path);
+
 // Removes the last component from a path string (if possible) and returns the result with one trailing separator.
 // If there is only one path component, the result will be "" for relative paths and "/" for absolute paths.
 // Note that this is NOT the same as getting the parent of path, as the final component could be ".."
@@ -426,6 +449,7 @@ std::vector<std::string> listFiles(std::string const& directory, std::string con
 std::vector<std::string> listDirectories(std::string const& directory);
 
 void findFilesRecursively(std::string const& path, std::vector<std::string>& out);
+AsyncResult<Void> findFilesRecursivelyAsync(std::string path, std::vector<std::string>* out);
 
 // Tag the given file as "temporary", i.e. not really needing commits to disk
 void makeTemporary(const char* filename);
@@ -435,7 +459,8 @@ void setCloseOnExec(int fd);
 // Logs an out of memory error and exits the program
 void outOfMemory();
 
-int getRandomSeed();
+uint64_t getRandomSeed();
+void getRandomBytes(void* buf, size_t len);
 
 bool getEnvironmentVar(const char* name, std::string& value);
 int setEnvironmentVar(const char* name, const char* value, int overwrite);
@@ -470,7 +495,7 @@ int eraseDirectoryRecursive(std::string const& directory);
 struct TmpFile {
 public:
 	TmpFile();
-	TmpFile(const std::string& tempDir);
+	explicit TmpFile(const std::string& tempDir);
 	TmpFile(const std::string& tempDir, std::string const& prefix);
 	~TmpFile();
 	size_t read(uint8_t* buff, size_t len);
@@ -489,11 +514,11 @@ private:
 } // namespace platform
 
 #ifdef __linux__
-typedef struct {
+using ProfilingSample = struct {
 	double timestamp;
 	size_t length;
 	void* frames[];
-} ProfilingSample;
+};
 
 dev_t getDeviceId(std::string path);
 #endif
@@ -748,7 +773,6 @@ inline static void aligned_free(void* ptr) {
 }
 #elif defined(__APPLE__)
 #if !defined(HAS_ALIGNED_ALLOC)
-#include <cstdlib>
 inline static void* aligned_alloc(size_t alignment, size_t size) {
 	void* ptr = nullptr;
 	posix_memalign(&ptr, alignment, size);
@@ -878,17 +902,9 @@ EXTERNC void setProfilingEnabled(int enabled);
 	                             DTRACE_PROBE)                                                                         \
 	(foundationdb, __VA_ARGS__)
 
-extern void fdb_probe_actor_create(const char* name, unsigned long id);
-extern void fdb_probe_actor_destroy(const char* name, unsigned long id);
-extern void fdb_probe_actor_enter(const char* name, unsigned long, int index);
-extern void fdb_probe_actor_exit(const char* name, unsigned long, int index);
 #else
 #define FDB_TRACE_PROBE_STRING_CONCAT(h, t) h##t
 #define FDB_TRACE_PROBE(...)
-inline void fdb_probe_actor_create(const char* name, unsigned long id) {}
-inline void fdb_probe_actor_destroy(const char* name, unsigned long id) {}
-inline void fdb_probe_actor_enter(const char* name, unsigned long id, int index) {}
-inline void fdb_probe_actor_exit(const char* name, unsigned long id, int index) {}
 #endif
 
 #if defined(__aarch64__)

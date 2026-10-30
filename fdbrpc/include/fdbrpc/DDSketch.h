@@ -112,6 +112,35 @@ public:
 		return *this;
 	}
 
+	void addSamplePair(T sample, DDSketchBase<Impl, T>& other) {
+		ASSERT(this != &other && fabs(errorGuarantee - other.errorGuarantee) < EPS &&
+		       buckets.size() == other.buckets.size());
+
+		if (!populationSize)
+			minValue = maxValue = sample;
+		if (!other.populationSize)
+			other.minValue = other.maxValue = sample;
+
+		if (sample <= EPS) {
+			++zeroPopulationSize;
+			++other.zeroPopulationSize;
+		} else {
+			size_t index = static_cast<Impl*>(this)->getIndex(sample);
+			ASSERT(index < buckets.size());
+			++buckets[index];
+			++other.buckets[index];
+		}
+
+		++populationSize;
+		++other.populationSize;
+		sum += sample;
+		other.sum += sample;
+		maxValue = std::max(maxValue, sample);
+		other.maxValue = std::max(other.maxValue, sample);
+		minValue = std::min(minValue, sample);
+		other.minValue = std::min(other.minValue, sample);
+	}
+
 	double mean() const {
 		if (populationSize == 0)
 			return 0;
@@ -245,7 +274,7 @@ private:
 template <class T>
 class DDSketchSlow : public DDSketchBase<DDSketchSlow<T>, T> {
 public:
-	DDSketchSlow(double errorGuarantee = 0.1)
+	explicit DDSketchSlow(double errorGuarantee = 0.1)
 	  : DDSketchBase<DDSketchSlow<T>, T>(errorGuarantee), gamma((1.0 + errorGuarantee) / (1.0 - errorGuarantee)),
 	    logGamma(log(gamma)) {
 		offset = getIndex(1.0 / DDSketchBase<DDSketch<T>, T>::EPS) + 5;

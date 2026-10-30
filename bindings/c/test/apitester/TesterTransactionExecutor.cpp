@@ -97,7 +97,7 @@ public:
 		}
 	}
 
-	virtual ~TransactionContextBase() { ASSERT(txState == TxState::DONE); }
+	~TransactionContextBase() override { ASSERT(txState == TxState::DONE); }
 
 	// A state machine:
 	// IN_PROGRESS -> (ON_ERROR -> IN_PROGRESS)* [-> ON_ERROR] -> DONE
@@ -165,7 +165,7 @@ public:
 		}
 	}
 
-	virtual void onError(fdb::Error err) override {
+	void onError(fdb::Error err) override {
 		std::unique_lock<std::mutex> lock(mutex);
 		if (txState != TxState::IN_PROGRESS) {
 			// Ignore further errors, if the transaction is in the error handing mode or completed
@@ -295,6 +295,7 @@ protected:
 
 	std::vector<fdb::Error::CodeType> retriedErrorCodes() {
 		std::vector<fdb::Error::CodeType> retriedErrorCodes;
+		retriedErrorCodes.reserve(retriedErrors.size());
 		for (auto e : retriedErrors) {
 			retriedErrorCodes.push_back(e.code());
 		}
@@ -438,7 +439,7 @@ protected:
 		onError(err);
 	}
 
-	virtual void handleOnErrorFuture() override {
+	void handleOnErrorFuture() override {
 		ASSERT(txState == TxState::ON_ERROR);
 
 		auto start = timeNow();
@@ -503,7 +504,7 @@ protected:
 
 	static void futureReadyCallback(fdb::Future f, void* param) {
 		try {
-			AsyncTransactionContext* txCtx = (AsyncTransactionContext*)param;
+			auto* txCtx = (AsyncTransactionContext*)param;
 			txCtx->onFutureReady(f);
 		} catch (std::exception& err) {
 			fmt::print("Unexpected exception in callback {}\n", err.what());
@@ -550,7 +551,7 @@ protected:
 		onError(err);
 	}
 
-	virtual void handleOnErrorFuture() override {
+	void handleOnErrorFuture() override {
 		ASSERT(txState == TxState::ON_ERROR);
 
 		onErrorCallTimePoint = timeNow();
@@ -565,7 +566,7 @@ protected:
 
 	static void onErrorReadyCallback(fdb::Future f, void* param) {
 		try {
-			AsyncTransactionContext* txCtx = (AsyncTransactionContext*)param;
+			auto* txCtx = (AsyncTransactionContext*)param;
 			txCtx->onErrorReady(f);
 		} catch (std::exception& err) {
 			fmt::print("Unexpected exception in callback {}\n", err.what());
@@ -640,9 +641,10 @@ protected:
  */
 class TransactionExecutorBase : public ITransactionExecutor {
 public:
-	TransactionExecutorBase(const TransactionExecutorOptions& options) : options(options), scheduler(nullptr) {}
+	explicit TransactionExecutorBase(const TransactionExecutorOptions& options)
+	  : options(options), scheduler(nullptr) {}
 
-	~TransactionExecutorBase() {
+	~TransactionExecutorBase() override {
 		if (tamperClusterFileThread.joinable()) {
 			tamperClusterFileThread.join();
 		}
@@ -752,7 +754,7 @@ protected:
  */
 class DBPoolTransactionExecutor : public TransactionExecutorBase {
 public:
-	DBPoolTransactionExecutor(const TransactionExecutorOptions& options) : TransactionExecutorBase(options) {}
+	explicit DBPoolTransactionExecutor(const TransactionExecutorOptions& options) : TransactionExecutorBase(options) {}
 
 	~DBPoolTransactionExecutor() override { release(); }
 
@@ -780,7 +782,7 @@ private:
  */
 class DBPerTransactionExecutor : public TransactionExecutorBase {
 public:
-	DBPerTransactionExecutor(const TransactionExecutorOptions& options) : TransactionExecutorBase(options) {}
+	explicit DBPerTransactionExecutor(const TransactionExecutorOptions& options) : TransactionExecutorBase(options) {}
 
 	fdb::Database selectDatabase() override { return fdb::Database(clusterFile.c_str()); }
 };

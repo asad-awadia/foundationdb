@@ -287,7 +287,7 @@ TEST_CASE("performance/flow/IndexedSet/integers") {
 	double start = timer();
 	for (int i = 0; i < x.size(); i++) {
 		int t = x[i];
-		is.insert(std::move(t), 3);
+		is.insert(t, 3);
 	}
 	double end = timer();
 	double kps = x.size() / 1000.0 / (end - start);
@@ -372,11 +372,13 @@ TEST_CASE("performance/flow/IndexedSet/strings") {
 
 	printf("%0.1f Map.KfindStr/sec\n", count / 1000.0 / (end - start));
 
+	tt = 0;
 	start = timer();
 	for (size_t i = 0; i < count; i++) {
-		aMap.find(hello);
+		tt += aMap.find(hello)->second;
 	}
 	end = timer();
+	ASSERT(tt == count);
 	printf("%0.1f std::map.KfindStr/sec\n", count / 1000.0 / (end - start));
 
 	return Void();
@@ -429,7 +431,7 @@ TEST_CASE("/flow/IndexedSet/data constructor and destructor calls match") {
 	count = 0;
 	struct Counter {
 		int value;
-		Counter(int value) : value(value) { count++; }
+		explicit Counter(int value) : value(value) { count++; }
 		~Counter() { count--; }
 		Counter(const Counter& r) : value(r.value) { count++; }
 		void operator=(const Counter& r) { value = r.value; }

@@ -34,11 +34,11 @@ using fdb::ValueRef;
 
 class AtomicOpsCorrectnessWorkload : public ApiWorkload {
 public:
-	AtomicOpsCorrectnessWorkload(const WorkloadConfig& config) : ApiWorkload(config) {}
+	explicit AtomicOpsCorrectnessWorkload(const WorkloadConfig& config) : ApiWorkload(config) {}
 
 private:
-	typedef std::function<uint64_t(uint64_t, uint64_t)> IntAtomicOpFunction;
-	typedef std::function<Value(ValueRef, ValueRef)> AtomicOpFunction;
+	using IntAtomicOpFunction = std::function<uint64_t(uint64_t, uint64_t)>;
+	using AtomicOpFunction = std::function<Value(ValueRef, ValueRef)>;
 
 	enum OpType {
 		OP_ATOMIC_ADD,
@@ -57,7 +57,7 @@ private:
 	};
 
 	void randomOperation(TTaskFct cont) override {
-		OpType txType = (OpType)Random::get().randomInt(0, OP_LAST);
+		auto txType = OpType(Random::get().randomInt(0, OP_LAST));
 
 		switch (txType) {
 		case OP_ATOMIC_ADD:

@@ -101,12 +101,26 @@ const std::array<Operation, MAX_OP> opTable{ {
 	                        args.streaming_mode,
 	                        0 /*iteration*/,
 	                        true /*snapshot*/,
-	                        args.txnspec.ops[OP_GETRANGE][OP_REVERSE])
+	                        args.txnspec.ops[OP_SGETRANGE][OP_REVERSE])
 	              .eraseType();
 	      },
 	      [](Future& f, Transaction&, Arguments const&, ByteString&, ByteString&, ByteString& val) {
 	          if (f && !f.error()) {
 		          f.get<future_var::KeyValueRefArray>();
+	          }
+	      } } },
+	  1,
+	  false },
+	{ "STATUSJSON",
+	  { { StepKind::READ,
+	      [](Transaction& tx, Arguments const&, ByteString&, ByteString&, ByteString&) {
+	          static constexpr auto status_json_key =
+	              std::string_view{ "\xff\xff/status/json", sizeof("\xff\xff/status/json") - 1 };
+	          return tx.get(toBytesRef(status_json_key), false /*snapshot*/).eraseType();
+	      },
+	      [](Future& f, Transaction&, Arguments const&, ByteString&, ByteString&, ByteString&) {
+	          if (f && !f.error()) {
+		          f.get<future_var::ValueRef>();
 	          }
 	      } } },
 	  1,

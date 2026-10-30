@@ -86,7 +86,7 @@ struct ProcessEventsImpl {
 				// it's possible that the callback has been removed in
 				// which case attempting to call it will be undefined
 				// behavior.
-				if (toRemove.count(c.first) == 0) {
+				if (!toRemove.contains(c.first)) {
 					c.second->callback(name, data, e);
 				}
 			} catch (...) {
@@ -164,7 +164,7 @@ void uncancellableEvent(StringRef name, Callback callback) {
 }
 
 Event::Event(StringRef name, Callback callback) {
-	impl = new EventImpl({ std::move(name) }, std::move(callback));
+	impl = new EventImpl({ name }, std::move(callback));
 }
 Event::Event(std::vector<StringRef> names, Callback callback) {
 	impl = new EventImpl(std::move(names), std::move(callback));

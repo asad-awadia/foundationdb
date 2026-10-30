@@ -207,6 +207,27 @@ const KeyRef JSONSchemas::statusSchema = R"statusSchema(
                      "counter":0,
                      "roughness":0.0
                   },
+                  "active_watches":0,
+                  "total_watches":{
+                     "hz":0.0,
+                     "counter":0,
+                     "roughness":0.0
+                  },
+                  "triggered_watches":{
+                     "hz":0.0,
+                     "counter":0,
+                     "roughness":0.0
+                  },
+                  "timed_out_watches":{
+                     "hz":0.0,
+                     "counter":0,
+                     "roughness":0.0
+                  },
+                  "errored_watches":{
+                     "hz":0.0,
+                     "counter":0,
+                     "roughness":0.0
+                  },
                   "mutation_bytes":{
                      "hz":0.0,
                      "counter":0,
@@ -289,6 +310,102 @@ const KeyRef JSONSchemas::statusSchema = R"statusSchema(
                      "p99":0.0,
                      "p99.9":0.0
                   },
+                  "commit_batch_transactions":{
+                     "count":0,
+                     "min":0.0,
+                     "max":0.0,
+                     "median":0.0,
+                     "mean":0.0,
+                     "p25":0.0,
+                     "p90":0.0,
+                     "p95":0.0,
+                     "p99":0.0,
+                     "p99.9":0.0
+                  },
+                  "commit_batch_bytes":{
+                     "count":0,
+                     "min":0.0,
+                     "max":0.0,
+                     "median":0.0,
+                     "mean":0.0,
+                     "p25":0.0,
+                     "p90":0.0,
+                     "p95":0.0,
+                     "p99":0.0,
+                     "p99.9":0.0
+                  },
+                  "commit_batching_waiting":{
+                     "count":0,
+                     "min":0.0,
+                     "max":0.0,
+                     "median":0.0,
+                     "mean":0.0,
+                     "p25":0.0,
+                     "p90":0.0,
+                     "p95":0.0,
+                     "p99":0.0,
+                     "p99.9":0.0
+                  },
+                  "commit_preresolution_latency":{
+                     "count":0,
+                     "min":0.0,
+                     "max":0.0,
+                     "median":0.0,
+                     "mean":0.0,
+                     "p25":0.0,
+                     "p90":0.0,
+                     "p95":0.0,
+                     "p99":0.0,
+                     "p99.9":0.0
+                  },
+                  "commit_resolution_latency":{
+                     "count":0,
+                     "min":0.0,
+                     "max":0.0,
+                     "median":0.0,
+                     "mean":0.0,
+                     "p25":0.0,
+                     "p90":0.0,
+                     "p95":0.0,
+                     "p99":0.0,
+                     "p99.9":0.0
+                  },
+                  "commit_postresolution_latency":{
+                     "count":0,
+                     "min":0.0,
+                     "max":0.0,
+                     "median":0.0,
+                     "mean":0.0,
+                     "p25":0.0,
+                     "p90":0.0,
+                     "p95":0.0,
+                     "p99":0.0,
+                     "p99.9":0.0
+                  },
+                  "commit_tlog_logging_latency":{
+                     "count":0,
+                     "min":0.0,
+                     "max":0.0,
+                     "median":0.0,
+                     "mean":0.0,
+                     "p25":0.0,
+                     "p90":0.0,
+                     "p95":0.0,
+                     "p99":0.0,
+                     "p99.9":0.0
+                  },
+                  "commit_reply_latency":{
+                     "count":0,
+                     "min":0.0,
+                     "max":0.0,
+                     "median":0.0,
+                     "mean":0.0,
+                     "p25":0.0,
+                     "p90":0.0,
+                     "p95":0.0,
+                     "p99":0.0,
+                     "p99.9":0.0
+                  },
                   "grv_latency_bands":{
                      "$map": 1
                   },
@@ -328,11 +445,11 @@ const KeyRef JSONSchemas::statusSchema = R"statusSchema(
                   "type":"x",
                   "name":{
                      "$enum":[
-                        "file_open_error",
                         "incorrect_cluster_file_contents",
                         "trace_log_file_write_error",
                         "trace_log_could_not_create_file",
                         "trace_log_writer_thread_unresponsive",
+                        "exclude_from_tlog_recruitment_low_disk",
                         "process_error",
                         "io_error",
                         "io_timeout",
@@ -438,9 +555,7 @@ const KeyRef JSONSchemas::statusSchema = R"statusSchema(
                   "log_server_min_free_space",
                   "log_server_min_free_space_ratio",
                   "storage_server_durability_lag",
-                  "storage_server_list_fetch_failed",
-                  "blob_worker_lag",
-                  "blob_worker_missing"
+                  "storage_server_list_fetch_failed"
                ]
             },
             "description":"The database is not being saturated by the workload."
@@ -461,9 +576,7 @@ const KeyRef JSONSchemas::statusSchema = R"statusSchema(
                   "log_server_min_free_space",
                   "log_server_min_free_space_ratio",
                   "storage_server_durability_lag",
-                  "storage_server_list_fetch_failed",
-                  "blob_worker_lag",
-                  "blob_worker_missing"
+                  "storage_server_list_fetch_failed"
                ]
             },
             "description":"The database is not being saturated by the workload."
@@ -586,7 +699,6 @@ const KeyRef JSONSchemas::statusSchema = R"statusSchema(
                   "unreachable_cluster_controller_worker",
                   "unreachable_dataDistributor_worker",
                   "unreachable_ratekeeper_worker",
-                  "unreachable_blobManager_worker",
                   "unreachable_consistencyScan_worker",
                   "unreadable_configuration",
                   "full_replication_timeout",
@@ -608,8 +720,7 @@ const KeyRef JSONSchemas::statusSchema = R"statusSchema(
                   "primary_dc_missing",
                   "fetch_primary_dc_timeout",
                   "fetch_storage_wiggler_stats_timeout",
-                  "fetch_consistency_scan_status_timeout",
-                  "metacluster_metrics_missing"
+                  "fetch_consistency_scan_status_timeout"
                ]
             },
             "issues":[
@@ -619,7 +730,8 @@ const KeyRef JSONSchemas::statusSchema = R"statusSchema(
                         "incorrect_cluster_file_contents",
                         "trace_log_file_write_error",
                         "trace_log_could_not_create_file",
-                        "trace_log_writer_thread_unresponsive"
+                        "trace_log_writer_thread_unresponsive",
+                        "exclude_from_tlog_recruitment_low_disk"
                      ]
                   },
                   "description":"Cluster file contents do not match current cluster connection string. Verify cluster file is writable and has not been overwritten externally."
@@ -873,6 +985,8 @@ const KeyRef JSONSchemas::statusSchema = R"statusSchema(
          "grv_proxies":1,
          "proxies":6,
          "backup_worker_enabled":1,
+         "range_partitioned_backup_worker_enabled":1,
+         "range_partitioned_backup_workers":0,
          "perpetual_storage_wiggle":0,
          "perpetual_storage_wiggle_locality":"0",
          "perpetual_storage_wiggle_engine":{
@@ -894,6 +1008,16 @@ const KeyRef JSONSchemas::statusSchema = R"statusSchema(
              "disabled",
              "aggressive",
              "gradual"
+         ]},
+         "shard_metadata_format": {
+             "$enum":[
+             "original",
+             "encoded"
+         ]},
+         "shard_metadata_migration": {
+             "$enum":[
+             "enabled",
+             "disabled"
          ]}
       },
       "consistency_scan" : {
@@ -1163,7 +1287,10 @@ const KeyRef JSONSchemas::clusterConfigurationSchema = R"configSchema(
     "auto_resolvers":1,
     "auto_logs":3,
     "commit_proxies":5,
-    "grv_proxies":1
+    "grv_proxies":1,
+    "backup_worker_enabled":1,
+    "range_partitioned_backup_worker_enabled":1,
+    "range_partitioned_backup_workers":0
 })configSchema"_sr;
 
 const KeyRef JSONSchemas::latencyBandConfigurationSchema = R"configSchema(
@@ -1283,9 +1410,7 @@ const KeyRef JSONSchemas::faultToleranceStatusSchema = R"statusSchema(
                   "log_server_min_free_space",
                   "log_server_min_free_space_ratio",
                   "storage_server_durability_lag",
-                  "storage_server_list_fetch_failed",
-                  "blob_worker_lag",
-                  "blob_worker_missing"
+                  "storage_server_list_fetch_failed"
                ]
             },
             "description":"The database is not being saturated by the workload."
@@ -1306,9 +1431,7 @@ const KeyRef JSONSchemas::faultToleranceStatusSchema = R"statusSchema(
                   "log_server_min_free_space",
                   "log_server_min_free_space_ratio",
                   "storage_server_durability_lag",
-                  "storage_server_list_fetch_failed",
-                  "blob_worker_lag",
-                  "blob_worker_missing"
+                  "storage_server_list_fetch_failed"
                ]
             },
             "description":"The database is not being saturated by the workload."
@@ -1365,7 +1488,6 @@ const KeyRef JSONSchemas::faultToleranceStatusSchema = R"statusSchema(
                   "unreachable_cluster_controller_worker",
                   "unreachable_dataDistributor_worker",
                   "unreachable_ratekeeper_worker",
-                  "unreachable_blobManager_worker",
                   "unreachable_consistencyScan_worker",
                   "unreadable_configuration",
                   "full_replication_timeout",
@@ -1387,8 +1509,7 @@ const KeyRef JSONSchemas::faultToleranceStatusSchema = R"statusSchema(
                   "primary_dc_missing",
                   "fetch_primary_dc_timeout",
                   "fetch_storage_wiggler_stats_timeout",
-                  "fetch_consistency_scan_status_timeout",
-                  "metacluster_metrics_missing"
+                  "fetch_consistency_scan_status_timeout"
                ]
             },
             "issues":[

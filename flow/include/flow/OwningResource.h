@@ -21,6 +21,8 @@
 #ifndef FLOW_OWNING_REOSURCE_H
 #define FLOW_OWNING_REOSURCE_H
 
+#include "flow/Arena.h"
+#include "flow/Error.h"
 #include "flow/FastRef.h"
 
 // Consider the following situation:
@@ -55,7 +57,7 @@ template <typename T>
 struct Resource : public ReferenceCounted<Resource<T>>, NonCopyable {
 	T* resource;
 
-	Resource(T* resource_) : resource(resource_) {}
+	explicit Resource(T* resource_) : resource(resource_) {}
 	~Resource() { delete resource; }
 
 	void reset(T* resource_) {
@@ -69,8 +71,8 @@ class ResourceRef {
 protected:
 	Reference<Resource<T>> resourceRef;
 
-	ResourceRef(const Reference<Resource<T>>& ref) : resourceRef(ref) {}
-	ResourceRef(Reference<Resource<T>>&& ref) : resourceRef(std::move(ref)) {}
+	explicit ResourceRef(const Reference<Resource<T>>& ref) : resourceRef(ref) {}
+	explicit ResourceRef(Reference<Resource<T>>&& ref) : resourceRef(std::move(ref)) {}
 	ResourceRef& operator=(const Reference<Resource<T>>& ref) {
 		resourceRef = ref.resourceRef;
 		return *this;
@@ -80,7 +82,7 @@ protected:
 		return *this;
 	}
 
-	virtual ~ResourceRef() {}
+	virtual ~ResourceRef() = default;
 
 public:
 	// Retrieves the resource as a pointer
@@ -112,7 +114,7 @@ class ResourceOwningRef : public details::ResourceRef<T>, NonCopyable {
 	friend class ActorWeakSelfRef;
 
 public:
-	ResourceOwningRef(T* resource) : details::ResourceRef<T>(makeReference<details::Resource<T>>(resource)) {}
+	explicit ResourceOwningRef(T* resource) : details::ResourceRef<T>(makeReference<details::Resource<T>>(resource)) {}
 	virtual ~ResourceOwningRef() { details::ResourceRef<T>::resourceRef->reset(nullptr); }
 };
 
@@ -121,7 +123,7 @@ public:
 template <typename T>
 class ResourceWeakRef : public details::ResourceRef<T> {
 public:
-	ResourceWeakRef(const ResourceOwningRef<T>& ref) : details::ResourceRef<T>(ref.resourceRef) {}
+	explicit ResourceWeakRef(const ResourceOwningRef<T>& ref) : details::ResourceRef<T>(ref.resourceRef) {}
 	ResourceWeakRef(const ResourceWeakRef& ref) : details::ResourceRef<T>(ref.resourceRef) {}
 };
 
@@ -136,8 +138,8 @@ using ActorOwningSelfRef = ResourceOwningRef<T>;
 template <typename T>
 class ActorWeakSelfRef : public ResourceWeakRef<T> {
 public:
-	ActorWeakSelfRef(const ResourceOwningRef<T>& ref) : ResourceWeakRef<T>(ref) {}
-	ActorWeakSelfRef(const ResourceWeakRef<T>& ref) : ResourceWeakRef<T>(ref) {}
+	explicit ActorWeakSelfRef(const ResourceOwningRef<T>& ref) : ResourceWeakRef<T>(ref) {}
+	explicit ActorWeakSelfRef(const ResourceWeakRef<T>& ref) : ResourceWeakRef<T>(ref) {}
 	ActorWeakSelfRef(const ActorWeakSelfRef<T>& ref)
 	  : ResourceWeakRef<T>(static_cast<const ResourceWeakRef<T>&>(ref)) {}
 

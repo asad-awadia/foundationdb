@@ -21,7 +21,7 @@
 testClass = "Backup"
 
 [configuration]
-storageEngineExcludeTypes = [5] # FIXME: remove after allowing bulkloading with fetchKey and shardedrocksdb
+storageEngineExcludeTypes = ["ssd-sharded-rocksdb"] # FIXME: remove after allowing bulkloading with fetchKey and shardedrocksdb
 disableTss = true # TODO(BulkLoad): support TSS
 
 # HA (multi-region) configuration - randomly enabled for test coverage
@@ -32,6 +32,13 @@ minimumRegions = 1
 
 # Ensure enough storage servers for non-overlapping BulkLoad teams
 extraMachineCountDC = 3
+# Dedicated storage-class machines so bulk-load team selection can find a team disjoint from the
+# source: it rejects any team sharing a server with the source (DDTeamCollection). Without these,
+# runs fail with DDBulkLoadEngineTaskGetTeamFailedToFindValidTeam reporting ValidTeamSize 0 with
+# every candidate team duplicated, the task is marked Error, and the restore is incomplete.
+# extraMachineCountDC above adds ordinary machines, which do not supply that capacity. Per DC, so
+# this holds for the multi-region variants too. See tests/fast/BulkLoading.toml for the same guard.
+extraStorageMachineCountPerDC = 5
 
 # Explicit simple config - single replication, single region, explicit process counts
 config = "triple usable_regions=1 storage_engine=ssd-2 perpetual_storage_wiggle=0 commit_proxies=3 grv_proxies=3 resolvers=3 logs=3"
@@ -89,7 +96,6 @@ timeout = 3600
     nodeCount = 100
     transactionsPerSecond = 100.0
     testDuration = 30.0
-    expectedRate = 0
 
     [[test.workload]]
     testName = 'BackupS3BlobCorrectness'
@@ -98,7 +104,6 @@ timeout = 3600
     abortAndRestartAfter = 0.0
     stopDifferentialAfter = 0.0
     performRestore = true
-    backupRangesCount = -1
     skipDirtyRestore = false
     backupURL = 'blobstore://mocks3:mocksecret:mocktoken@127.0.0.1:8080/backup_container?bucket=backup_bucket&region=us-east-1&secure_connection=0&cwpf=1&cu=1'
     # BulkDump/BulkLoad integration options
